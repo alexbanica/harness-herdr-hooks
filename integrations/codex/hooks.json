@@ -1,0 +1,27 @@
+{
+  "description": "Template only. The installer replaces the managed entrypoint token before registration.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "@HARNESS_HERDR_HOOKS_ENTRYPOINT@ codex-hook",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "@HARNESS_HERDR_HOOKS_ENTRYPOINT@ codex-hook",
+            "async": true
+          }
+        ]
+      }
+    ]
+  }
+}
