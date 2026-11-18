@@ -102,19 +102,30 @@ class StateStore:
             records = data.setdefault("records", {})
             pending = set(data.setdefault("pending_created", []))
             old = set(data.get("baseline", []))
+            # A verified creation can arrive after an observer's first snapshot.
+            # Keep it eligible until the coordinator has durably recorded it, so
+            # a restart cannot turn that new session back into a baseline member.
+            old.difference_update(pending)
             old.update(session_keys - set(records) - pending)
             data["baseline"] = sorted(old)
-            data["pending_created"] = sorted(pending - session_keys)
+            data["pending_created"] = sorted(pending - set(records))
             data["baseline_ready"] = True
 
     def note_creation(self, session_key: str) -> None:
-        """Remember a verified native creation event until its first baseline."""
+        """Keep a verified native creation eligible until it is recorded."""
         with self.locked() as data:
+            records = data.setdefault("records", {})
             pending = set(data.setdefault("pending_created", []))
-            if session_key not in pending:
+            if session_key in records:
+                pending.discard(session_key)
+            elif session_key not in pending:
                 if len(pending) >= 1024: raise UnsafeState("pending creation limit reached")
                 pending.add(session_key)
             data["pending_created"] = sorted(pending)
+            baseline = set(data.get("baseline", []))
+            if session_key in baseline:
+                baseline.remove(session_key)
+                data["baseline"] = sorted(baseline)
 
     def baseline_ready(self) -> bool:
         with self.locked() as data:

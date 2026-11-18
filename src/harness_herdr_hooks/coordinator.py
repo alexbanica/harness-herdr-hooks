@@ -53,9 +53,20 @@ class Coordinator:
         with self.store.locked() as state:
             if not state.get("baseline_ready"):
                 return Outcome(Decision.SKIP, "initial baseline is not established")
+            records = state["records"]
+            pending = set(state.get("pending_created", ()))
+            rec = records.get(key, {})
+            if key in pending:
+                # This is the verified serialized observation that consumes a
+                # creation marker.  Retain an empty nonterminal record so a
+                # later restart cannot rebuild this key into the baseline.
+                pending.remove(key)
+                state["pending_created"] = sorted(pending)
+                if not rec:
+                    rec = {"status": "pending", "attempts": 0}
+                    records[key] = rec
             if key in state.get("baseline", ()):
                 return Outcome(Decision.SKIP, "pre-existing session")
-            rec = state["records"].get(key, {})
             if rec.get("status") == "suppressed": return Outcome(Decision.SKIP, "pane was manually closed")
             if rec.get("status") == "attached":
                 pane_state = self.runtime.owned_pane_state(parent, child, rec["binding_id"])
