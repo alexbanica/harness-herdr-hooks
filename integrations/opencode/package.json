@@ -1,0 +1,7 @@
+{
+  "name": "harness-herdr-hooks-opencode",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./plugin.js"
+}
