@@ -436,7 +436,7 @@ def uninstall(harness:str,*,config_dir:str|None=None)->dict[str,str]:
                         or hashlib.sha256(metadata.read_bytes()).hexdigest()!=entry.get("metadata_sha256")):
                     raise InstallError("managed Codex adapter changed; preserving profile")
                 if entry.get("path"):
-                    from .codex_config import _check_file, _identity, _parse, _path_value, _edit
+                    from .codex_config import _check_file, _identity, _parse, _path_value, _restore_bytes
                     try:
                         config_pre,config_mode,config_exists=_check_file(config_path)
                         if not config_exists: raise InstallError("managed Codex config is unavailable; preserving profile")
@@ -446,15 +446,8 @@ def uninstall(harness:str,*,config_dir:str|None=None)->dict[str,str]:
                     if current_path!=entry["path"].get("installed_path"):
                         raise InstallError("managed Codex PATH changed; preserving profile")
                     original=entry["path"].get("original_path")
-                    if original is None:
-                        lines=config_pre.splitlines(keepends=True); active=False; out=[]
-                        for line in lines:
-                            stripped=line.strip()
-                            if stripped.startswith(b"["): active=(stripped==b"[shell_environment_policy.set]"); out.append(line); continue
-                            if active and re.match(rb"^\s*(?:PATH|\"PATH\"|'PATH')\s*=",line): continue
-                            out.append(line)
-                        config_after=b"".join(out)
-                    else: config_after=_edit(config_pre,original)
+                    try: config_after=_restore_bytes(config_pre,original)
+                    except Exception as exc: raise InstallError("managed Codex PATH layout cannot be safely restored; preserving profile") from exc
             # Build a complete rollback journal before the first profile or adapter write.
             manifest_path=_manifest(root); manifest_identity=_safe_owned_file(manifest_path); manifest_pre=manifest_path.read_bytes()
             hooks_after=None

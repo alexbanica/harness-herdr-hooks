@@ -66,6 +66,36 @@ class CodexInstallTests(unittest.TestCase):
         restored=config.read_text()
         self.assertNotIn("PATH =",restored)
 
+    def test_uninstall_recognizes_commented_path_table_and_restores_absent_path(self):
+        config=self.root/"config.toml"
+        original=b'# keep this comment\nmodel = "x"\n\n[shell_environment_policy.set]\nOTHER = "keep" # preserve me\n'
+        config.write_bytes(original); config.chmod(0o640)
+        with patch.dict(os.environ, {"PATH": str(self.bin)}):
+            install("codex", source_root=self.source, config_dir=str(self.root))
+        installed=config.read_bytes()
+        self.assertIn(b'PATH = ',installed)
+        # A valid semantic-equivalent header edit must not orphan the managed PATH.
+        config.write_bytes(installed.replace(b"[shell_environment_policy.set]", b"[shell_environment_policy.set] # user note"))
+        expected=original.replace(b"[shell_environment_policy.set]", b"[shell_environment_policy.set] # user note")
+        uninstall("codex",config_dir=str(self.root))
+        self.assertEqual(config.read_bytes(),expected)
+        self.assertEqual(config.stat().st_mode&0o777,0o640)
+        self.assertFalse((self.root/".harness-herdr-hooks.json").exists())
+        self.assertFalse((self.root/"harness-herdr-hooks/codex-adapter/codex").exists())
+
+    def test_uninstall_unsupported_commented_path_layout_preserves_ownership(self):
+        with patch.dict(os.environ, {"PATH": str(self.bin)}):
+            install("codex", source_root=self.source, config_dir=str(self.root))
+        config=self.root/"config.toml"; hooks=self.root/"hooks.json"
+        manifest=self.root/".harness-herdr-hooks.json"; adapter=self.root/"harness-herdr-hooks/codex-adapter"
+        # TOML resolves this spelling to the same table, but it is outside the
+        # supported byte-preserving header layout.
+        bad=config.read_bytes().replace(b"[shell_environment_policy.set]", b'["shell_environment_policy".set] # note')
+        config.write_bytes(bad)
+        before=(config.read_bytes(),hooks.read_bytes(),manifest.read_bytes(),(adapter/"codex").read_bytes())
+        with self.assertRaises(InstallError): uninstall("codex",config_dir=str(self.root))
+        self.assertEqual((config.read_bytes(),hooks.read_bytes(),manifest.read_bytes(),(adapter/"codex").read_bytes()),before)
+
     def test_fresh_profile_skips_another_profiles_managed_adapter_on_path(self):
         other=Path(self.tmp.name)/"other-profile"; other.mkdir(mode=0o700)
         with patch.dict(os.environ,{"PATH":str(self.bin)}):

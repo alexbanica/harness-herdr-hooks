@@ -64,6 +64,12 @@ def _comment_at(line: bytes, start: int=0) -> int:
         elif ch==35: return i
     return -1
 
+def _is_path_table_header(line: bytes) -> bool:
+    """Recognize the owned table with an optional TOML trailing comment."""
+    comment = _comment_at(line)
+    header = line[:comment] if comment >= 0 else line
+    return header.strip() == _TABLE
+
 def _edit(raw: bytes, installed: str) -> bytes:
     data=_parse(raw); current=_path_value(data)
     policy=data.get("shell_environment_policy",{})
@@ -73,7 +79,7 @@ def _edit(raw: bytes, installed: str) -> bytes:
     for i,line in enumerate(lines):
         stripped=line.strip()
         if stripped.startswith(b"["):
-            if stripped==_TABLE: active=True; has_table=True; table_spans.append(i)
+            if _is_path_table_header(line): active=True; has_table=True; table_spans.append(i)
             else: active=False
             continue
         if active:
@@ -243,21 +249,34 @@ def restore_path(ownership: dict[str,Any]) -> str:
     if path!=root/"config.toml": raise ConfigError("managed Codex config path mismatch")
     raw,mode,exists=_check_file(path); current=_path_value(_parse(raw))
     if current!=ownership.get("installed_path"): raise ConfigError("managed Codex PATH changed; preserving configuration")
-    original=ownership.get("original_path")
-    if original is None:
-        # Remove only PATH assignment, preserving every other byte and table content.
-        lines=raw.splitlines(keepends=True); active=False; out=[]
-        for line in lines:
-            stripped=line.strip()
-            if stripped.startswith(b"["): active=(stripped==_TABLE); out.append(line); continue
-            if active and re.match(rb"^\s*(?:PATH|\"PATH\"|'PATH')\s*=",line): continue
-            out.append(line)
-        restored=b"".join(out)
-    else: restored=_edit(raw,original)
+    restored=_restore_bytes(raw,ownership.get("original_path"))
     identity=_identity(path)
     if exists: _atomic(path,restored,mode,expected=raw,expected_exists=True,expected_identity=identity)
     elif restored: _atomic(path,restored,0o600)
     return "restored"
+
+def _restore_bytes(raw: bytes, original: str|None) -> bytes:
+    """Build and verify a byte-preserving restoration before ownership is removed."""
+    if original is None:
+        lines=raw.splitlines(keepends=True); active=False; headers=0; keys=0; out=[]
+        for line in lines:
+            if line.strip().startswith(b"["):
+                active=_is_path_table_header(line)
+                if active: headers+=1
+                out.append(line); continue
+            if active and re.match(rb"^\s*(?:PATH|\"PATH\"|'PATH')\s*=",line):
+                keys+=1; continue
+            out.append(line)
+        if headers != 1 or keys != 1:
+            raise ConfigError("managed PATH layout is unsupported; preserving configuration")
+        restored=b"".join(out)
+    else:
+        restored=_edit(raw,original)
+    # A syntactically valid edit is not sufficient: verify the owned field has
+    # actually returned to the recorded original value before deleting ownership.
+    if _path_value(_parse(restored)) != original:
+        raise ConfigError("Codex PATH restoration postcondition failed; preserving configuration")
+    return restored
 
 
 def commit_path_journal(config_root: Path) -> None:
