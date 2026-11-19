@@ -1,6 +1,7 @@
 """Bounded Herdr protocol-22 Unix socket client."""
 from __future__ import annotations
 import itertools, json, os, shutil, socket, stat, time
+from urllib.parse import urlsplit
 from .model import matches_agent_session_ref
 from pathlib import Path
 from typing import Any
@@ -83,6 +84,76 @@ def codex_remote_socket(argv:list[str],codex_home:Path)->Path|None:
     if not path.is_absolute(): return None
     try: return path.resolve(strict=False)
     except (OSError,RuntimeError): return None
+
+def _codex_proc_proof(process:dict[str,Any], *, proc_root:Path=Path('/proc')):
+    """Read independent Linux process identity when Herdr omits foreground argv."""
+    from .codex_backend import inspect_process, verify_process_pin
+    pid=process.get('pid'); name=process.get('name'); cwd=process.get('cwd')
+    if not isinstance(pid,int) or not isinstance(name,str) or not name:
+        raise ValueError('Codex process identity is incomplete')
+    expected_cwd=Path(cwd) if isinstance(cwd,str) and Path(cwd).is_absolute() else None
+    proof=inspect_process(pid,expected_name=name,expected_cwd=expected_cwd,proc_root=proc_root)
+    return verify_process_pin(proof,proc_root=proc_root)
+
+def codex_backend_proof(process:dict[str,Any],codex_home:Path,*,proc_root:Path=Path('/proc'))->dict[str,object]:
+    """Build bounded durable endpoint/process pins from one verified pane process.
+
+    If native argv is unreadable, OS process metadata must still establish a
+    default daemon launch. Explicit selection must resolve to its own endpoint.
+    """
+    from .codex_backend import select_endpoint
+    proc=_codex_proc_proof(process,proc_root=proc_root)
+    if proc.launch_mode=='no_daemon' or proc.launch_mode=='unknown':
+        raise ValueError('Codex launch mode cannot be safely qualified')
+    explicit=None
+    if proc.launch_mode=='explicit':
+        args=list(proc.argv or ()); values=[]; index=0
+        while index<len(args):
+            arg=args[index]
+            if arg=='--remote':
+                if index+1>=len(args): raise ValueError('explicit Codex endpoint is incomplete')
+                values.append(args[index+1]); index+=2; continue
+            if arg.startswith('--remote='): values.append(arg[len('--remote='):])
+            index+=1
+        if len(values)!=1 or not values[0].startswith('unix://'):
+            raise ValueError('explicit Codex endpoint is unsupported or ambiguous')
+        parsed=urlsplit(values[0])
+        if parsed.netloc not in ('','localhost'):
+            raise ValueError('remote Codex socket host is unsupported')
+        explicit=(codex_home/'app-server-control'/'app-server-control.sock') if not parsed.path else Path(parsed.path)
+        if not explicit.is_absolute(): raise ValueError('explicit Codex socket path must be absolute')
+    pin=select_endpoint(codex_home,explicit)
+    if process.get('argv'):
+        herdr_endpoint=codex_remote_socket(process['argv'],codex_home)
+        if proc.launch_mode=='explicit' and herdr_endpoint!=pin.target:
+            raise ValueError('Herdr and OS process endpoint evidence disagree')
+    return {'socket_alias':str(pin.alias),'socket_target':str(pin.target),
+            'socket_identity':list(pin.socket_identity),'alias_identity':list(pin.alias_identity),
+            'directory_identity':list(pin.directory_identity),'pid':proc.pid,'uid':proc.uid,
+            'executable':str(proc.executable),'cwd':str(proc.cwd),'start_ticks':proc.start_ticks}
+
+def revalidate_codex_backend_proof(proof:dict[str,Any],processes:list[dict[str,Any]],
+                                   codex_home:Path,*,proc_root:Path=Path('/proc')) -> bool:
+    """Revalidate selected socket incarnation and exact foreground process pin."""
+    try:
+        proc=next((p for p in processes if isinstance(p,dict) and p.get('pid')==proof.get('pid')),None)
+        if proc is None: return False
+        current=codex_backend_proof(proc,codex_home,proc_root=proc_root)
+        return current==proof
+    except (KeyError,TypeError,ValueError,OSError,RuntimeError): return False
+
+def process_matches_attachment(process:dict[str,Any],expected:list[str],context:Any,
+                               *,proc_root:Path=Path('/proc')) -> bool:
+    """Match native attachment using Herdr argv or independently read /proc argv."""
+    argv=process.get('argv')
+    if isinstance(argv,list) and argv:
+        if attachment_argv_matches(argv,expected,context): return True
+    if context.harness.value!='codex': return False
+    try:
+        proof=_codex_proc_proof(process,proc_root=proc_root)
+        return bool(proof.argv and attachment_argv_matches(list(proof.argv),expected,context))
+    except (ValueError,OSError,RuntimeError): return False
+
 class HerdrClient:
     def __init__(self, socket_path: Path | str, timeout: float = 5.0):
         self.socket_path=Path(socket_path); self.timeout=min(max(float(timeout),.1),5.0); self._ids=itertools.count(1); self.peer_identity=None; self._socket_fingerprint=None
@@ -168,15 +239,19 @@ class HerdrClient:
             if expected=='opencode':
                 if not isinstance(backend_pid,int) or backend_pid<=0: return False
                 return any(p.get('pid')==backend_pid and 'opencode' in (p.get('name','')+' '+str(p.get('argv') or '')).lower() for p in processes)
-            # Only an explicit native --remote endpoint proves a backend.
             expected_socket=Path(backend).resolve(strict=False)
-            for p in processes:
-                argv=p.get('argv') or []
-                native_name=Path(str(p.get('name',''))).name.lower()
-                argv0=Path(str(argv[0])).name.lower() if argv else ''
-                if native_name!='codex' and argv0!='codex': continue
-                if codex_remote_socket(argv,parent.context.config_root)==expected_socket: return True
-            return False
+            proof=getattr(parent,'backend_proof',None)
+            candidates=[p for p in processes if isinstance(p,dict) and
+                        (Path(str(p.get('name',''))).name.lower() in {'codex','codex-cli'}
+                         or (isinstance(p.get('argv'),list) and p.get('argv')
+                             and Path(str(p['argv'][0])).name.lower() in {'codex','codex-cli'}))]
+            if proof is not None:
+                return (Path(str(proof.get('socket_target','')))==expected_socket
+                        and revalidate_codex_backend_proof(dict(proof),candidates,parent.context.config_root))
+            # Bootstrap may construct its first proof from the selected process;
+            # callers must persist it before starting an observer.
+            return any(Path(codex_backend_proof(p,parent.context.config_root)['socket_target'])==expected_socket
+                       for p in candidates)
         except (HerdrError,OSError,AttributeError,ValueError,RuntimeError): return False
     def wait_for_attachment(self,pane_id:str,context:Any,backend_pid:int|None=None,timeout:float=5.0,*,expected_argv:list[str]|None=None,session_path:Path|str|None=None)->bool:
         if not expected_argv: return False
@@ -187,7 +262,7 @@ class HerdrClient:
                 ref=pane.get('agent_session') if pane else None
                 if matches_agent_session_ref(ref,context.session_id,Path(session_path) if session_path else None) and context.harness.value in (str(ref.get('agent',''))+' '+str(ref.get('source',''))).lower():
                     info=self.process_info(pane_id); procs=info.get('foreground_processes',[])
-                    if any(attachment_argv_matches(proc.get('argv'),expected_argv,context) for proc in procs if isinstance(proc,dict)): return True
+                    if any(process_matches_attachment(proc,expected_argv,context) for proc in procs if isinstance(proc,dict)): return True
             except HerdrError: pass
             time.sleep(min(.1,max(0,deadline-time.monotonic())))
         return False

@@ -41,6 +41,8 @@ class ParentBinding:
     pane_id: str
     ancestry: tuple[str, ...] = ()
     session_path: Path | None = None
+    # Bounded native proof pins only; intentionally excludes environment and argv.
+    backend_proof: Mapping[str, object] | None = None
 
 
 class Lifecycle(str, Enum):
@@ -61,6 +63,11 @@ class Session:
     observed_at: float
     ancestry: tuple[str, ...] = ()
     session_path: Path | None = None
+    # ``subagent`` sessions may own an integration-created pane; an
+    # ``independent`` interactive session is deliberately retained.
+    kind: str = "subagent"
+    turn_id: str | None = None
+    generation: str | None = None
 
 
 class Decision(str, Enum):
@@ -105,39 +112,59 @@ def context_from_dict(v: object) -> Context:
 
 
 def parent_to_dict(p: ParentBinding) -> dict[str, object]:
-    return {"context": context_to_dict(p.context), "herdr_server_id": p.herdr_server_id,
+    result = {"context": context_to_dict(p.context), "herdr_server_id": p.herdr_server_id,
             "workspace_id": p.workspace_id, "tab_id": p.tab_id, "pane_id": p.pane_id,
             "ancestry": list(p.ancestry),
             "session_path": str(p.session_path.resolve(strict=False)) if p.session_path else None}
+    if p.backend_proof is not None:
+        result["backend_proof"] = dict(p.backend_proof)
+    return result
 
 
 def parent_from_dict(v: object) -> ParentBinding:
     old_keys = {"context", "herdr_server_id", "workspace_id", "tab_id", "pane_id", "ancestry"}
     new_keys = old_keys | {"session_path"}
-    if not isinstance(v, dict) or set(v) not in (old_keys, new_keys): raise ValueError("serialized record has unknown or missing fields")
+    pinned_keys = new_keys | {"backend_proof"}
+    if not isinstance(v, dict) or set(v) not in (old_keys, new_keys, pinned_keys): raise ValueError("serialized record has unknown or missing fields")
     d = v
     if any(not isinstance(d[k], str) or not d[k] for k in ("herdr_server_id", "workspace_id", "tab_id", "pane_id")) or not isinstance(d["ancestry"], list) or not all(isinstance(x, str) for x in d["ancestry"]): raise ValueError("invalid serialized parent")
     path = _canonical_optional_path(d.get("session_path"))
-    return ParentBinding(context_from_dict(d["context"]), d["herdr_server_id"], d["workspace_id"], d["tab_id"], d["pane_id"], tuple(d["ancestry"]), path)
+    proof = d.get("backend_proof")
+    if proof is not None:
+        allowed = {"socket_alias", "socket_target", "socket_identity", "alias_identity", "directory_identity", "pid", "uid", "executable", "cwd", "start_ticks"}
+        if not isinstance(proof, dict) or set(proof) - allowed or len(proof) > len(allowed): raise ValueError("invalid backend proof fields")
+        for key in ("socket_alias", "socket_target", "executable", "cwd"):
+            if key in proof and (not isinstance(proof[key], str) or not Path(proof[key]).is_absolute()): raise ValueError("backend proof paths must be absolute")
+        for key in ("pid", "uid", "start_ticks"):
+            if key in proof and (not isinstance(proof[key], int) or proof[key] < 0): raise ValueError("invalid backend process pin")
+        for key in ("socket_identity", "alias_identity", "directory_identity"):
+            if key in proof and (not isinstance(proof[key], list) or len(proof[key]) != 5 or not all(isinstance(x, int) and x >= 0 for x in proof[key])): raise ValueError("invalid backend filesystem pin")
+    return ParentBinding(context_from_dict(d["context"]), d["herdr_server_id"], d["workspace_id"], d["tab_id"], d["pane_id"], tuple(d["ancestry"]), path, proof)
 
 
 def session_to_dict(s: Session) -> dict[str, object]:
     return {"context": context_to_dict(s.context), "parent_session_id": s.parent_session_id,
             "title": s.title, "cwd": str(s.cwd), "lifecycle": s.lifecycle.value,
             "attachable": s.attachable, "observed_at": s.observed_at, "ancestry": list(s.ancestry),
-            "session_path": str(s.session_path.resolve(strict=False)) if s.session_path else None}
+            "session_path": str(s.session_path.resolve(strict=False)) if s.session_path else None,
+            "kind": s.kind, "turn_id": s.turn_id, "generation": s.generation}
 
 
 def session_from_dict(v: object) -> Session:
     old_keys = {"context", "parent_session_id", "title", "cwd", "lifecycle", "attachable", "observed_at", "ancestry"}
-    new_keys = old_keys | {"session_path"}
-    if not isinstance(v, dict) or set(v) not in (old_keys, new_keys): raise ValueError("serialized record has unknown or missing fields")
+    path_keys = old_keys | {"session_path"}
+    new_keys = path_keys | {"kind", "turn_id", "generation"}
+    if not isinstance(v, dict) or set(v) not in (old_keys, path_keys, new_keys): raise ValueError("serialized record has unknown or missing fields")
     d = v
     if not isinstance(d["cwd"], str) or not Path(d["cwd"]).is_absolute() or not isinstance(d["attachable"], bool) or not isinstance(d["observed_at"], (int, float)) or not isinstance(d["ancestry"], list) or not all(isinstance(x, str) for x in d["ancestry"]): raise ValueError("invalid serialized session")
     if d["parent_session_id"] is not None and not isinstance(d["parent_session_id"], str): raise ValueError("invalid parent session ID")
     if d["title"] is not None and not isinstance(d["title"], str): raise ValueError("invalid session title")
+    kind = d.get("kind", "subagent")
+    if kind not in {"subagent", "independent"}: raise ValueError("invalid session kind")
+    if any(d.get(k) is not None and (not isinstance(d[k], str) or not d[k]) for k in ("turn_id", "generation")):
+        raise ValueError("invalid session turn generation")
     path = _canonical_optional_path(d.get("session_path"))
-    return Session(context_from_dict(d["context"]), d["parent_session_id"], d["title"], Path(d["cwd"]), Lifecycle(d["lifecycle"]), d["attachable"], float(d["observed_at"]), tuple(d["ancestry"]), path)
+    return Session(context_from_dict(d["context"]), d["parent_session_id"], d["title"], Path(d["cwd"]), Lifecycle(d["lifecycle"]), d["attachable"], float(d["observed_at"]), tuple(d["ancestry"]), path, kind, d.get("turn_id"), d.get("generation"))
 
 
 def _canonical_optional_path(value: object) -> Path | None:

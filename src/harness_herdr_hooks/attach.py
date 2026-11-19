@@ -39,6 +39,33 @@ def _argv_matches(actual:object,expected:list[str])->bool:
         return str(Path(found).resolve()) if found else x
     return canon(actual[0])==canon(expected[0]) and actual[1:]==expected[1:]
 
+def _proc_argv(pid:int,*,expected_cwd:Path,proc_root:Path=Path('/proc'))->list[str]|None:
+    """Read bounded wrapper argv and pin PID start/executable across the read."""
+    if not isinstance(pid,int) or pid<=0: return None
+    root=Path(proc_root)/str(pid)
+    try:
+        def start_ticks()->int:
+            raw=(root/'stat').read_text(encoding='ascii')
+            fields=raw[raw.rfind(')')+2:].split()
+            if len(fields)<20: raise ValueError('short process stat')
+            return int(fields[19])
+        first=start_ticks(); uid_line=next(x for x in (root/'status').read_text(encoding='ascii').splitlines() if x.startswith('Uid:'))
+        if int(uid_line.split()[1])!=os.getuid(): return None
+        exe=(root/'exe').resolve(strict=True); cwd=(root/'cwd').resolve(strict=True)
+        raw=(root/'cmdline').read_bytes()
+        if len(raw)>65536 or not raw: return None
+        argv=[x.decode('utf-8','surrogateescape') for x in raw.split(b'\0') if x]
+        if (start_ticks()!=first or cwd!=expected_cwd.resolve(strict=True)
+                or (root/'exe').resolve(strict=True)!=exe): return None
+        return argv
+    except (OSError,ValueError,StopIteration,UnicodeError,RuntimeError): return None
+
+def _wrapper_process_argv(process:dict,expected_cwd:Path,*,proc_root:Path=Path('/proc'))->list[str]|None:
+    argv=process.get('argv')
+    if isinstance(argv,list) and argv: return [str(x) for x in argv]
+    pid=process.get('pid')
+    return _proc_argv(pid,expected_cwd=expected_cwd,proc_root=proc_root) if isinstance(pid,int) else None
+
 def _tty_has_no_processes(tty:str)->bool:
     """Linux-only bounded /proc scan; any uncertainty retains the pane."""
     if not tty.startswith('/dev/') or not Path('/proc').is_dir(): return False
@@ -56,6 +83,17 @@ def _tty_has_no_processes(tty:str)->bool:
         from .herdr import _tty_stats_empty
         return _tty_stats_empty(stats,dev)
     except OSError: return False
+
+def _tty_identity(tty:object)->tuple[int,int,int]|None:
+    """Pin the PTY node incarnation as well as its device number."""
+    if not isinstance(tty,str) or not tty.startswith('/dev/'):
+        return None
+    try:
+        info=os.stat(tty)
+        if not stat.S_ISCHR(info.st_mode): return None
+        return info.st_dev,info.st_ino,info.st_rdev
+    except OSError:
+        return None
 
 def _runtime(parent:Any,child:Any,client:HerdrClient,backend_pid:int|None):
     if child.context.harness==Harness.CODEX:
@@ -93,7 +131,9 @@ def exec_binding(binding_id:str,environment:dict[str,str]|None=None)->None:
         raise AttachmentUnavailable('target pane has unexpected native session or working directory')
     info=client.process_info(pane_id); procs=info.get('foreground_processes',[])
     if not isinstance(record.get('entrypoint'),str) or not Path(record['entrypoint']).is_absolute(): raise AttachmentUnavailable('binding entrypoint unavailable')
-    argv=next((p.get('argv') or [] for p in procs if p.get('pid')==os.getpid()),[])
+    current=next((p for p in procs if isinstance(p,dict) and p.get('pid')==os.getpid()),None)
+    argv=_wrapper_process_argv(current,Path(pane['cwd'])) if current else None
+    argv=argv or []
     python_executable=bool(argv) and Path(argv[0]).name.lower().startswith('python')
     module_argv=python_executable and argv[1:]==['-m','harness_herdr_hooks','attach',binding_id]
     script_argv=python_executable and argv[1:]==[record['entrypoint'],'attach',binding_id]

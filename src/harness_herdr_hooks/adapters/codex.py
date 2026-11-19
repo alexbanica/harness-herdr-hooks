@@ -1,4 +1,4 @@
-"""Codex 0.169.0 hook and existing-app-server adapter primitives.
+"""Codex 0.170.0 hook and existing-app-server adapter primitives.
 
 Hook values are treated only as event identity hints. Backend identity must be
 independently established by the caller before any routing or attachment.
@@ -9,6 +9,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import secrets
 import selectors
 import shutil
@@ -26,14 +27,20 @@ from ..model import Context, Harness, Lifecycle, ParentBinding, Session
 
 _HOOK_FIELDS = {
     "SessionStart": {
-        "required": {"cwd", "hook_event_name", "model", "permission_mode", "session_id", "source", "transcript_path"},
-        "strings": {"cwd", "hook_event_name", "model", "permission_mode", "session_id", "source"},
-        "enums": {"hook_event_name": {"SessionStart"}, "permission_mode": {"default", "acceptEdits", "plan", "dontAsk", "bypassPermissions"}, "source": {"startup", "resume", "clear", "compact", "fork"}},
+        "required": {"cwd", "hook_event_name", "session_id", "transcript_path"},
+        "strings": {"cwd", "hook_event_name", "session_id"},
+        "enums": {"hook_event_name": {"SessionStart"}},
     },
     "SubagentStart": {
-        "required": {"agent_id", "agent_type", "cwd", "hook_event_name", "model", "permission_mode", "session_id", "transcript_path", "turn_id"},
-        "strings": {"agent_id", "agent_type", "cwd", "hook_event_name", "model", "permission_mode", "session_id", "turn_id"},
-        "enums": {"hook_event_name": {"SubagentStart"}, "permission_mode": {"default", "acceptEdits", "plan", "dontAsk", "bypassPermissions"}},
+        "required": {"agent_id", "agent_type", "cwd", "hook_event_name", "session_id", "transcript_path", "turn_id"},
+        "strings": {"agent_id", "agent_type", "cwd", "hook_event_name", "session_id", "turn_id"},
+        "enums": {"hook_event_name": {"SubagentStart"}},
+    },
+    "SubagentStop": {
+        "required": {"agent_id", "agent_type", "cwd", "hook_event_name", "session_id", "stop_hook_active", "transcript_path", "turn_id"},
+        "strings": {"agent_id", "agent_type", "cwd", "hook_event_name", "session_id", "turn_id"},
+        "enums": {"hook_event_name": {"SubagentStop"}},
+        "booleans": {"stop_hook_active"},
     },
 }
 
@@ -63,6 +70,19 @@ class HookEvent:
     turn_id: str | None = None
     agent_id: str | None = None
     agent_type: str | None = None
+    stop_hook_active: bool | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TurnMetadata:
+    """Message-free persisted turn status correlated to its native thread."""
+    thread_id: str
+    turn_id: str
+    status: str
+
+    @property
+    def terminal(self) -> bool:
+        return self.status in {"completed", "interrupted", "failed"}
 
 
 def parse_hook(payload: str | bytes | Mapping[str, Any], *, profile: str,
@@ -75,24 +95,37 @@ def parse_hook(payload: str | bytes | Mapping[str, Any], *, profile: str,
         raise ValueError("hook input must be a JSON object")
     name = obj.get("hook_event_name")
     schema = _HOOK_FIELDS.get(name)
-    if schema is None or set(obj) != schema["required"]:
+    if schema is None or not schema["required"] <= set(obj):
         raise ValueError("unsupported or incomplete Codex hook input")
     if any(not isinstance(obj[k], str) or not obj[k] for k in schema["strings"]):
         raise ValueError("invalid Codex hook string field")
     if any(obj[k] not in allowed for k, allowed in schema["enums"].items()):
         raise ValueError("unsupported Codex hook enum value")
-    if obj["transcript_path"] is not None and not isinstance(obj["transcript_path"], str):
+    if any(not isinstance(obj[k], bool) for k in schema.get("booleans", ())):
+        raise ValueError("invalid Codex hook boolean field")
+    if name in {"SubagentStart", "SubagentStop"} and obj["session_id"] != obj["agent_id"]:
+        raise ValueError("Codex subagent hook identity does not match child session")
+    if obj["transcript_path"] is not None and (not isinstance(obj["transcript_path"], str) or not obj["transcript_path"]):
+        raise ValueError("invalid transcript path field")
+    if not isinstance(obj["transcript_path"], (str, type(None))):
         raise ValueError("invalid transcript path field")
     if not verified_backend_id or not verified_backend_instance:
         raise ValueError("Codex backend identity and socket incarnation have not been independently verified")
     ident = CodexIdentity(profile, config_root, data_root, state_root,
                           verified_backend_id, obj["session_id"], verified_backend_instance)
     return HookEvent(name, ident, Path(obj["cwd"]), obj.get("turn_id"),
-                     obj.get("agent_id"), obj.get("agent_type"))
+                     obj.get("agent_id"), obj.get("agent_type"), obj.get("stop_hook_active"))
 
 
 class AppServerProxy:
     """Small JSON-RPC client over Codex's stdio proxy to an existing socket."""
+    QUALIFIED_SERVER_VERSION = "0.170.0"
+    _USER_AGENT_VERSION = re.compile(
+        r"^codex-tui/(0\.170\.0) \([A-Za-z0-9 ._-]{1,80}; [A-Za-z0-9._-]{1,40}\)"
+        r"(?: herdr/\d{1,3}\.\d{1,3}\.\d{1,3} "
+        r"\(harness-herdr-hooks; \d{1,3}\.\d{1,3}\.\d{1,3}\))?$"
+    )
+
     def __init__(self, executable: str, socket_path: Path, *, context: Context, timeout: float = 5.0,
                  popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
                  lstat: Callable[[Path], os.stat_result] = Path.lstat):
@@ -122,10 +155,12 @@ class AppServerProxy:
         os.set_blocking(self._proc.stdin.fileno(), False)
         self._write_fd = self._proc.stdin.fileno()
         self._in_startup = True
+        self.server_version: str | None = None
         try:
             self._handshake(self._startup_deadline)
             initialized = self.request("initialize", {"clientInfo": {"name": "harness-herdr-hooks", "version": "0.1.0"},
                                                        "capabilities": {"experimentalApi": True}})
+            self.server_version = self._qualified_version(initialized)
             if initialized.get("codexHome") != str(context.config_root.resolve()):
                 raise ValueError("Codex app-server home does not match the selected profile")
             self.notify("initialized", {})
@@ -133,6 +168,19 @@ class AppServerProxy:
         except BaseException:
             self.close()
             raise
+
+    @classmethod
+    def _qualified_version(cls, initialized: object) -> str:
+        """Require the native server version from initialize before automation."""
+        if not isinstance(initialized, dict):
+            raise ValueError("Codex app-server initialize response is invalid")
+        user_agent = initialized.get("userAgent")
+        if not isinstance(user_agent, str):
+            raise ValueError("Codex app-server version is missing")
+        match = cls._USER_AGENT_VERSION.match(user_agent)
+        if match is None or match.group(1) != cls.QUALIFIED_SERVER_VERSION:
+            raise ValueError("Codex app-server version is unsupported")
+        return match.group(1)
 
     def _inspect_socket(self) -> tuple[int, int, int, int]:
         info = self._lstat(self.socket_path)
@@ -363,6 +411,44 @@ def list_loaded_threads(proxy: AppServerProxy) -> set[str]:
     raise RuntimeError("Codex loaded-thread pagination limit exceeded")
 
 
+def list_turn_metadata(proxy: AppServerProxy, thread_id: str, *, page_size: int = 100,
+                       max_pages: int = 10) -> tuple[TurnMetadata, ...]:
+    """Read bounded turn IDs/status only; never request transcript items."""
+    if not isinstance(thread_id, str) or not thread_id:
+        raise ValueError("Codex thread ID is required")
+    if not 1 <= page_size <= 100 or not 1 <= max_pages <= 10:
+        raise ValueError("Codex turn pagination bounds are invalid")
+    cursor: str | None = None
+    seen: set[str] = set()
+    result: list[TurnMetadata] = []
+    for _ in range(max_pages):
+        params: dict[str, Any] = {"threadId": thread_id, "itemsView": "notLoaded",
+                                  "limit": page_size, "sortDirection": "desc"}
+        if cursor:
+            params["cursor"] = cursor
+        page = proxy.request("thread/turns/list", params)
+        rows = page.get("data")
+        if not isinstance(rows, list):
+            raise RuntimeError("invalid Codex thread/turns/list data")
+        for row in rows:
+            if not isinstance(row, dict) or not isinstance(row.get("id"), str) or row.get("status") not in {"completed", "interrupted", "failed", "inProgress"}:
+                raise RuntimeError("invalid Codex turn metadata")
+            # A proxy/server violating itemsView=notLoaded is not allowed to
+            # make transcript contents enter lifecycle state.
+            if row.get("itemsView", "notLoaded") != "notLoaded" or row.get("items") not in (None, []):
+                raise RuntimeError("Codex turn response included transcript items")
+            result.append(TurnMetadata(thread_id, row["id"], row["status"]))
+        cursor = page.get("nextCursor")
+        if cursor is None:
+            return tuple(result)
+        if not isinstance(cursor, str) or not cursor or cursor in seen:
+            raise RuntimeError("invalid or cyclic Codex turn pagination cursor")
+        seen.add(cursor)
+    if cursor is not None:
+        raise RuntimeError("Codex turn pagination limit exceeded")
+    return tuple(result)
+
+
 def lifecycle(status: Mapping[str, Any] | str | None, *, loaded: bool,
               attachable: bool) -> tuple[Lifecycle, bool]:
     """Only active + loaded + verified attachable metadata qualifies for display."""
@@ -405,10 +491,10 @@ class CodexRuntimeAdapter:
     @staticmethod
     def _is_native_child(thread: Mapping[str, Any], parent_id: str) -> bool:
         source = thread.get("source")
-        if not isinstance(source, dict) or set(source) != {"subAgent"}:
+        if not isinstance(source, dict) or "subAgent" not in source:
             return False
         sub = source["subAgent"]
-        if not isinstance(sub, dict) or set(sub) != {"thread_spawn"}:
+        if not isinstance(sub, dict) or "thread_spawn" not in sub:
             return False
         spawn = sub["thread_spawn"]
         return isinstance(spawn, dict) and spawn.get("parent_thread_id") == parent_id
@@ -541,4 +627,4 @@ def attach_argv(executable: str, socket_path: Path, child_id: str) -> list[str]:
     return [executable, "resume", "--remote", f"unix://{socket_path}", child_id]
 
 
-__all__ = ["AppServerProxy", "CodexIdentity", "HookEvent", "attach_argv", "lifecycle", "list_loaded_threads", "list_threads", "parse_hook"]
+__all__ = ["AppServerProxy", "CodexIdentity", "HookEvent", "TurnMetadata", "attach_argv", "lifecycle", "list_loaded_threads", "list_threads", "list_turn_metadata", "parse_hook"]
