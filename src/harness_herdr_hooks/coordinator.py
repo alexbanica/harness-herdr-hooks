@@ -31,7 +31,7 @@ class Coordinator:
     def observe_initial(self, parent: ParentBinding) -> Outcome:
         if not self.runtime.verify_parent(parent):
             return Outcome(Decision.SKIP, "parent context is not verified")
-        keys = {s.context.key() for s in self.runtime.sessions(parent)}
+        keys = {s.context.key() for s in self.runtime.sessions(parent) if s.kind != "standalone"}
         self.store.establish_baseline(keys)
         return Outcome(Decision.BASELINE, "existing sessions excluded")
 
@@ -43,10 +43,154 @@ class Coordinator:
             cc.profile != pc.profile or cc.config_root.resolve() != pc.config_root.resolve() or
             cc.data_root.resolve() != pc.data_root.resolve() or cc.state_root.resolve() != pc.state_root.resolve()):
             return Outcome(Decision.SKIP, "provider/profile/backend mismatch")
-        if child.parent_session_id != pc.session_id and pc.session_id not in child.ancestry:
+        if child.kind == "standalone":
+            proof = child.creation_proof
+            if (proof is None or proof.parent_id != pc.session_id or
+                    proof.child_id != cc.session_id or child.parent_session_id != pc.session_id):
+                return Outcome(Decision.SKIP, "standalone creation proof does not prove this parent")
+            key = hashlib.sha256(json.dumps([proof.parent_id, proof.turn_id, proof.item_id],
+                                            separators=(",", ":")).encode()).hexdigest()
+        elif child.parent_session_id != pc.session_id and pc.session_id not in child.ancestry:
             return Outcome(Decision.SKIP, "child ancestry does not prove this parent")
+        if child.kind == "standalone":
+            return self._handle_standalone(parent, child, key)
         with self.store.observing():
             return self._handle_serialized(parent, child)
+
+    def _handle_standalone(self, parent: ParentBinding, child: Session, event_key: str) -> Outcome:
+        """Claim a verified standalone creation under locks, then call runtime unlocked."""
+        proof = child.creation_proof
+        pc = parent.context
+        # The observer lock serializes candidate verification and initial claim.
+        # No provider/Herdr operation is permitted while either lock is held.
+        with self.store.observing():
+            with self.store.locked() as state:
+                # Match the exact persisted association while serialized with
+                # other observer claims; no provider/native calls occur here.
+                candidate_context = {"profile": pc.profile, "backend_id": pc.backend_id,
+                                     "backend_instance": pc.backend_instance,
+                                     "session_id": pc.session_id}
+                candidate_destination = {"server_id": parent.herdr_server_id,
+                                         "workspace_id": parent.workspace_id,
+                                         "tab_id": parent.tab_id, "pane_id": parent.pane_id}
+                expected_path = str(Path(parent.session_path).absolute()) if parent.session_path else None
+                digest = hashlib.sha256(os.path.normpath(str(child.cwd)).encode("utf-8")).hexdigest() if child.cwd else None
+                discovery = state.get("task_discovery", {})
+                authority = discovery.get("authority") or {}
+                bound_parent = authority.get("parent", {})
+                if (not expected_path or bound_parent.get("parent_id") != pc.session_id
+                        or bound_parent.get("path") != expected_path
+                        or authority.get("context") != candidate_context
+                        or authority.get("destination") != candidate_destination):
+                    return Outcome(Decision.SKIP, "standalone parent file is not exactly bound")
+                candidate = next((x for x in discovery.get("pending", [])
+                                  if x.get("event_key") == event_key and x.get("status") == "verified"
+                           and x.get("child_id") == proof.child_id
+                           and x.get("parent_id") == pc.session_id
+                           and x.get("context") == candidate_context
+                           and x.get("destination") == candidate_destination
+                           and x.get("cwd_sha256") == proof.cwd_sha256
+                           and (proof.cwd_sha256 is None or proof.cwd_sha256 == digest)), None)
+                terminal_outcome = next((x for x in discovery.get("outcomes", [])
+                                         if x.get("event_key") == event_key
+                                         and x.get("child_id") == proof.child_id
+                                         and x.get("status") == "attached"), None)
+                replay_record = state["records"].get(child.context.key(), {})
+                replay = candidate is None and terminal_outcome is not None \
+                    and replay_record.get("standalone_event_key") == event_key
+                if candidate is None:
+                    if not replay:
+                        return Outcome(Decision.SKIP, "standalone creation association is not verified")
+                    association_hash = replay_record.get("standalone_association_sha256")
+                else:
+                    association_hash = hashlib.sha256(json.dumps(
+                        {"authority": authority, "candidate": candidate}, sort_keys=True,
+                        separators=(",", ":")).encode()).hexdigest()
+                if child.lifecycle != Lifecycle.RUNNING:
+                    return Outcome(Decision.SKIP, "standalone task is not positively running")
+                key = child.context.key()
+                records = state["records"]
+                rec = records.get(key, {})
+                if not state.get("baseline_ready"):
+                    return Outcome(Decision.SKIP, "initial baseline is not established")
+                if key in state.get("baseline", ()):
+                    return Outcome(Decision.SKIP, "pre-existing session")
+                if rec.get("status") == "suppressed":
+                    return Outcome(Decision.SKIP, "pane was manually closed", rec.get("binding_id"))
+                generation = proof.turn_id + ":" + proof.item_id
+                authority_hash = hashlib.sha256(json.dumps(
+                    authority, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+                if rec.get("standalone_event_key") not in (None, event_key):
+                    return Outcome(Decision.SKIP, "standalone association changed")
+                if rec.get("status") in {"attached", "claimed"} and rec.get(
+                        "standalone_association_sha256") != association_hash:
+                    return Outcome(Decision.SKIP, "standalone association changed")
+                if rec.get("status") not in {"attached", "claimed"}:
+                    attempts = int(rec.get("attempts", 0))
+                    if attempts >= MAX_RETRIES:
+                        return Outcome(Decision.FAILED, "retry budget exhausted", rec.get("binding_id"), attempts)
+                    binding = hashlib.sha256(f"{key}:{event_key}".encode()).hexdigest()[:24]
+                    rec = {**rec, "status": "claimed", "binding_id": binding,
+                           "attempts": attempts, "generation": generation,
+                           "turn_id": proof.turn_id, "kind": "standalone",
+                           "ownership": "created", "standalone_event_key": event_key,
+                           "standalone_association_sha256": association_hash,
+                           "standalone_authority_sha256": authority_hash,
+                           "standalone_child_id": proof.child_id}
+                    records[key] = rec
+                    newly_claimed = True
+                else:
+                    newly_claimed = False
+                claim = dict(rec)
+                binding = claim.get("binding_id")
+                attempts = int(claim.get("attempts", 0))
+
+        # Claim is durable before external inspection/attachment. Concurrent
+        # observers see it and can only reconcile, never launch a duplicate.
+        claim_binding = binding
+        try:
+            if not newly_claimed:
+                pane_state = self.runtime.owned_pane_state(parent, child, binding)
+            else:
+                pane_state = "new-claim"
+        except Exception:
+            pane_state = "unknown"
+        if pane_state == "closed":
+            if not self.store.reconcile_standalone(key, event_key, binding, "suppressed",
+                                                   reason="verified pane closure"):
+                return Outcome(Decision.WAIT, "standalone association changed during pane inspection", binding, attempts)
+            return Outcome(Decision.SKIP, "pane was manually closed", binding)
+        if pane_state == "live":
+            if not self.store.reconcile_standalone(key, event_key, claim_binding, "attached", title=child.title):
+                return Outcome(Decision.WAIT, "standalone association changed during pane inspection", binding, attempts)
+            self.store.update_task_candidate(event_key, status="attached", now=time.time())
+            if child.title and claim.get("title") != child.title:
+                try: self.runtime.update_title(binding, child.title)
+                except Exception: pass
+            return Outcome(Decision.ATTACHED, "reconciled owned pane", binding, attempts)
+        if claim.get("status") == "attached":
+            return Outcome(Decision.WAIT, "owned pane state is unknown", binding, attempts)
+        if not newly_claimed:
+            return Outcome(Decision.WAIT, "stale claim ownership is unknown; fail closed", binding, attempts)
+        try:
+            existing = self.runtime.find_existing_pane(parent, child)
+            if existing:
+                binding = existing
+            live = child.attachable and self.runtime.can_attach_now(parent, child)
+            ok = bool(live and (existing or self.runtime.open_and_attach(parent, child, binding)))
+        except Exception:
+            ok = False
+        if ok:
+            if not self.store.reconcile_standalone(key, event_key, claim_binding, "attached", title=child.title,
+                                                   binding_id=binding,
+                                                   ownership="reused" if existing else "created"):
+                return Outcome(Decision.WAIT, "standalone association changed during attachment", binding, attempts)
+            self.store.update_task_candidate(event_key, status="attached", now=time.time())
+            return Outcome(Decision.ATTACHED, binding_id=binding, attempts=attempts)
+        if not self.store.reconcile_standalone(key, event_key, claim_binding, "pending", attempts=attempts + 1):
+            return Outcome(Decision.WAIT, "standalone association changed during attachment", binding, attempts)
+        return Outcome(Decision.WAIT if attempts + 1 < MAX_RETRIES else Decision.FAILED,
+                       "child not yet attachable", binding, attempts + 1)
 
     def _handle_serialized(self, parent: ParentBinding, child: Session) -> Outcome:
         if not self.runtime.verify_parent(parent):
@@ -299,7 +443,7 @@ class NativeRuntime:
             # the pinned backend incarnation to the selected parent context.
             c = replace(child.context, backend_instance=parent.context.backend_instance)
             child = replace(child, context=c)
-            if child.context.harness.value == "codex":
+            if child.context.harness.value == "codex" and child.kind == "subagent":
                 try:
                     from .adapters.codex import list_turn_metadata
                     turns = list_turn_metadata(self.provider.proxy, child.context.session_id)
@@ -529,7 +673,17 @@ def run_observer(parent: ParentBinding, store: StateStore, provider: object,
         while runtime.verify_parent(parent):
             try:
                 for child in runtime.sessions(parent):
-                    coordinator.handle(parent, child)
+                    outcome = coordinator.handle(parent, child)
+                    proof = child.creation_proof
+                    if child.kind == "standalone" and proof is not None:
+                        event_key = hashlib.sha256(json.dumps(
+                            [proof.parent_id, proof.turn_id, proof.item_id],
+                            separators=(",", ":")).encode()).hexdigest()
+                        if outcome.decision == Decision.ATTACHED:
+                            store.update_task_candidate(event_key, status="attached", now=time.time())
+                            report = getattr(provider, "_standalone_status", None)
+                            if callable(report):
+                                report("recognized", "verified", "attached")
                 failures = 0
             except Exception:
                 failures += 1

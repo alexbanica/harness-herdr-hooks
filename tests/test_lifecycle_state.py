@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from harness_herdr_hooks.model import (
-    Context, Harness, Lifecycle, Session, session_from_dict, session_to_dict,
+    Context, CreationProof, Harness, Lifecycle, Session, session_from_dict, session_to_dict,
 )
 from harness_herdr_hooks.state import (
     StateStore, binding_is_close_owned, load_existing_binding, save_binding,
@@ -27,6 +27,19 @@ class LifecycleModelTests(unittest.TestCase):
         legacy["kind"] = "arbitrary"
         with self.assertRaises(ValueError):
             session_from_dict(legacy)
+
+    def test_standalone_kind_requires_minimum_creation_proof(self):
+        current = session_to_dict(make_session())
+        current["kind"] = "standalone"
+        current["creation_proof"] = {"parent_id": "parent", "turn_id": "turn",
+                                     "item_id": "item", "child_id": "child"}
+        current["context"]["session_id"] = "child"
+        current["parent_session_id"] = "parent"
+        standalone = session_from_dict(current)
+        self.assertEqual(standalone.kind, "standalone")
+        self.assertEqual(standalone.creation_proof, CreationProof("parent", "turn", "item", "child"))
+        del current["creation_proof"]
+        with self.assertRaises(ValueError): session_from_dict(current)
 
     def test_parent_backend_proof_roundtrip_is_bounded_and_path_checked(self):
         from harness_herdr_hooks.model import ParentBinding, parent_from_dict, parent_to_dict

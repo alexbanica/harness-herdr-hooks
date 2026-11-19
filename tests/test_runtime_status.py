@@ -26,10 +26,48 @@ class RuntimeStatusTests(unittest.TestCase):
     def test_absent_status_is_unknown_and_does_not_create_state(self):
         self.assertEqual(cli._runtime_status(self.root, str(self.profile)), {
             "native_hook_loading": "unknown", "last_verified_binding": "unknown", "observer": "unknown",
+            "task_discovery": {"recognition": "unknown", "verification": "unknown", "attachment": "unknown"},
             "attachment": {"known": False, "observed_counts": {}},
             "cleanup": {"known": False, "outcomes": {}}, "ownership": {"known": False, "counts": {}},
         })
         self.assertFalse(self.root.exists())
+
+    def test_task_discovery_status_is_bounded_and_retained(self):
+        cli._runtime_write(self.root, str(self.profile), lambda d: d.update(task_discovery={
+            "recognition": "recognized", "verification": "verified",
+            "attachment": "pending", "reason": "attachment_pending", "raw": "discard"}))
+        status = cli._runtime_status(self.root, str(self.profile))["task_discovery"]
+        self.assertEqual(status, {"recognition": "recognized", "verification": "verified",
+                                  "attachment": "pending", "reason": "attachment_pending"})
+        cli._runtime_write(self.root, str(self.profile), lambda d: d.update(task_discovery={
+            "recognition": "unknown", "verification": "unknown", "attachment": "unknown"}))
+        self.assertEqual(cli._runtime_status(self.root, str(self.profile))["task_discovery"], {
+            "recognition": "unknown", "verification": "unknown", "attachment": "unknown"})
+
+    def test_unsupported_creation_envelope_reason_survives_bounded_status(self):
+        cli._runtime_write(self.root, str(self.profile), lambda d: d.update(task_discovery={
+            "recognition": "recognized", "verification": "unknown",
+            "attachment": "unknown", "reason": "unsupported_envelope",
+            "raw": "discard"}))
+        self.assertEqual(cli._runtime_status(self.root, str(self.profile))["task_discovery"], {
+            "recognition": "recognized", "verification": "unknown",
+            "attachment": "unknown", "reason": "unsupported_envelope"})
+
+    def test_current_task_failure_replaces_stale_success_and_exposes_only_reason_code(self):
+        adapter = object.__new__(__import__("harness_herdr_hooks.adapters.codex", fromlist=["CodexRuntimeAdapter"]).CodexRuntimeAdapter)
+        adapter.context = type("C", (), {"profile": str(self.profile)})()
+        adapter.task_store_root = self.root
+        adapter._standalone_status("recognized", "verified", "attached")
+        adapter._standalone_status("deferred", "deferred", "unknown", "unsafe_parent_file")
+        task = cli._runtime_status(self.root, str(self.profile))["task_discovery"]
+        self.assertEqual(task, {"recognition": "recognized", "verification": "verified",
+                                "attachment": "attached", "reason": "unsafe_parent_file",
+                                "current_health": {"state": "deferred", "reason": "unsafe_parent_file"}})
+        self.assertNotIn("exception", json.dumps(task))
+        adapter._standalone_status("observing", "unknown", "unknown")
+        self.assertEqual(cli._runtime_status(self.root, str(self.profile))["task_discovery"], {
+            "recognition": "recognized", "verification": "verified", "attachment": "attached",
+            "reason": "unsafe_parent_file", "current_health": {"state": "healthy"}})
 
     def test_verified_codex_hook_records_bounded_profile_evidence(self):
         env = {"HERDR_ENV": "1", "HERDR_SOCKET_PATH": "/private/socket",

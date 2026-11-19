@@ -65,3 +65,16 @@ cross-profile/backend isolation, authorized real child display and completion
 cleanup, ordinary launch routing, and all race/concurrency paths remain
 unqualified. macOS runtime is a separate outstanding predecessor gap. These
 remain acceptance work; no complete support claim is made.
+
+## Standalone Codex task records
+
+Codex standalone discovery reads only newly appended qualified creation records
+from the exact verified parent's owner-controlled rollout file inside the
+selected profile's sessions directory. The typed event nominates a child;
+native metadata from that same backend independently establishes task identity,
+cwd and attachability. No other profile/backend is searched to make a candidate
+fit. Persistent state contains bounded IDs, cursor/file identity, hashes for an
+optional normalized cwd, context/destination pins, and retry/outcome metadata;
+it excludes prompts, raw tool results, transcript text and partial record
+bytes. This local-record association is not cryptographic ancestry proof and
+does not establish native subagent lineage.

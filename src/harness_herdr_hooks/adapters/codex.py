@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -461,7 +462,8 @@ def lifecycle(status: Mapping[str, Any] | str | None, *, loaded: bool,
 class CodexRuntimeAdapter:
     """Maps one verified Codex backend into the coordinator Runtime interface."""
     def __init__(self, context: Context, executable: str = "codex", *,
-                 proxy_factory: Callable[..., AppServerProxy] = AppServerProxy):
+                 proxy_factory: Callable[..., AppServerProxy] = AppServerProxy,
+                 task_store_root: Path | None = None):
         if context.harness is not Harness.CODEX:
             raise ValueError("Codex runtime requires a Codex context")
         raw_socket_path = Path(context.backend_id)
@@ -480,9 +482,11 @@ class CodexRuntimeAdapter:
         if not context.backend_instance:
             raise ValueError("Codex socket incarnation pin is required")
         self.context = context
+        self.task_store_root = task_store_root or context.state_root
         self.executable = executable
         self.socket_path = socket_path
         self.proxy = proxy_factory(executable, socket_path, context=context)
+        self._task_retry_monotonic: dict[str, tuple[float, float, float]] = {}
 
     def _check_parent(self, parent: ParentBinding) -> None:
         if parent.context != self.context:
@@ -569,6 +573,293 @@ class CodexRuntimeAdapter:
             chain = self._verified_chain(ident, rows, parent.context.session_id)
             if chain is not None:
                 yield self._session(thread, chain, loaded)
+        try:
+            yield from self._standalone_sessions(parent)
+        except Exception:
+            # Malformed or unavailable rollout files disable only this
+            # optional discovery path; native ancestry discovery stays live.
+            self._standalone_status("deferred", "deferred", "unknown", "metadata_unavailable")
+
+    def _standalone_status(self, recognition: str, verification: str,
+                           attachment: str, reason: str | None = None) -> None:
+        try:
+            from ..cli import _runtime_write
+            def update(data):
+                current = data.get("task_discovery", {})
+                if not isinstance(current, dict): current = {}
+                # Stage fields describe the last meaningful discovery result.
+                # Empty reads and capture failures update health only.
+                for key, value in (("recognition", recognition),
+                                   ("verification", verification),
+                                   ("attachment", attachment)):
+                    if value not in {"unknown", "observing", "deferred"}:
+                        current[key] = value
+                if reason in {"parent_file_missing", "parent_file_mismatch", "unsafe_parent_file",
+                              "metadata_unavailable", "candidate_expired", "future_timestamp",
+                              "task_finished", "task_mismatch", "unsupported_envelope",
+                              "unsupported_record_format", "retry_exhausted", "attachment_pending",
+                              "invalid_cwd", "cwd_mismatch", "status_deferred"}:
+                    current["reason"] = reason
+                elif reason is None and any(value not in {"unknown", "observing", "deferred"}
+                                            for value in (recognition, verification, attachment)):
+                    current.pop("reason", None)
+                health = {"state": "deferred" if reason in {
+                    "parent_file_missing", "parent_file_mismatch", "unsafe_parent_file",
+                    "metadata_unavailable", "candidate_expired", "future_timestamp",
+                    "unsupported_envelope", "unsupported_record_format", "retry_exhausted",
+                    "invalid_cwd", "cwd_mismatch", "status_deferred"} else "healthy"}
+                if health["state"] == "deferred" and reason in {
+                    "parent_file_missing", "parent_file_mismatch", "unsafe_parent_file",
+                    "metadata_unavailable", "candidate_expired", "future_timestamp",
+                    "unsupported_envelope", "unsupported_record_format", "retry_exhausted",
+                    "invalid_cwd", "cwd_mismatch", "status_deferred"}:
+                    health["reason"] = reason
+                current["current_health"] = health
+                data["task_discovery"] = current
+            _runtime_write(self.task_store_root, self.context.profile, update)
+        except Exception:
+            pass
+
+    def _standalone_sessions(self, parent: ParentBinding) -> Iterator[Session]:
+        """Observe only new typed create_thread results in the exact bound parent file."""
+        import os
+        from ..codex_task_records import bind_parent_file, read_new_records
+        from ..model import CreationProof
+        from ..state import StateStore
+
+        try:
+            native_parent = self._read_thread(parent.context.session_id)
+        except Exception:
+            self._standalone_status("deferred", "deferred", "unknown", "metadata_unavailable")
+            return
+        if not isinstance(native_parent, dict):
+            self._standalone_status("deferred", "deferred", "unknown", "metadata_unavailable")
+            return
+        raw_parent_path = native_parent.get("path")
+        if not isinstance(raw_parent_path, str) or not Path(raw_parent_path).is_absolute():
+            self._standalone_status("deferred", "deferred", "unknown", "parent_file_missing")
+            return
+        if native_parent.get("id") != parent.context.session_id:
+            self._standalone_status("deferred", "deferred", "unknown", "parent_file_mismatch")
+            return
+        native_path = Path(raw_parent_path)
+        if parent.session_path is not None and os.path.abspath(native_path) != os.path.abspath(parent.session_path):
+            self._standalone_status("deferred", "deferred", "unknown", "parent_file_mismatch")
+            return
+        sessions_dir = self.context.data_root / "sessions"
+        store = StateStore(self.task_store_root, self.context.key()[:32])
+        try:
+            binding = bind_parent_file(native_path, sessions_dir, parent.context.session_id)
+        except FileNotFoundError:
+            self._standalone_status("deferred", "deferred", "unknown", "parent_file_missing")
+            return
+        except ValueError as exc:
+            missing_component = isinstance(exc.__cause__, OSError) and getattr(exc.__cause__, "errno", None) == 2
+            reason = "parent_file_missing" if missing_component else "unsafe_parent_file"
+            self._standalone_status("deferred", "deferred", "unknown", reason)
+            return
+        except OSError as exc:
+            reason = "parent_file_missing" if getattr(exc, "errno", None) == 2 else "unsafe_parent_file"
+            self._standalone_status("deferred", "deferred", "unknown", reason)
+            return
+        # Pair the cursor snapshot with the local read and commit. No provider
+        # request is made while this separate task-observer lock is held.
+        with store.task_observing():
+            snapshot = store.task_discovery()
+            read = read_new_records(binding, snapshot.get("cursor"))
+            authority = {"parent_id": parent.context.session_id,
+                         "path": binding.path, "owner_uid": binding.owner_uid}
+            context_pin = {"profile": parent.context.profile,
+                           "backend_id": parent.context.backend_id,
+                           "backend_instance": parent.context.backend_instance,
+                           "session_id": parent.context.session_id}
+            destination = {"server_id": parent.herdr_server_id,
+                           "workspace_id": parent.workspace_id,
+                           "tab_id": parent.tab_id, "pane_id": parent.pane_id}
+            store.commit_task_records(read.cursor.to_dict(), list(read.events), parent=authority,
+                                      context=context_pin, destination=destination, now=time.time())
+        reasons = {"unsupported record format": "unsupported_envelope",
+                   "parent rollout replaced": "parent_file_mismatch",
+                   "parent rollout truncated": "parent_file_mismatch",
+                   "cursor identity changed": "parent_file_mismatch",
+                   "oversized record skipped": "unsupported_envelope"}
+        reason = reasons.get(read.reason or "")
+        self._standalone_status("recognized" if read.events else "observing",
+                                "pending" if read.events else "unknown", "unknown", reason)
+        discovery = store.task_discovery()
+        candidates = list(discovery.get("pending", []))
+        retry_map = getattr(self, "_task_retry_monotonic", None)
+        if retry_map is None:
+            retry_map = self._task_retry_monotonic = {}
+        live_keys = {item.get("event_key") for item in candidates if isinstance(item, dict)}
+        for key in tuple(retry_map):
+            if key not in live_keys:
+                retry_map.pop(key, None)
+        # Re-observe attached work only through its durable exact task record
+        # and owned binding. Bound this path; never enumerate arbitrary threads.
+        from ..state import load_existing_binding
+        from ..model import context_to_dict, parent_from_dict, session_from_dict
+        for outcome in discovery.get("outcomes", [])[-128:]:
+            if outcome.get("status") != "attached" or not isinstance(outcome.get("child_id"), str):
+                continue
+            child_id = outcome["child_id"]
+            child_context = Context(Harness.CODEX, parent.context.profile, parent.context.config_root,
+                                    parent.context.data_root, parent.context.state_root,
+                                    parent.context.backend_id, child_id, parent.context.backend_instance)
+            record = store.record(child_context.key())
+            if not isinstance(record, dict) or record.get("status") != "attached":
+                continue
+            generation, turn_id = record.get("generation"), record.get("turn_id")
+            if not isinstance(generation, str) or not isinstance(turn_id, str) or not generation.startswith(turn_id + ":"):
+                continue
+            item_id = generation[len(turn_id) + 1:]
+            event_key = hashlib.sha256(json.dumps([parent.context.session_id, turn_id, item_id], separators=(",", ":")).encode()).hexdigest()
+            if outcome.get("event_key") != event_key:
+                continue
+            try:
+                binding = load_existing_binding(self.task_store_root, record.get("binding_id"))
+            except Exception:
+                continue
+            try:
+                bound_parent = parent_from_dict(binding.get("parent"))
+                bound_child = session_from_dict(binding.get("child"))
+            except Exception:
+                continue
+            proof = bound_child.creation_proof
+            if (binding.get("kind") != "standalone" or binding.get("outcome", {}).get("status") != "attached"
+                    or context_to_dict(bound_child.context) != context_to_dict(child_context)
+                    or context_to_dict(bound_parent.context) != context_to_dict(parent.context)
+                    or bound_parent.session_path != parent.session_path
+                    or proof is None or proof.parent_id != parent.context.session_id
+                    or proof.turn_id != turn_id or proof.item_id != item_id or proof.child_id != child_id):
+                continue
+            candidates.append({"event_key": event_key, "child_id": child_id,
+                               "parent_id": parent.context.session_id, "turn_id": turn_id,
+                               "item_id": item_id, "cwd_sha256": proof.cwd_sha256,
+                               "status": "attached_replay", "context": context_pin,
+                               "destination": destination, "proof": proof})
+        if not candidates:
+            return
+        loaded = list_loaded_threads(self.proxy)
+        for candidate in candidates:
+            if (candidate.get("context") != context_pin or candidate.get("destination") != destination
+                    or candidate.get("parent_id") != parent.context.session_id):
+                store.update_task_candidate(candidate["event_key"], status="rejected",
+                                            now=time.time(), reason="context changed")
+                continue
+            wall_now = time.time()
+            mono_now = time.monotonic()
+            first_seen = candidate.get("first_seen")
+            # Persisted wall-clock timestamps are trusted only inside the bounded
+            # retry window. Use monotonic time for the rest of this process so a
+            # clock adjustment cannot extend the candidate's lifetime.
+            replay = candidate.get("status") == "attached_replay"
+            if not replay and (not isinstance(first_seen, (int, float)) or isinstance(first_seen, bool)
+                    or not math.isfinite(first_seen)):
+                store.update_task_candidate(candidate["event_key"], status="rejected",
+                                            now=wall_now, reason="metadata unavailable")
+                self._standalone_status("recognized", "rejected", "unknown", "candidate_expired")
+                continue
+            if replay:
+                logical_now, deadline = wall_now, float("inf")
+            else:
+                stamp = retry_map.get(candidate["event_key"])
+                if stamp is None or stamp[0] != float(first_seen):
+                    age = wall_now - float(first_seen)
+                    if age < 0:
+                        store.update_task_candidate(candidate["event_key"], status="rejected", now=wall_now,
+                                                    reason="metadata unavailable")
+                        self._standalone_status("recognized", "rejected", "unknown", "future_timestamp")
+                        continue
+                    started = mono_now - age
+                    deadline = started + 30.0
+                    stamp = (float(first_seen), started, deadline)
+                    if len(retry_map) >= 128:
+                        retry_map.pop(next(iter(retry_map)))
+                    retry_map[candidate["event_key"]] = stamp
+                _saved_first, started, deadline = stamp
+                logical_now = float(first_seen) + max(0.0, mono_now - started)
+            if not replay and mono_now >= deadline:
+                store.update_task_candidate(candidate["event_key"], status="rejected",
+                                            now=logical_now, reason="metadata unavailable")
+                self._standalone_status("recognized", "rejected", "unknown", "candidate_expired")
+                retry_map.pop(candidate["event_key"], None)
+                continue
+            if not replay and not store.reserve_task_verification(candidate["event_key"], now=logical_now):
+                outcomes = store.task_discovery().get("outcomes", [])
+                if any(item.get("event_key") == candidate["event_key"] and item.get("status") == "rejected"
+                       for item in outcomes if isinstance(item, dict)):
+                    self._standalone_status("recognized", "rejected", "unknown", "retry_exhausted")
+                continue
+            try:
+                row = self._read_thread(candidate["child_id"])
+                if row.get("id") != candidate["child_id"]:
+                    store.update_task_candidate(candidate["event_key"], status="rejected",
+                                                now=logical_now, reason="context changed")
+                    self._standalone_status("recognized", "rejected", "unknown", "task_mismatch")
+                    continue
+                if candidate["child_id"] not in loaded:
+                    raise LookupError("metadata unavailable")
+                cwd = row.get("cwd")
+                if cwd is None:
+                    raise LookupError("metadata unavailable")
+                if not isinstance(cwd, str) or not Path(cwd).is_absolute():
+                    store.update_task_candidate(candidate["event_key"], status="rejected",
+                                                now=logical_now, reason="not attachable")
+                    self._standalone_status("recognized", "rejected", "unknown", "invalid_cwd")
+                    continue
+                digest = candidate.get("cwd_sha256")
+                if digest is not None:
+                    if hashlib.sha256(os.path.normpath(cwd).encode("utf-8")).hexdigest() != digest:
+                        store.update_task_candidate(candidate["event_key"], status="rejected",
+                                                    now=logical_now, reason="context changed")
+                        self._standalone_status("recognized", "rejected", "unknown", "cwd_mismatch")
+                        continue
+                native_status = row.get("status")
+                status_type = native_status.get("type") if isinstance(native_status, dict) else None
+                if status_type in {"completed", "interrupted", "failed"}:
+                    # Existing attached replays remain historical attachment evidence.
+                    store.update_task_candidate(candidate["event_key"], status="rejected",
+                                                now=logical_now, reason="not attachable")
+                    if not replay:
+                        self._standalone_status("recognized", "rejected", "unknown", "task_finished")
+                    continue
+                if not self._active_status(native_status):
+                    if replay:
+                        continue
+                    store.update_task_candidate(candidate["event_key"], status="pending",
+                                                now=logical_now, reason="metadata unavailable")
+                    self._standalone_status("recognized", "deferred", "unknown", "status_deferred")
+                    continue
+                proof = candidate.get("proof") or CreationProof(candidate["parent_id"], candidate["turn_id"],
+                                      candidate["item_id"], candidate["child_id"], digest)
+                context = Context(Harness.CODEX, self.context.profile, self.context.config_root,
+                                  self.context.data_root, self.context.state_root,
+                                  self.context.backend_id, candidate["child_id"],
+                                  self.context.backend_instance)
+                if not replay:
+                    store.update_task_candidate(candidate["event_key"], status="verified", now=logical_now)
+                    self._standalone_status("recognized", "verified", "pending")
+                    finished_mono = time.monotonic()
+                    if finished_mono >= deadline:
+                        store.update_task_candidate(candidate["event_key"], status="rejected",
+                                                    now=logical_now + finished_mono - mono_now,
+                                                    reason="metadata unavailable")
+                        self._standalone_status("recognized", "rejected", "unknown", "candidate_expired")
+                        retry_map.pop(candidate["event_key"], None)
+                        continue
+                raw_path = row.get("path")
+                session_path = Path(raw_path).resolve(strict=False) if isinstance(raw_path, str) and Path(raw_path).is_absolute() else None
+                yield Session(context, parent.context.session_id,
+                              row.get("name") if isinstance(row.get("name"), str) else None,
+                              Path(cwd), Lifecycle.RUNNING, True, time.time(), (),
+                              session_path, "standalone", None, None, proof)
+            except Exception:
+                if not replay:
+                    store.update_task_candidate(candidate["event_key"], status="pending",
+                                                now=logical_now + max(0.0, time.monotonic() - mono_now),
+                                                reason="metadata unavailable")
+                    self._standalone_status("recognized", "deferred", "unknown", "metadata_unavailable")
 
     def _read_thread(self, thread_id: str) -> Mapping[str, Any]:
         result = self.proxy.request("thread/read", {"threadId": thread_id, "includeTurns": False})
@@ -579,6 +870,50 @@ class CodexRuntimeAdapter:
 
     def can_attach_now(self, parent: ParentBinding, child: Session) -> bool:
         self._check_parent(parent)
+        if child.kind == "standalone":
+            pc, cc = parent.context, child.context
+            proof = child.creation_proof
+            if (cc.harness != pc.harness or cc.backend_id != pc.backend_id or
+                    cc.backend_instance != pc.backend_instance or cc.profile != pc.profile or
+                    cc.config_root.resolve() != pc.config_root.resolve() or
+                    cc.data_root.resolve() != pc.data_root.resolve() or
+                    cc.state_root.resolve() != pc.state_root.resolve() or
+                    proof is None or proof.parent_id != parent.context.session_id or
+                    proof.child_id != child.context.session_id or child.parent_session_id != proof.parent_id):
+                return False
+            try:
+                native_parent = self._read_thread(pc.session_id)
+            except Exception:
+                return False
+            native_path = native_parent.get("path")
+            if (native_parent.get("id") != pc.session_id or
+                    not isinstance(native_path, str) or not Path(native_path).is_absolute()):
+                return False
+            if parent.session_path is None or Path(native_path).resolve(strict=False) != parent.session_path.resolve(strict=False):
+                return False
+            try:
+                from ..codex_task_records import bind_parent_file
+                bind_parent_file(Path(native_path), pc.data_root / "sessions", pc.session_id)
+            except (OSError, ValueError):
+                return False
+            loaded = list_loaded_threads(self.proxy)
+            if child.context.session_id not in loaded:
+                return False
+            try:
+                thread = self._read_thread(child.context.session_id)
+            except Exception:
+                return False
+            cwd = thread.get("cwd")
+            if (thread.get("id") != child.context.session_id or not isinstance(cwd, str)
+                    or not Path(cwd).is_absolute() or Path(cwd) != child.cwd
+                    or not self._active_status(thread.get("status"))):
+                return False
+            if proof.cwd_sha256 is not None:
+                import hashlib
+                import os
+                if hashlib.sha256(os.path.normpath(cwd).encode("utf-8")).hexdigest() != proof.cwd_sha256:
+                    return False
+            return True
         if (child.context.harness is not Harness.CODEX
                 or child.context.backend_id != self.context.backend_id
                 or child.context.backend_instance != self.context.backend_instance):
