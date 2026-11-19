@@ -84,6 +84,17 @@ def _tty_has_no_processes(tty:str)->bool:
         return _tty_stats_empty(stats,dev)
     except OSError: return False
 
+def _tty_identity(tty:object)->tuple[int,int,int]|None:
+    """Pin the PTY node incarnation as well as its device number."""
+    if not isinstance(tty,str) or not tty.startswith('/dev/'):
+        return None
+    try:
+        info=os.stat(tty)
+        if not stat.S_ISCHR(info.st_mode): return None
+        return info.st_dev,info.st_ino,info.st_rdev
+    except OSError:
+        return None
+
 def _runtime(parent:Any,child:Any,client:HerdrClient,backend_pid:int|None):
     if child.context.harness==Harness.CODEX:
         from .adapters.codex import CodexRuntimeAdapter

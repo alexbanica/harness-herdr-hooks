@@ -125,8 +125,28 @@ def _atomic(path:Path,raw:bytes,mode:int,*,expected:bytes|None=None,
         try: os.unlink(tmp)
         except FileNotFoundError: pass
 
-def _find_native(path_tail: str, fallback_path: str|None=None) -> str:
-    found=shutil.which("codex",path=path_tail) or (shutil.which("codex",path=fallback_path) if fallback_path else None)
+def _is_managed_adapter(candidate: Path) -> bool:
+    metadata=candidate.with_name("adapter.json")
+    try:
+        info=metadata.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or stat.S_IMODE(info.st_mode)&0o077: return False
+        value=json.loads(metadata.read_text(encoding="utf-8"))
+        return (isinstance(value,dict) and value.get("schema")==1
+                and set(value)=={"schema","source_root","native_executable","config_root"})
+    except (OSError,ValueError,TypeError): return False
+
+def _find_native(path_tail: str, fallback_path: str|None=None, *, exclude_dirs: tuple[Path,...]=()) -> str:
+    def find(value: str|None) -> str|None:
+        if not value: return None
+        candidates=[]
+        for item in value.split(os.pathsep):
+            candidate=Path(item or ".")/"codex"
+            try: resolved=candidate.resolve(strict=True)
+            except OSError: continue
+            if _is_managed_adapter(resolved) or any(resolved.parent == directory.resolve() for directory in exclude_dirs): continue
+            if resolved.is_file() and os.access(resolved,os.X_OK): return str(candidate)
+        return None
+    found=find(path_tail) or find(fallback_path)
     if not found: raise ConfigError("native Codex executable cannot be resolved from original PATH")
     native=Path(found).resolve(strict=True)
     if not native.is_file() or not os.access(native,os.X_OK): raise ConfigError("resolved Codex executable is not executable")
@@ -186,10 +206,22 @@ def install_path(config_root: Path, adapter_dir: Path, *, env_path: str|None=Non
         else: raise ConfigError("managed Codex PATH changed; preserving configuration")
     else: original=current
     tail=original if original is not None else (env_path if env_path is not None else os.environ.get("PATH",""))
+    if ownership and original is None:
+        prefix=str(adapter_dir)+os.pathsep
+        installed_value=ownership.get("installed_path")
+        if not isinstance(installed_value,str) or not installed_value.startswith(prefix):
+            raise ConfigError("managed Codex PATH has no recoverable original tail")
+        tail=installed_value[len(prefix):]
     if not isinstance(tail,str) or "\n" in tail or "\r" in tail: raise ConfigError("original PATH is invalid")
     installed=str(adapter_dir)+(os.pathsep+tail if tail else "")
     # Avoid interpreting a literal prior adapter prefix as part of original tail.
-    native=_find_native(tail,env_path)
+    native=ownership.get("native_executable") if ownership else None
+    if native:
+        native_path=Path(native)
+        try: valid=native_path.is_file() and os.access(native_path,os.X_OK) and not _is_managed_adapter(native_path.resolve())
+        except OSError: valid=False
+        if not valid: native=None
+    if native is None: native=_find_native(tail,env_path,exclude_dirs=(adapter_dir,))
     updated=_edit(raw,installed)
     # Persist a private compare-and-swap preimage before changing Codex config.
     journal_data={"schema":1,"before_sha256":hashlib.sha256(raw).hexdigest(),"before_exists":existed,"after_exists":True,"before_mode":mode,"before_bytes":raw.hex(),"after_bytes":updated.hex(),"after_sha256":hashlib.sha256(updated).hexdigest(),

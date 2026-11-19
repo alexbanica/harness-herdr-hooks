@@ -2,6 +2,7 @@ import json
 import hashlib
 import importlib
 import os
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -43,6 +44,37 @@ class CodexInstallTests(unittest.TestCase):
         uninstall("codex", config_dir=str(self.root))
         self.assertFalse((adapter / "codex").exists())
         self.assertTrue((self.root / "hooks.json").exists())
+
+    def test_reinstall_with_managed_path_in_environment_keeps_native_and_path_stable(self):
+        self.native.write_text("#!/bin/sh\nprintf 'native-codex %s\\n' \"$1\"\n")
+        self.native.chmod(0o700)
+        adapter=self.root/"harness-herdr-hooks"/"codex-adapter"
+        with patch.dict(os.environ,{"PATH":str(self.bin)}):
+            install("codex",source_root=self.source,config_dir=str(self.root))
+        config=self.root/"config.toml"
+        before=config.read_bytes(); own=json.loads((self.root/".harness-herdr-hooks.json").read_text())["entries"]["codex"]["path"]
+        with patch.dict(os.environ,{"PATH":own["installed_path"]}):
+            install("codex",source_root=self.source,config_dir=str(self.root))
+        after=config.read_bytes(); own2=json.loads((self.root/".harness-herdr-hooks.json").read_text())["entries"]["codex"]["path"]
+        meta=json.loads((adapter/"adapter.json").read_text())
+        self.assertEqual(before,after)
+        self.assertEqual(own["installed_path"],own2["installed_path"])
+        self.assertEqual(meta["native_executable"],str(self.native.resolve()))
+        result=subprocess.run([str(adapter/"codex"),"--version"],capture_output=True,text=True,timeout=5,check=True)
+        self.assertEqual(result.stdout,"native-codex --version\n")
+        uninstall("codex",config_dir=str(self.root))
+        restored=config.read_text()
+        self.assertNotIn("PATH =",restored)
+
+    def test_fresh_profile_skips_another_profiles_managed_adapter_on_path(self):
+        other=Path(self.tmp.name)/"other-profile"; other.mkdir(mode=0o700)
+        with patch.dict(os.environ,{"PATH":str(self.bin)}):
+            install("codex",source_root=self.source,config_dir=str(other))
+        foreign_adapter=other/"harness-herdr-hooks"/"codex-adapter"
+        with patch.dict(os.environ,{"PATH":str(foreign_adapter)+os.pathsep+str(self.bin)}):
+            install("codex",source_root=self.source,config_dir=str(self.root))
+        native=json.loads((self.root/"harness-herdr-hooks"/"codex-adapter"/"adapter.json").read_text())["native_executable"]
+        self.assertEqual(native,str(self.native.resolve()))
 
     def test_uninstall_manifest_publication_failure_rolls_back_all_owned_files(self):
         module = importlib.import_module("harness_herdr_hooks.install")

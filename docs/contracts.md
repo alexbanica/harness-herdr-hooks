@@ -69,6 +69,24 @@ binding is revalidated. Reused panes, panes with unknown ownership or process
 identity, and independent interactive-session panes remain open. Revocation
 stops only the integration's own helper and leaves panes/agents alone.
 
+Terminal cleanup is reconciled against persisted positive ownership even when
+ordinary child discovery no longer returns that child. A missing child, missing
+helper, unloaded helper, or `itemsView: notLoaded` alone is not terminal
+evidence. A successful native status read reporting `notLoaded` may participate
+only alongside metadata confirming terminal state for the matching turn/task
+generation and no newer running work; cleanup then revalidates the original owned
+pane and process, including proof that the original PTY process exited before
+closing an empty display. Cleanup snapshots state under lock, performs native
+checks and close outside that lock, then persists only if the generation and
+ownership still match. A concurrent final close is guarded, and a manually
+closed child is suppressed from reopening. Unknown, unowned, or ambiguous panes
+are retained. Initial attachment is skipped until a successful startup baseline
+is persisted, so existing children are not mistaken for new ones. Owned helper
+replacement is a bounded parent-owned operation: it checks helper revision and
+path and retires only a proven integration-owned stale helper. Read-only status
+does not retire or reconcile helpers; the operation does not force a daemon
+restart.
+
 ## Qualification limits
 
 The Codex adapter routes supported ordinary interactive `codex` shell commands
@@ -82,7 +100,12 @@ turn state; `stop_hook_active=true` denotes re-entry after an earlier
 same-turn continuation and does not itself mean the current request is done.
 
 Current source and controlled operator/API evidence are summarized in
-[validation](validation.md). Native Codex trust/reload, child display and
-completion cleanup, ordinary-launch routing, and full profile/backend/race
-coverage remain unverified; macOS runtime remains a separate predecessor gap.
-Do not infer support for an unobserved native path from these contracts.
+[validation](validation.md). Parent observed Codex 0.170.0, Herdr 0.9.5p22,
+and one bare launch acknowledgement placed in an unfocused pane in the selected
+tab, with its launch payload removed. The launch pane remained at the native
+confirmation UI. This does not establish same-thread/subagent attachment,
+no-added-turn behavior, completion/cancellation, client exit, or current
+revision runtime loading. Native trust/reload, terminal pane closure, and full
+profile/backend/race coverage remain unverified; macOS runtime remains a
+separate predecessor gap. Do not infer support for an unobserved native path
+from these contracts.

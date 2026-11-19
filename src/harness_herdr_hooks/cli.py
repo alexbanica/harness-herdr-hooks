@@ -2,6 +2,7 @@
 from __future__ import annotations
 import argparse, fcntl, hashlib, json, os, re, shutil, socket, stat, subprocess, sys, time
 import shlex
+import signal
 from dataclasses import replace
 from pathlib import Path
 from typing import Sequence
@@ -18,6 +19,19 @@ from .launch import LaunchStore, run_claimed_launch
 
 _RUNTIME_MAX_AGE=30*24*60*60
 _RUNTIME_MAX_BYTES=16384
+
+# This value belongs to the interpreter that imported this module.  A status
+# command compares it with the revision published by the long lived observer;
+# it never hashes source on disk and attributes that value to another process.
+try:
+    _PACKAGE_ROOT=Path(__file__).resolve(strict=True).parents[1]
+    _revision=hashlib.sha256()
+    for _source in sorted(_PACKAGE_ROOT.rglob("*.py")):
+        _revision.update(str(_source.relative_to(_PACKAGE_ROOT)).encode()+b"\0")
+        _revision.update(_source.read_bytes()+b"\0")
+    _LOADED_SOURCE_SHA256=_revision.hexdigest()
+except OSError:
+    _PACKAGE_ROOT=None; _LOADED_SOURCE_SHA256=None
 
 def _runtime_path(root:Path,profile:str)->Path:
     key=hashlib.sha256(str(Path(profile).resolve()).encode()).hexdigest()
@@ -84,7 +98,13 @@ def _runtime_status(root:Path,profile:str)->dict:
     if observer:
         pid=observer.get("pid"); pin=observer.get("pin")
         current=_process_pin(pid,expected=pin)
-        result["observer"]="running" if observer.get("state")=="running" and current else "ended"
+        if observer.get("state")=="ended": result["observer"]="ended"
+        elif not current: result["observer"]="unknown" if _process_pin(pid) is None else "stale"
+        elif (observer.get("source_sha256")==_LOADED_SOURCE_SHA256
+              and observer.get("source_sha256") and observer.get("binding_id")
+              and _observer_command_matches(pid, observer)):
+            result["observer"]="running"
+        else: result["observer"]="stale"
     binding_dir=root/"harness-herdr-hooks"/"bindings"
     counts={}; ownership={}
     try:
@@ -130,9 +150,16 @@ def _publish_observer(root:Path,parent:ParentBinding,state:str,pin:dict|None)->N
     def update(data):
         old=data.get("observer",{})
         if (old.get("pid"),old.get("pin"))!=(os.getpid(),pin):
-            if state=="ended" or old.get("state")=="running":return
+            # A running record may outlive a crashed observer. Replace it only
+            # when its kernel process identity is demonstrably gone; a live but
+            # unverifiable owner remains protected as ambiguous.
+            if state=="ended":return
+            if old.get("state")=="running" and _process_pin(old.get("pid"),expected=old.get("pin")) is not None:return
         data["observer"]={"state":state,"pid":os.getpid(),"pin":pin,
             "server_id":parent.herdr_server_id,"pane_id":parent.pane_id,"at":time.time()}
+        data["observer"].update(source_sha256=_LOADED_SOURCE_SHA256,
+            source_path=str(_PACKAGE_ROOT), source_root=str(_PACKAGE_ROOT), binding_id=parent.context.key()[:64],
+            context_key=parent.context.key())
     _runtime_write(root,str(parent.context.config_root),update)
 
 def _native_codex_executable(config_root:Path)->Path:
@@ -283,6 +310,78 @@ def _process_pin(pid:int,*,expected:dict|None=None,proc_root:Path=Path("/proc"))
         if start()!=first or int(uid)!=os.getuid() or (expected is not None and pin!=expected): return None
         return pin
     except (OSError,ValueError,StopIteration,IndexError,RuntimeError): return None
+
+def _observer_command_matches(pid:int, observer:dict, *, proc_root:Path=Path("/proc"))->bool:
+    """Prove argv still identifies this exact helper and binding."""
+    pin=_process_pin(pid,expected=observer.get("pin"),proc_root=proc_root)
+    if not pin:return False
+    try:
+        root=proc_root/str(pid)
+        raw=(root/"cmdline").read_bytes()
+        if len(raw)>65536:return False
+        argv=[x.decode("utf-8","surrogateescape") for x in raw.split(b"\0") if x]
+        envraw=(root/"environ").read_bytes()
+        if len(envraw)>65536:return False
+        env=dict(item.split(b"=",1) for item in envraw.split(b"\0") if b"=" in item)
+        rootpath=observer.get("source_root") or observer.get("source_path")
+        expected_pythonpath=str(Path(rootpath).resolve())
+        interpreter=shutil.which(argv[0]) if argv and not os.path.isabs(argv[0]) else (argv[0] if argv else None)
+        interpreter_ok=bool(interpreter and Path(interpreter).resolve(strict=True)==Path(pin["exe"]).resolve(strict=True))
+        module_form=(len(argv)==5 and interpreter_ok
+                     and argv[1:]==["-m","harness_herdr_hooks","observe",observer["binding_id"]]
+                     and env.get(b"PYTHONPATH",b"").decode("utf-8","surrogateescape").split(os.pathsep)[0]==expected_pythonpath)
+        script_form=(len(argv)>=3 and Path(argv[0]).resolve()==Path(observer.get("entrypoint", "")).resolve()
+                     and argv[-2:]==["observe",observer["binding_id"]])
+        return _process_pin(pid,expected=pin,proc_root=proc_root)==pin and (module_form or script_form)
+    except (OSError,KeyError,ValueError,RuntimeError):return False
+
+def _retire_observer(root:Path,profile:str,parent:ParentBinding,*,announced:bool,
+                     kill=os.kill)->str:
+    """Parent-invoked, fail-closed retirement for one precisely owned helper."""
+    if not announced:return "announcement-required"
+    data=_runtime_read(_runtime_path(root,profile)); observer=data.get("observer",{})
+    binding_id=parent.context.key()[:64]
+    legacy=not observer.get("binding_id") and not observer.get("context_key")
+    if ((not legacy and (observer.get("binding_id")!=binding_id or observer.get("context_key")!=parent.context.key()))
+            or observer.get("server_id")!=parent.herdr_server_id
+            or observer.get("pane_id")!=parent.pane_id):return "foreign-or-ambiguous"
+    try:
+        record=load_existing_binding(root,binding_id); recorded=parent_from_dict(record["parent"])
+        if (recorded.context.key()!=parent.context.key() or recorded.herdr_server_id!=parent.herdr_server_id
+                or recorded.pane_id!=parent.pane_id or recorded.tab_id!=parent.tab_id
+                or recorded.workspace_id!=parent.workspace_id):return "foreign-or-ambiguous"
+    except (OSError,ValueError,KeyError,TypeError):return "binding-unavailable"
+    pid=observer.get("pid"); pin=observer.get("pin")
+    if (not isinstance(pin,dict) or not isinstance(pin.get("start_ticks"),int)
+            or pin.get("uid")!=os.getuid() or not isinstance(pin.get("exe"),str)):
+        return "process-identity-unknown"
+    current=_process_pin(pid,expected=pin)
+    if not current:return "process-identity-unknown"
+    # Legacy helper records can be retired only if argv independently proves
+    # the private binding and source path recorded in its owned binding.
+    expected={**observer,"binding_id":binding_id,
+              "source_path":observer.get("source_path") or str(Path(record.get("entrypoint", "")).parent.parent/"src"),
+              "source_root":observer.get("source_root") or str(Path(record.get("entrypoint", "")).parent.parent/"src"),
+              "entrypoint":record.get("entrypoint")}
+    if not _observer_command_matches(pid,expected):return "command-identity-unknown"
+    try:kill(pid,signal.SIGTERM)
+    except OSError:return "signal-failed"
+    deadline=time.monotonic()+1.0
+    while time.monotonic()<deadline:
+        if _process_pin(pid,expected=current) is None:
+            try: os.kill(pid,0)
+            except ProcessLookupError:
+                def ended(data):
+                    old=data.get("observer",{})
+                    if old.get("pid")==pid and old.get("pin")==current:
+                        old["state"]="ended"; old["ended_at"]=time.time(); data["observer"]=old
+                _runtime_write(root,profile,ended)
+                return "ended"
+            except OSError:return "process-state-unknown"
+            # A live PID with a changed start time is reuse, not our helper.
+            if _process_pin(pid) is not None:return "ended"
+        time.sleep(.05)
+    return "still-running"
 
 def _proc_argv(pid:int,*,expected_cwd:Path,proc_root:Path=Path("/proc"))->list[str]|None:
     """Read bounded argv only when PID, cwd and executable remain pinned."""

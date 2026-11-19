@@ -10,6 +10,12 @@ does not change Codex daemon settings, socket permissions, or hook trust.
 Python 3.11+, POSIX `sh`, and a repository checkout are required; OpenCode is
 not.
 
+Native executable discovery skips candidates that already resolve through a
+managed adapter. Reinstall reuses the owned concrete adapter entry and its PATH
+tail/native settings rather than selecting the adapter itself or adding another
+prefix. The adapter does not search another profile or delegate across profile
+boundaries.
+
 ## Install and inspect
 
 ```sh
@@ -53,10 +59,18 @@ hooks, use its native trust flow. Installation does not bypass trust, restart an
 active session, or alter daemon settings.
 
 `status` reports registration and adapter configuration separately from
-observed native trust/loading, backend binding, observer health, and pane
-outcomes. Unknown means not observed, not success. Isolated operator checks
-passed, but native hook loading, child display/cleanup without an added turn,
-and ordinary launch routing have not passed in a reloaded parent. See
+observed native trust/loading, loaded helper revision, backend binding,
+observer health, and pane outcomes. Observer states distinguish `running`,
+`stale`, `unknown`, and `ended`; a registered source path does not prove that
+a running parent loaded that revision. Native thread `notLoaded` or missing
+items alone is not terminal evidence. A successful native status read reporting
+`notLoaded` can participate in cleanup only with exact matching terminal-turn
+metadata and no newer running work. Isolated operator checks passed. A live bare `codex` invocation was
+acknowledged once and placed in an unfocused pane in the selected tab; the
+confirmation UI remained open and no confirmation was answered. Native
+same-thread/subagent attachment, no-added-turn behavior, terminal cleanup,
+client exit to a usable shell, and current-revision runtime loading remain
+unverified. See
 [validation](validation.md) and [troubleshooting](troubleshooting.md).
 
 The adapter routes supported ordinary interactive `codex` shell commands from
@@ -69,6 +83,15 @@ sessions are outside this routing qualification and retain native behavior.
 Outside Herdr, the adapter delegates normally. The adapter's bounded launch
 payload expires after 120 seconds if not claimed; it does not persist prompts
 as retained metadata.
+
+The observed native launch above established acknowledgement and pane placement
+only; it did not reach confirmation, client exit, or shell retention. A missing
+child from discovery or a missing/unloaded helper is never proof of terminal
+completion. Codex cleanup requires positive terminal metadata for the matching
+turn/task generation, absence of newer running work, and revalidation of the
+integration-owned pane/process. Manually closed children are suppressed from
+reopening. Unknown or ambiguous ownership is retained. The adapter preserves
+the selected profile's existing PATH tail and unrelated native configuration.
 
 ## Uninstall
 

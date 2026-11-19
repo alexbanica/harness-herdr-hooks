@@ -14,6 +14,8 @@ from harness_herdr_hooks.herdr import (
 from harness_herdr_hooks.codex_backend import ProcessProof
 from harness_herdr_hooks.model import Context, Harness
 from harness_herdr_hooks.attach import _wrapper_process_argv
+from harness_herdr_hooks.coordinator import NativeRuntime
+from harness_herdr_hooks.state import binding_is_close_owned
 
 
 class PaneOwnershipTests(unittest.TestCase):
@@ -81,6 +83,30 @@ class PaneOwnershipTests(unittest.TestCase):
             argv=_wrapper_process_argv(row,Path('/tmp'),proc_root=root)
             self.assertEqual(argv,['/usr/bin/python3','/tmp/hook.py','attach','bound'])
             self.assertIsNone(_wrapper_process_argv(row,Path('/other'),proc_root=root))
+
+    def test_exited_display_requires_exact_process_incarnation_absence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary); proc=root/'42'; proc.mkdir()
+            (proc/'stat').write_text('42 (codex) R 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 123 20\n')
+            pin={'pid':42,'start_ticks':123}
+            self.assertEqual(NativeRuntime._pinned_display_state(pin,proc_root=root),'live')
+            (proc/'stat').write_text('42 (codex) R 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 124 20\n')
+            self.assertEqual(NativeRuntime._pinned_display_state(pin,proc_root=root),'unknown')
+            (proc/'stat').unlink(); proc.rmdir()
+            self.assertEqual(NativeRuntime._pinned_display_state(pin,proc_root=root),'exited')
+
+    def test_empty_display_requires_no_foreground_or_foreign_pty_process(self):
+        with patch('harness_herdr_hooks.attach._tty_has_no_processes',return_value=True):
+            self.assertTrue(NativeRuntime._empty_display_pty({'foreground_processes':[],'tty':'/dev/pts/4'}))
+            self.assertFalse(NativeRuntime._empty_display_pty({'foreground_processes':[{'pid':99}],'tty':'/dev/pts/4'}))
+        with patch('harness_herdr_hooks.attach._tty_has_no_processes',return_value=False):
+            self.assertFalse(NativeRuntime._empty_display_pty({'foreground_processes':[],'tty':'/dev/pts/4'}))
+
+    def test_independent_and_reused_bindings_never_grant_close_ownership(self):
+        base={'schema':2,'ownership':'created','kind':'subagent','close_suppressed':False}
+        self.assertTrue(binding_is_close_owned(base))
+        self.assertFalse(binding_is_close_owned(dict(base,kind='independent')))
+        self.assertFalse(binding_is_close_owned(dict(base,ownership='reused')))
 
 
 if __name__ == '__main__':

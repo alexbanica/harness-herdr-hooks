@@ -173,7 +173,7 @@ def _groups(data:dict[str,Any],event:str)->list[Any]:
 def _owned_group_matches(groups:list[Any],owned:dict[str,Any])->list[int]: return [i for i,g in enumerate(groups) if g==owned]
 
 def _codex_install(root:Path,source_root:Path,manifest:dict[str,Any],manifest_pre:bytes|None)->dict[str,str]:
-    from .codex_config import (_check_file, _parse, _path_value, _edit, _find_native,
+    from .codex_config import (_check_file, _parse, _path_value, _edit, _find_native, _is_managed_adapter,
         install_path, commit_path_journal, recover_path_journal,
                                _check_root)
     source=source_root/"bin/harness-herdr-hooks"
@@ -240,9 +240,23 @@ def _codex_install(root:Path,source_root:Path,manifest:dict[str,Any],manifest_pr
             original_path=old_path.get("original_path")
         else: original_path=current_path
         tail=original_path if original_path is not None else os.environ.get("PATH","")
+        if old_path and original_path is None:
+            prefix=str(adapter_dir)+os.pathsep
+            installed_value=old_path.get("installed_path")
+            if not isinstance(installed_value,str) or not installed_value.startswith(prefix):
+                raise InstallError("managed Codex PATH has no recoverable original tail")
+            tail=installed_value[len(prefix):]
         if not isinstance(tail,str) or "\n" in tail or "\r" in tail: raise InstallError("original PATH is invalid")
         installed_path=str(adapter_dir)+(os.pathsep+tail if tail else "")
-        _find_native(tail,os.environ.get("PATH"))
+        prior_native=None
+        if old_meta:
+            try: prior_native=json.loads(old_meta).get("native_executable")
+            except (json.JSONDecodeError,AttributeError): prior_native=None
+        if prior_native:
+            native_path=Path(prior_native)
+            try: prior_native=str(native_path.resolve()) if native_path.is_file() and os.access(native_path,os.X_OK) and not _is_managed_adapter(native_path.resolve()) else None
+            except OSError: prior_native=None
+        if prior_native is None: _find_native(tail,os.environ.get("PATH"),exclude_dirs=(adapter_dir,))
         _edit(config_raw,installed_path)
     except InstallError: raise
     except Exception as exc: raise InstallError(f"managed Codex PATH setup failed: {exc}") from exc
@@ -253,8 +267,9 @@ def _codex_install(root:Path,source_root:Path,manifest:dict[str,Any],manifest_pr
     # parent and adapter directory ownership and modes exactly.
     adapter_dir.parent.mkdir(mode=0o700,parents=False,exist_ok=True)
     adapter_dir.mkdir(mode=0o700,exist_ok=True)
+    native=prior_native or _find_native(tail,os.environ.get("PATH"),exclude_dirs=(adapter_dir,))
     meta={"schema":1,"source_root":str(source_root.resolve()),
-          "native_executable":_find_native(tail,os.environ.get("PATH")),"config_root":str(root)}
+          "native_executable":native,"config_root":str(root)}
     # Snapshot adapter state after the validated directory creation.
     shim_mode=stat.S_IMODE(shim.stat().st_mode) if shim.exists() else 0o700
     meta_mode=stat.S_IMODE(metadata.stat().st_mode) if metadata.exists() else 0o600

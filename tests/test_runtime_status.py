@@ -1,13 +1,16 @@
 import io
 import json
 import os
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from harness_herdr_hooks import cli
-from harness_herdr_hooks.model import Context, Harness, ParentBinding
+from harness_herdr_hooks.model import Context, Harness, ParentBinding, parent_to_dict
 
 
 class RuntimeStatusTests(unittest.TestCase):
@@ -61,7 +64,46 @@ class RuntimeStatusTests(unittest.TestCase):
     def test_stale_observer_pid_is_ended(self):
         cli._runtime_write(self.root, str(self.profile), lambda d: d.update(
             observer={"state": "running", "pid": 99999999, "pin": {"start_ticks": 1, "exe": "/x", "uid": os.getuid()}}))
-        self.assertEqual(cli._runtime_status(self.root, str(self.profile))["observer"], "ended")
+        self.assertEqual(cli._runtime_status(self.root, str(self.profile))["observer"], "unknown")
+
+    def test_observer_requires_matching_loaded_revision_and_command(self):
+        record={"state":"running","pid":42,"pin":{"start_ticks":1,"exe":"/python","uid":os.getuid()},
+                "source_sha256":cli._LOADED_SOURCE_SHA256,"binding_id":"binding"}
+        cli._runtime_write(self.root,str(self.profile),lambda d:d.update(observer=record))
+        with patch.object(cli,"_process_pin",return_value=record["pin"]), \
+             patch.object(cli,"_observer_command_matches",return_value=True):
+            self.assertEqual(cli._runtime_status(self.root,str(self.profile))["observer"],"running")
+        record["source_sha256"]="old-revision"
+        cli._runtime_write(self.root,str(self.profile),lambda d:d.update(observer=record))
+        with patch.object(cli,"_process_pin",return_value=record["pin"]), \
+             patch.object(cli,"_observer_command_matches",return_value=True):
+            self.assertEqual(cli._runtime_status(self.root,str(self.profile))["observer"],"stale")
+
+    def test_retirement_requires_announcement_exact_parent_and_command(self):
+        binding=self.parent.context.key()[:64]
+        observer={"state":"running","pid":42,"pin":{"start_ticks":1,"exe":"/python","uid":os.getuid()},
+                  "server_id":"server-id","pane_id":"pane","binding_id":binding,
+                  "context_key":self.parent.context.key(),"source_path":"/repo/src/harness_herdr_hooks",
+                  "source_root":"/repo/src","source_sha256":"old"}
+        cli._runtime_write(self.root,str(self.profile),lambda d:d.update(observer=observer))
+        record={"parent":parent_to_dict(self.parent),"entrypoint":"/repo/bin/harness-herdr-hooks"}
+        kill=__import__("unittest.mock",fromlist=["Mock"]).Mock()
+        with patch("harness_herdr_hooks.cli.load_existing_binding",return_value=record), \
+             patch.object(cli,"_process_pin",side_effect=[observer["pin"],None]), \
+             patch.object(cli,"_observer_command_matches",return_value=True):
+            self.assertEqual(cli._retire_observer(self.root,str(self.profile),self.parent,announced=False,kill=kill),"announcement-required")
+            self.assertEqual(cli._retire_observer(self.root,str(self.profile),self.parent,announced=True,kill=kill),"ended")
+        kill.assert_called_once_with(42,cli.signal.SIGTERM)
+
+    def test_retirement_never_signals_foreign_or_unverified_command(self):
+        binding=self.parent.context.key()[:64]
+        observer={"state":"running","pid":42,"pin":{"start_ticks":1,"exe":"/python","uid":os.getuid()},
+                  "server_id":"server-id","pane_id":"another-pane","binding_id":binding,
+                  "context_key":self.parent.context.key()}
+        cli._runtime_write(self.root,str(self.profile),lambda d:d.update(observer=observer))
+        kill=__import__("unittest.mock",fromlist=["Mock"]).Mock()
+        self.assertEqual(cli._retire_observer(self.root,str(self.profile),self.parent,announced=True,kill=kill),"foreign-or-ambiguous")
+        self.assertFalse(kill.called)
 
     def test_old_observer_end_cannot_replace_newer_owner(self):
         newer = {"state": "running", "pid": 123, "pin": {"start_ticks": 4, "exe": "/new", "uid": os.getuid()}}
@@ -74,6 +116,50 @@ class RuntimeStatusTests(unittest.TestCase):
         finally:
             os.getpid = original_pid
         self.assertEqual(cli._runtime_read(cli._runtime_path(self.root, str(self.profile)))["observer"], newer)
+
+    def test_stale_dead_observer_is_replaced_by_new_lock_owner(self):
+        cli._runtime_write(self.root, str(self.profile), lambda d: d.update(observer={
+            "state": "running", "pid": 2147483647,
+            "pin": {"start_ticks": 1, "exe": "/gone", "uid": os.getuid()}}))
+        pin = cli._process_pin(os.getpid())
+        self.assertIsNotNone(pin)
+        cli._publish_observer(self.root, self.parent, "running", pin)
+        observer = cli._runtime_read(cli._runtime_path(self.root, str(self.profile)))["observer"]
+        self.assertEqual(observer["pid"], os.getpid())
+        self.assertEqual(observer["pin"], pin)
+
+    def test_real_module_launcher_environment_matches_published_source_root(self):
+        source_root = str(cli._PACKAGE_ROOT)
+        binding_id = self.parent.context.key()[:64]
+        isolated = self.root / "isolated"; isolated.mkdir(parents=True)
+        env = {**os.environ, "PYTHONPATH": source_root,
+               "HARNESS_HERDR_STATE_ROOT": str(isolated), "XDG_STATE_HOME": str(isolated)}
+        process = subprocess.Popen([sys.executable, "-m", "harness_herdr_hooks", "observe", binding_id],
+                                   env=env, cwd=str(isolated), stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, start_new_session=True)
+        matched = False
+        try:
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline and process.poll() is None:
+                pin = cli._process_pin(process.pid)
+                if pin:
+                    # Exercise the production publisher so the matcher consumes
+                    # its effective source_root, rather than a test-computed value.
+                    with patch.object(cli.os, "getpid", return_value=process.pid):
+                        cli._publish_observer(self.root, self.parent, "running", pin)
+                    record = cli._runtime_read(cli._runtime_path(self.root, str(self.profile)))
+                    observer = record.get("observer", {})
+                else:
+                    observer = {}
+                if observer.get("pin") and cli._observer_command_matches(process.pid, observer):
+                    matched = True
+                    break
+                time.sleep(0.005)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            process.wait(timeout=2)
+        self.assertTrue(matched, "actual module launcher argv/PYTHONPATH did not match source root")
 
     def test_lifecycle_outcomes_do_not_claim_cleanup_success(self):
         cli._record_hook(self.root, self.parent)
