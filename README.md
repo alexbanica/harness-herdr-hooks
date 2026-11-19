@@ -4,24 +4,25 @@ Harness Herdr Hooks observes new Codex and OpenCode sessions created from a
 verified parent session in a Herdr pane. When a running child can be attached
 through its existing native backend, it opens that same session in an unfocused
 pane in the parent's Herdr tab. It never sends a prompt or starts replacement
-work. Session titles flow one way to Herdr pane names. Finished or unverified
-children are skipped; activity outside Herdr is a silent no-op.
+work for that attached child. A supported ordinary interactive Codex command
+is routed with its requested prompt once and leaves a usable shell after the
+client exits. Session titles flow one way to Herdr pane names. Finished or
+unverified children are skipped; activity outside Herdr is a silent no-op.
 
 **Status: DRAFT / experimental.** Source and isolated operator/API checks pass
 for the behaviors listed in [validation](docs/validation.md), but complete
-native acceptance is blocked. Native hook/plugin enablement and trust, authorized
-real native child attachment without an added turn, complete profile/backend and
-race coverage, and macOS runtime evidence remain unqualified. This project does
-not claim complete support or Definition of Done.
+native acceptance is blocked. Native Codex hook loading and trust have not
+been demonstrated in a user-owned parent session, so child display/cleanup and
+ordinary interactive launch routing remain unqualified. Complete profile/backend and race coverage and
+macOS runtime evidence also remain outstanding. This project does not claim
+complete support or Definition of Done.
 
 ## Quick start
 
-The public repository's initial source is on `feat/initial-hooks`; `main` has
-the planning artifacts until that branch is merged. Clone the source branch,
-then install and check only the harness you use:
+Clone the repository, then install and check only the harness you use:
 
 ```sh
-git clone --branch feat/initial-hooks https://github.com/alexbanica/harness-herdr-hooks.git
+git clone https://github.com/alexbanica/harness-herdr-hooks.git
 cd harness-herdr-hooks
 bin/harness-herdr-hooks install codex
 bin/harness-herdr-hooks status codex
@@ -37,13 +38,18 @@ itself establish native runtime support.
 ## What is required for a pane
 
 Use the selected harness in a Herdr pane with Herdr 0.9.5 / protocol 22, Python
-3.11+, POSIX `sh`, and the selected native CLI in `PATH`. The observed parent,
-Herdr pane, harness profile, and backend must all be verified. In particular,
-Codex requires an explicitly selected foreground `--remote unix://PATH` (or
-`--remote=URI`) endpoint; implicit daemon or embedded fallback is refused.
+3.11+, POSIX `sh`, and the selected native CLI in `PATH`. Codex 0.170.0
+qualifies verified selection of its normal shared default daemon as well as an
+explicit Unix endpoint; `--no-daemon` and uncertain launch modes are refused.
 OpenCode requires its bound loopback, unauthenticated local API. Unsupported,
 ambiguous, completed, or out-of-Herdr cases fail closed or skip as described in
 [the contracts](docs/contracts.md).
+
+Codex installation adds an owned adapter directory to the selected profile's
+literal `shell_environment_policy.set.PATH`. Reload/restart that Codex profile
+through its normal user controls before expecting future shell commands to use
+it; trust changed hooks if Codex asks. The installer does not restart Codex,
+bypass trust, or change daemon settings. See [Codex setup](docs/install-codex.md).
 
 ## Example
 

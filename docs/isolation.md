@@ -11,12 +11,14 @@ reading event input or touching integration state.
 
 ## Harness boundaries
 
-- **Codex:** Only Codex hook payload and native app-server interfaces are used.
-  The foreground Codex process must select an explicit `--remote unix://PATH`
-  or `--remote=URI` endpoint. The selected socket is checked as a user-owned
-  socket with a pinned incarnation. The integration refuses implicit shared
-  daemon and embedded fallback. `CODEX_HOME` (or `~/.codex`) selects the Codex
-  profile; it does not prove that the backend is private.
+- **Codex:** Only bounded Codex hook metadata and native app-server interfaces
+  are used. Codex 0.170.0 supports the verified selected-profile shared default
+  daemon and explicit Unix `--remote` endpoints; `--no-daemon` and unknown
+  launch modes are refused. The socket alias/target, user ownership, private
+  directory, process identity, and backend incarnation are pinned. Optional
+  Herdr foreground argv is not required. `CODEX_HOME` (or `~/.codex`) selects
+  the profile; it does not prove that the backend is private. Codex's owned
+  command adapter is added only to that profile's literal shell PATH setting.
 - **OpenCode:** Only OpenCode plugin/API identity is used. The runtime is bound
   to the parent foreground server PID and loopback unauthenticated API. The
   plugin disables itself if `OPENCODE_CONFIG`, `OPENCODE_CONFIG_CONTENT`, or
@@ -25,8 +27,11 @@ reading event input or touching integration state.
   separate resources. A config override does not create private backend or
   account isolation.
 
-The adapters do not copy credentials, provider configuration, environment
-maps, conversation text, or transcripts into integration state. Child attach
+The adapters do not copy credentials, provider configuration, arbitrary
+environment maps, conversation text, or transcripts into integration state.
+Ordinary interactive Codex launch arguments are carried in a private bounded
+payload for at most 120 seconds, deleted after acknowledgment or expiry, and
+not retained as metadata. Child attach
 clients receive a bounded allowlist of environment values, not the full parent
 environment. No provider or account is created by installation. The OpenCode
 loopback API itself is unauthenticated, so the current binding is not evidence
@@ -55,7 +60,8 @@ it does not expose a public revision or generation API.
 
 Source/operator and controlled API checks cover bounded parsing, context
 verification, synthetic event behavior, and cleanup cases recorded in
-[validation](validation.md). Full native cross-profile/backend isolation,
-authorized real child attach, native trust/reload, all race/concurrency paths,
-and macOS runtime behavior are not qualified. These remain acceptance work; no
-complete support claim is made.
+[validation](validation.md). Native Codex selected-profile loading/trust,
+cross-profile/backend isolation, authorized real child display and completion
+cleanup, ordinary launch routing, and all race/concurrency paths remain
+unqualified. macOS runtime is a separate outstanding predecessor gap. These
+remain acceptance work; no complete support claim is made.

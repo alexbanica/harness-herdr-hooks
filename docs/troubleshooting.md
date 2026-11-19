@@ -13,17 +13,22 @@ loading, or complete pane attachment support.
   and exact config root, then verify with `status`. To remove registrations whose
   old checkout is missing, use another trusted checkout's `uninstall` command
   with that same config root; ownership checks still apply.
-- **No pane appears:** confirm that the parent is actually in the intended
-  Herdr pane, the native event was loaded, the Herdr protocol is supported, and
-  the selected backend is explicitly qualified. Outside-Herdr events are
-  intentionally silent. Incomplete or ambiguous identity fails closed. Native
-  hook/plugin trust and reload behavior are not yet fully qualified, so this
-  remains a DRAFT acceptance gap; do not change permissions or restart Herdr to
-  compensate.
-- **Codex reports missing/ambiguous backend:** start the foreground Codex
-  process with its intended explicit `--remote unix://PATH` or `--remote=URI`
-  endpoint and verify the user-owned socket exists. Implicit daemon or embedded
-  fallback is intentionally refused. Do not change daemon settings.
+- **No Codex pane appears:** confirm that the selected profile was loaded by a
+  user-owned parent after install and that any native trust prompt for changed
+  hooks was handled. Check status fields separately: registration/configuration,
+  observed trust/load, backend, observer, and pane outcome. Unknown is not
+  success. Verify Codex CLI and running app-server 0.170.0, Herdr 0.9.5/protocol
+  22, and exact selected profile/backend binding. The verified default daemon
+  and explicit Unix endpoints are supported; `--no-daemon` and ambiguous modes
+  fail closed. Outside-Herdr events remain silent. Do not bypass trust or change
+  socket permissions.
+- **Ordinary `codex` command does not route:** the parent must load the selected
+  profile's concrete `shell_environment_policy.set.PATH` after installation.
+  Absolute executable paths, deliberate PATH overrides, informational/tooling
+  commands, `exec`, resume, remote hosted backends, and `--no-daemon` sessions
+  are outside routing. The adapter does not start another session when routing
+  cannot be verified; inspect the bounded status/diagnostic and do not retry an
+  uncertain launch.
 - **OpenCode event is disabled:** the selected server must be its foreground
   loopback server with the expected unauthenticated local API. The plugin is
   disabled when `OPENCODE_CONFIG`, `OPENCODE_CONFIG_CONTENT`, or `OPENCODE_DB`
@@ -41,6 +46,8 @@ loading, or complete pane attachment support.
   own registration/helper. State records are retained for recovery; panes and
   agents are left untouched. Verify `status` for the selected config root.
 
-Native user-owned approval/trust and any reload/restart steps must follow the
-harness's own controls. Those procedures are not yet qualified here; no
-automatic server restart or trust bypass is supported.
+Native user-owned approval/trust and profile reload must follow Codex's own
+controls. This delivery has not yet demonstrated active-profile hook loading,
+native child display/cleanup, or ordinary launch routing. No automatic daemon
+restart or trust bypass is supported. OpenCode native qualification and the
+predecessor macOS gap remain separate.

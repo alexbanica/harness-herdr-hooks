@@ -12,11 +12,10 @@ serialization; the lock may remain after uninstall.
 
 ## Install and inspect
 
-The public source branch is `feat/initial-hooks`; default `main` contains the
-planning artifacts until its source PR is merged:
+Clone the repository, then install and inspect the selected OpenCode profile:
 
 ```sh
-git clone --branch feat/initial-hooks https://github.com/alexbanica/harness-herdr-hooks.git
+git clone https://github.com/alexbanica/harness-herdr-hooks.git
 cd harness-herdr-hooks
 bin/harness-herdr-hooks install opencode
 bin/harness-herdr-hooks status opencode
