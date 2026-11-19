@@ -91,6 +91,17 @@ class FakeProxy:
 
 
 class TurnMetadataTests(unittest.TestCase):
+    def test_thread_read_requests_metadata_without_turn_items(self):
+        class Proxy:
+            calls = []
+            def request(inner, method, params):
+                inner.calls.append((method, params))
+                return {"thread": {"id": "child"}}
+        adapter = object.__new__(CodexRuntimeAdapter)
+        adapter.proxy = Proxy()
+        self.assertEqual(adapter._read_thread("child"), {"id": "child"})
+        self.assertEqual(Proxy.calls, [("thread/read", {"threadId": "child", "includeTurns": False})])
+
     def test_metadata_only_turn_pages_and_continuation_generation(self):
         proxy = FakeProxy([
             {"data": [{"id": "turn-2", "status": "inProgress", "items": []}], "nextCursor": "next"},

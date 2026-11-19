@@ -60,10 +60,10 @@ class StandaloneDiscoveryTests(unittest.TestCase):
         store = StateStore(root / 'state', context.key()[:32]); store.establish_baseline(set())
         from harness_herdr_hooks.model import parent_to_dict, session_to_dict
         from harness_herdr_hooks.state import save_binding
-
         class Runtime:
             opened = 0
             closed = False
+            title_updates = []
             def verify_parent(self, p): return p == parent
             def find_existing_pane(self, p, c): return None
             def can_attach_now(self, p, c): return True
@@ -80,7 +80,7 @@ class StandaloneDiscoveryTests(unittest.TestCase):
             def owned_pane_state(self, p, c, binding):
                 if self.closed: return 'closed'
                 return 'live' if self.opened else 'unknown'
-            def update_title(self, binding, title): pass
+            def update_title(self, binding, title): self.title_updates.append((binding, title))
 
         runtime = Runtime(); coordinator = Coordinator(store, runtime)
         self.assertEqual(coordinator.handle(parent, child).decision.value, 'attached')
@@ -107,6 +107,51 @@ class StandaloneDiscoveryTests(unittest.TestCase):
                 self.assertEqual(coordinator.handle(parent, child).decision.value, 'skip')
                 self.assertEqual(store.record(child.context.key())['status'], 'suppressed')
                 self.assertEqual(runtime.opened, 1)
+
+    def test_reused_binding_without_wrapper_outcome_replays_and_updates_title(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            context, parent, original, adapter, proxy, store, runtime, coordinator = \
+                self._attached_replay_fixture(tmp)
+            record = store.record(original.context.key())
+            binding_id = record['binding_id']
+            event_key = record['standalone_event_key']
+            from harness_herdr_hooks.state import load_existing_binding, binding_is_close_owned
+            saved = load_existing_binding(adapter.task_store_root, binding_id)
+            saved.pop('outcome', None)
+            saved['ownership'] = 'reused'
+            binding_path = adapter.task_store_root / 'harness-herdr-hooks' / 'bindings' / (binding_id + '.json')
+            binding_path.write_text(json.dumps(saved))  # NativeRuntime reuse bindings have no wrapper outcome.
+            self.assertTrue(store.reconcile_standalone(
+                original.context.key(), event_key, binding_id, 'attached', ownership='reused'))
+            self.assertFalse(binding_is_close_owned(
+                load_existing_binding(adapter.task_store_root, binding_id)))
+
+            proxy.rows['standalone']['name'] = 'updated native title'
+            replayed, = list(adapter.sessions(parent))
+            self.assertEqual(replayed.title, 'updated native title')
+            self.assertEqual(coordinator.handle(parent, replayed).decision.value, 'attached')
+            self.assertEqual(store.record(original.context.key())['status'], 'attached')
+            self.assertEqual(store.record(original.context.key())['ownership'], 'reused')
+            self.assertEqual(load_existing_binding(adapter.task_store_root, binding_id)['ownership'], 'reused')
+            self.assertEqual(runtime.title_updates[-1], (binding_id, 'updated native title'))
+            self.assertEqual(runtime.opened, 1)
+
+            runtime.closed = True
+            self.assertEqual(coordinator.handle(parent, replayed).decision.value, 'skip')
+            self.assertEqual(store.record(original.context.key())['status'], 'suppressed')
+
+    def test_created_binding_without_attached_outcome_does_not_replay(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _context, parent, original, adapter, _proxy, store, _runtime, _coordinator = \
+                self._attached_replay_fixture(tmp)
+            record = store.record(original.context.key())
+            binding_id = record['binding_id']
+            from harness_herdr_hooks.state import load_existing_binding
+            saved = load_existing_binding(adapter.task_store_root, binding_id)
+            saved.pop('outcome', None)
+            binding_path = adapter.task_store_root / 'harness-herdr-hooks' / 'bindings' / (binding_id + '.json')
+            binding_path.write_text(json.dumps(saved))
+            self.assertEqual(list(adapter.sessions(parent)), [])
 
     def test_replay_rejects_changed_binding_context_and_foreign_native_ids(self):
         for mutation in ('binding', 'context', 'native_child', 'native_parent'):

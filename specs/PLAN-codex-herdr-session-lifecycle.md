@@ -371,3 +371,228 @@ do not report it as a blocker. No fabricated acceptance or unrelated fallback.
   test evidence, approval, implementation authority or delivery acceptance.
 - Architect trigger remains absent for the single-domain reason above. This
   record changes no reviewed behavior, sequencing, validation or delivery choice.
+
+## Amendment 1 — 2026-11-19 — Finish owned subagent pane cleanup
+
+- Amendment ID: HHH-002-PLAN-A1
+- Previous version: Original approved HHH-002-PLAN; earlier content and document
+  status remain unchanged.
+- Approval: Approved on 2026-11-19 by the user's explicit response "approve"
+  to the HHH-002-PLAN-A1 approval question; covers the original PLAN plus A1.
+- Approved SPEC: unchanged HHH-002, SHA-256
+  `6c4934c18c6b9578972ec27b2308bff9ce738fc7607b575ca66c428aeb23a08c`.
+- Request and purpose: User-invoked iterate on 2026-11-19 reports subagent panes
+  opening but remaining after closure. The user clarified: "Close after
+  subagent finishes or closes; show it while running". Separate non-subagent
+  session panes must remain. Correct implementation and evidence for the already
+  approved R5/R6/R8 behavior; do not redefine disappearance as completion.
+- Artifact provenance: approved files were retrieved byte-for-byte from delivery
+  commit `301010efb78f742c2eeddbbaffb745927f5dc71c` into their existing repository
+  paths in the invoking planning checkout. The original PLAN preimage SHA-256
+  is `4bd5ed1517fcf9f6f2640dee5438000deab7fab4199bc360d535dc724ace575a`.
+  No predecessor or source file was edited for this iteration.
+
+### Changes against the previous version
+
+| Section / requirement | Before | After | Reason |
+| --- | --- | --- | --- |
+| Hook and completion lifecycle; U50 | General metadata-confirmed cleanup without an explicit non-reentrant lock protocol. | Snapshot/claim under state lock, perform native/Herdr calls outside that lock, and reconcile only the same owned task generation. No close path may reenter state.lock while holding it. | The committed coordinator calls close_owned_pane while holding state.lock; the nested terminal check reads generation through that lock again. |
+| Completion observation; U20/U30/U50 | Discovery primarily enumerates visible native descendants and requires idle thread status for cleanup. | Reconcile positively owned pending cleanup from persisted bindings even after ordinary discovery omits a child. Require positive terminal evidence for that exact turn/task and no newer running work; missing/unloaded alone never authorizes close. | A finished/closed child can leave the enumeration or cease reporting idle before cleanup completes. |
+| Ownership cleanup; U40/U50 | Successful cleanup currently requires the original display process still to be live. | Preserve that proof for a live display; for an exited display require positively owned same-server/same-pane identity plus verified original process exit and a bounded empty-PTY proof. Retain on any unrelated activity or unknown ownership. | A native client can exit before its otherwise owned empty pane is closed. |
+| Observer lifecycle; U90 | Registration source path and helper liveness do not establish the loaded helper revision. | Record helper source revision and reconcile the exact owned observer before native retest; never assume an old Python process loads edited code. | A running or deadlocked helper may retain pre-fix code. |
+| Delivery/worktree | Original initial-delivery worktree/new-branch preparation. | Continue the existing branch and PR #2 from refreshed remote head in a separate clean cleanup worktree; preserve the active retained checkout and its pending edits. | The initial implementation is now published and its original checkout contains concurrent changes. |
+
+### Preserved behavior and impact
+
+The SPEC remains byte-identical: running subagents remain visible, terminal
+subagent panes close only when positively owned and safe, separate sessions and
+reused/unowned panes stay open. Preserve native backend/profile binding, no
+additional inference, explicit endpoints, normal launch routing, title updates,
+manual-close suppression and all original HHH-002 acceptance. This is a
+PLAN-only conformance correction, not a waiver of unknown-state retention.
+
+Read-only diagnosis `HHH-002-iterate-cleanup` found the committed lock-reentry
+path and additional discovery/idle/process gates. These are source findings,
+not a live reproduction. The original retained worktree already had pending
+edits to coordinator.py and tests/test_subagent_completion.py. They appear to
+address lock reentry, but are not accepted, validated or owned by this planning
+run. Do not overwrite, reset, stash, stage, commit or claim those edits. Do not
+reassign an active or uncertain overlapping implementation assignment. The
+implement parent must reconcile ownership before overlapping source work; an
+unresolved active-owner conflict is a genuine blocker, not permission to take
+over or to discard the existing changes.
+
+### Implementation choices and bounded source patterns
+
+Use the original qualified Codex 0.170.0/Herdr protocol-22 contracts. Inspect only
+the named cleanup paths and their direct dependencies: Coordinator.handle,
+_confirmed_terminal, NativeRuntime.sessions/close_owned_pane/run_observer,
+StateStore.locked/generation and binding ownership, adapter list_turn_metadata
+and child enumeration, attach empty-PTY checks, and CLI observer health records.
+Generated schemas and precise version-matched native lifecycle source may
+confirm metadata semantics; no unrelated product research or API redesign.
+
+1. Separate lock-held state transitions from provider/Herdr operations. Persist
+   a generation/binding-scoped cleanup claim and revalidate it before action;
+   reconcile only unchanged identity after action. Ignore stale stops and never
+   overwrite manual suppression or newer work. A subprocess watchdog regression
+   must exercise the real NativeRuntime close chain, not a close-method mock.
+2. Enumerate known owned pending cleanup independently of new-child discovery.
+   Read latest turn metadata with itemsView=notLoaded and includeTurns=false for
+   thread reads. Terminal completed/failed/interrupted for the recorded current
+   generation is necessary; reject a newer/inProgress turn, continuation, or
+   contradictory active status. A successful metadata read identifying a known
+   non-running child may support reconciliation after unload. Mere absence from
+   thread/list or loaded/list, failed reads, generic thread-closed notification,
+   missing hooks, timeouts, or lost transport must never substitute for terminal
+   proof. If explicit native closure does not supply equivalent proof, leave
+   its pane intact and report that required native case as a DRAFT gap.
+3. Before closing, revalidate parent/backend/server, creation ownership, kind,
+   generation and exact pane identity. For exited displays use the existing
+   bounded Linux empty-PTY proof and process-incarnation records; process-name,
+   session text, reused pane ID, or a new shell alone is insufficient. Any
+   process/PTY ambiguity retains the pane. Reused panes and independent sessions
+   are never close-owned. No native close-agent/interrupt request is issued by
+   cleanup itself. Make completed cleanup idempotent across restart and duplicates.
+4. Version the helper's loaded-source health evidence. After integrated checks,
+   announce any targeted owned-helper replacement and source relink effects.
+   Revoke/wait for the exact owned observer; if it is deadlocked, a targeted
+   termination is permitted only after matching private helper record, UID,
+   PID/start identity, exact observe command and binding. Do not signal Codex,
+   Herdr, their daemon, other helpers or any native session. If helper ownership
+   cannot be proved, stop that operation. Preserve panes and agent work.
+
+### Units, ownership and prerequisites for this correction
+
+The parent owns integration, requirements, artifact approval, active configuration
+and Git. Specialists cannot commit/push, create worktrees, edit active profiles or
+signal processes. All assignments use the original five-minute interruption
+limit, bounded JSON handoffs and preserved concurrent work. Serialize these
+units and all live environments; resplit verified partial work without overlap.
+
+| Unit | Exclusive ownership / role | Dependencies and completion evidence |
+| --- | --- | --- |
+| A1-U00 | Parent: clean workspace, ownership reconciliation, artifact transfer, published baseline | Verify approved pair and PR #2 head/base; refresh branch, reconcile overlapping active assignments, preserve original dirty checkout and active installation. |
+| A1-U10 | Developer: coordinator.py, tests/test_subagent_completion.py | A1-U00; real close-chain watchdog, cleanup state transitions outside lock, stale-generation/manual-suppression/concurrent-close tests. |
+| A1-U20 | Developer: adapters/codex.py, state.py, tests/test_codex_events.py, tests/test_lifecycle_state.py; coordinator.py only after A1-U10 releases it | A1-U10; known-owned terminal reconciliation after discovery loss, continuation/restart/new-work/unknown-status tests, no conversation-item reads. |
+| A1-U30 | Developer: coordinator.py, attach.py, herdr.py, tests/test_pane_ownership.py | A1-U20; safe live-display and proven-empty exited-display closure, process replacement/PID reuse/foreign PTY and independent/reused pane protections. |
+| A1-U40 | Developer: cli.py, tests/test_codex_integration.py; coordinator.py after A1-U30 | A1-U30; loaded helper revision/status, bounded owned-helper replacement protocol and restart recovery tests. |
+| A1-U50 | Code-reviewer and contract-reviewer: read-only integrated correction and affected dependencies | A1-U40 + development checks; parent collects whole wave, dispositions findings and assigns one bounded correction batch, then affected checks. |
+| A1-U60 | qa-agent: no source edits | A1-U50 corrections; independent deterministic suite and permitted native lifecycle/retention tests. |
+| A1-U70 | documentation-writer: docs/validation.md, docs/troubleshooting.md, docs/install-codex.md, docs/contracts.md; README only for changed behavior/status descriptions | Final QA stable; explain actual close evidence, unknown-state retention and helper refresh; do not claim pending source or native checks passed. |
+| A1-U80 | Parent: accepted staging, commit/push, same PR and active-source verification | All remaining original/iteration obligations assessed; verified branch head or evidenced blocked DRAFT. |
+
+### Validation and requirement-to-delivery trace
+
+Run the original stdlib suite and syntax/compile/JSON/diff checks; no new test
+dependency or unrelated workflow. Add meaningful tests for real flock reentry,
+confirmed terminal-but-unloaded versus nonterminal disappearance, same-generation
+closure, delayed stop, continuation, duplicate cleanup, restart, stale helper,
+newer work, PID/pane reuse, unrelated foreground processes, and separate/reused
+session retention. Bound every deadlock test in an isolated subprocess; terminate
+only that test process on timeout. No native sessions run during planning.
+
+After source assurance and announced owned integration refresh, native QA must
+show a real subagent pane while running, automatic removal after completion,
+and automatic removal after a controlled native closure/cancellation with
+authoritative terminal proof. Verify no added model turn or repeated launch.
+Keep a separate interactive session pane open, and verify unrelated/reused
+panes remain. Exercise owned display exit, helper restart and retained unknown
+state independently. Perform only the already authorized read-only smoke tasks;
+no native daemon/Herdr restart or hook trust bypass. Missing native proof, required
+user-owned trust/reload, or denied effects remain named DRAFT criteria. The user
+report establishes the symptom, not a recorded native acceptance pass.
+
+| SPEC coverage | Delivery / evidence |
+| --- | --- |
+| R5/R6; completion definition; A2/A3 | A1-U10/U20/U30/U60: real close-chain watchdog plus native running/finished/closed task and owned-display-exit observations. |
+| R3/R9/R10; A3/A5/A6 | A1-U10/U20/U30/U60: unchanged generation/ownership/profile constraints, absent argv, duplicates, restart, manual closure, unknown and unrelated work retention. |
+| R7/R8; A4 | A1-U30/U60: unchanged automatic-launch behavior, independent panes and usable shell remain; no launch source edit is planned. |
+| R1/R2/R4/R11; A1/A5/A7 | A1-U20/U40/U60/U70: existing hook/backend contracts preserved, metadata-only terminal proof, truthful loaded-helper and cleanup diagnostics. |
+| Scope/exclusions/installation effect; A6/A7; all remaining HHH-002 criteria | Original U00–U130 still apply; A1-U50–U80 reassess affected coverage and retain unverified predecessor/HHH-002 native criteria explicitly. No implicit waiver or invented reuse. |
+
+### Delivery, assurance, and stop conditions
+
+Continue `feat/codex-herdr-session-lifecycle` and existing
+https://github.com/alexbanica/harness-herdr-hooks/pull/2 into main. Use clean
+`/tmp/agent-worktrees/harness-herdr-hooks/codex-session-cleanup` in the ordinary
+existing-PR branch mode: refresh origin's exact branch, require local branch
+equals remote tip, then attach the additional isolated worktree to that same
+branch under the skill's existing-PR rules. A second attachment must not advance
+a shared branch ref underneath the old dirty checkout. Before source assignment
+or any branch advancement, the parent must reconcile its active owner and
+verify the original checkout's actual attachment. If already detached, record
+its pinned HEAD without changing it. If still attached to the delivery branch,
+only after its owner is confirmed inactive/reconciled may the parent detach that
+original checkout at its exact current HEAD, without force, reset, clean, stash,
+or switching commits. This PLAN approval grants that narrow preservation action
+at valid implement entry, not during planning. Capture the old HEAD/symbolic ref,
+exact index bytes and a private per-path working-content/mode/untracked inventory
+beforehand; keep recoverable preimages under the implement transfer rules. Verify
+the HEAD commit, index and all pending file bytes/modes are unchanged afterward.
+If owner status is unresolved, the no-change detachment is refused, or any state
+differs, do not advance the branch; retain evidence and report blocked DRAFT.
+Never restore over concurrent changes. After successful detachment the old dirty
+checkout remains pinned and the new checkout alone advances the delivery branch;
+its active-source files and pending edits remain untouched. Dirty/conflicting
+state at the new path, a local
+branch ahead/diverged from remote, or unresolved overlapping worker ownership
+blocks source assignment. Do not branch from invoking main or create a new PR.
+
+Original installation source remains the old retained checkout until an announced
+owned relink after checks. Preserve that checkout and its pending edits. A verified
+installation from the new accepted source may relink the selected profile only;
+never delete an active source checkout. Keep the new checkout if installed
+references require it; report that exception to normal clean-worktree removal.
+Restore invoking artifact content/index only under the original guarded transfer
+rules. Parent commits/pushes accepted correction plus amended PLAN non-force to
+the same branch and verifies upstream, remote SHA and PR head/base; no merge,
+deployment or release. Reconfirm the PR is still open before mutation.
+
+Full assurance remains selected: native lifecycle/ownership across components.
+Require independent integrated code review and contract review because the
+cleanup consumer's terminal evidence/observer-status semantics change; explicit
+security review remains untriggered. Run final independent QA and documentation
+synchronization. One agent-session presentation domain still applies, so an
+additional architect PLAN review is not triggered. Independent readiness review
+of this effective PLAN is required before approval presentation.
+
+Checkpoint reporting, consolidated review corrections and DRAFT recovery retain
+the original rules. Stop only for the original genuine blockers or unsupported
+terminal/empty-pane proof, unsafe integration-helper identity, conflicting
+ownership, changed artifacts/PR/base or denied required native capability. Finish
+safe independent work and authorized DRAFT delivery first. A handoff, test pass
+or partial cleanup fix is not the whole Definition of Done.
+
+### Planning assurance
+
+- Independent native plan-readiness-reviewer, unit
+  `HHH-002-cleanup-readiness`, reviewed the complete effective PLAN against the
+  unchanged approved SPEC on 2026-11-19. Its first reviewed PLAN hash was
+  `fba9fa59820c828c623d5877cfbbddd190abfbdbedc92076af14c82e16509303`.
+- Coverage: behavior/acceptance trace, scope, source ownership and dependencies,
+  locking/cleanup handoff, validation and effects, delivery and stop conditions.
+- One high finding concerned advancing a branch still shared with the original
+  dirty checkout. The delivery paragraph now requires owner reconciliation,
+  pinned same-HEAD detachment with recoverable preimages and unchanged-state
+  verification, or a blocked DRAFT without branch advancement.
+- The same reviewer verified that disposition against PLAN hash
+  `18785357071f37dee01542c0a304cc9a80664d099767717f2da9b201f3212606`,
+  retaining its prior unchanged coverage; final findings: none. Parent verified
+  both JSON handoffs, identities, hashes, scope and the exact intervening delta.
+- This assurance-record-only update changes no reviewed implementation choice.
+  Review is advisory, not artifact approval, runtime evidence or delivery
+  acceptance. Native closure signals, live empty-pane proof and actual owner
+  reconciliation remain implementation validation obligations.
+
+### Approval record
+
+- Decision: Approved on 2026-11-19 by the user's explicit response "approve"
+  to the complete effective PLAN amendment approval question.
+- Approved effective revision: original HHH-002-PLAN plus HHH-002-PLAN-A1.
+- Reviewed pre-approval file SHA-256:
+  `18d9c2587273c191204133dba6f76f372a3764af3c07b52b18ff2665cc889b80`.
+- Original document status, original body and earlier approval record remain
+  unchanged. The paired SPEC is unaffected and remains byte-identical.
+- This approval records the implementation plan; no implementation starts in
+  this planning conversation. The existing fresh-session handoff applies.

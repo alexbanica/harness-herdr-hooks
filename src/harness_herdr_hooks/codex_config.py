@@ -64,6 +64,12 @@ def _comment_at(line: bytes, start: int=0) -> int:
         elif ch==35: return i
     return -1
 
+def _is_path_table_header(line: bytes) -> bool:
+    """Recognize the owned table with an optional TOML trailing comment."""
+    comment = _comment_at(line)
+    header = line[:comment] if comment >= 0 else line
+    return header.strip() == _TABLE
+
 def _edit(raw: bytes, installed: str) -> bytes:
     data=_parse(raw); current=_path_value(data)
     policy=data.get("shell_environment_policy",{})
@@ -73,7 +79,7 @@ def _edit(raw: bytes, installed: str) -> bytes:
     for i,line in enumerate(lines):
         stripped=line.strip()
         if stripped.startswith(b"["):
-            if stripped==_TABLE: active=True; has_table=True; table_spans.append(i)
+            if _is_path_table_header(line): active=True; has_table=True; table_spans.append(i)
             else: active=False
             continue
         if active:
@@ -125,8 +131,28 @@ def _atomic(path:Path,raw:bytes,mode:int,*,expected:bytes|None=None,
         try: os.unlink(tmp)
         except FileNotFoundError: pass
 
-def _find_native(path_tail: str, fallback_path: str|None=None) -> str:
-    found=shutil.which("codex",path=path_tail) or (shutil.which("codex",path=fallback_path) if fallback_path else None)
+def _is_managed_adapter(candidate: Path) -> bool:
+    metadata=candidate.with_name("adapter.json")
+    try:
+        info=metadata.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or stat.S_IMODE(info.st_mode)&0o077: return False
+        value=json.loads(metadata.read_text(encoding="utf-8"))
+        return (isinstance(value,dict) and value.get("schema")==1
+                and set(value)=={"schema","source_root","native_executable","config_root"})
+    except (OSError,ValueError,TypeError): return False
+
+def _find_native(path_tail: str, fallback_path: str|None=None, *, exclude_dirs: tuple[Path,...]=()) -> str:
+    def find(value: str|None) -> str|None:
+        if not value: return None
+        candidates=[]
+        for item in value.split(os.pathsep):
+            candidate=Path(item or ".")/"codex"
+            try: resolved=candidate.resolve(strict=True)
+            except OSError: continue
+            if _is_managed_adapter(resolved) or any(resolved.parent == directory.resolve() for directory in exclude_dirs): continue
+            if resolved.is_file() and os.access(resolved,os.X_OK): return str(candidate)
+        return None
+    found=find(path_tail) or find(fallback_path)
     if not found: raise ConfigError("native Codex executable cannot be resolved from original PATH")
     native=Path(found).resolve(strict=True)
     if not native.is_file() or not os.access(native,os.X_OK): raise ConfigError("resolved Codex executable is not executable")
@@ -186,10 +212,22 @@ def install_path(config_root: Path, adapter_dir: Path, *, env_path: str|None=Non
         else: raise ConfigError("managed Codex PATH changed; preserving configuration")
     else: original=current
     tail=original if original is not None else (env_path if env_path is not None else os.environ.get("PATH",""))
+    if ownership and original is None:
+        prefix=str(adapter_dir)+os.pathsep
+        installed_value=ownership.get("installed_path")
+        if not isinstance(installed_value,str) or not installed_value.startswith(prefix):
+            raise ConfigError("managed Codex PATH has no recoverable original tail")
+        tail=installed_value[len(prefix):]
     if not isinstance(tail,str) or "\n" in tail or "\r" in tail: raise ConfigError("original PATH is invalid")
     installed=str(adapter_dir)+(os.pathsep+tail if tail else "")
     # Avoid interpreting a literal prior adapter prefix as part of original tail.
-    native=_find_native(tail,env_path)
+    native=ownership.get("native_executable") if ownership else None
+    if native:
+        native_path=Path(native)
+        try: valid=native_path.is_file() and os.access(native_path,os.X_OK) and not _is_managed_adapter(native_path.resolve())
+        except OSError: valid=False
+        if not valid: native=None
+    if native is None: native=_find_native(tail,env_path,exclude_dirs=(adapter_dir,))
     updated=_edit(raw,installed)
     # Persist a private compare-and-swap preimage before changing Codex config.
     journal_data={"schema":1,"before_sha256":hashlib.sha256(raw).hexdigest(),"before_exists":existed,"after_exists":True,"before_mode":mode,"before_bytes":raw.hex(),"after_bytes":updated.hex(),"after_sha256":hashlib.sha256(updated).hexdigest(),
@@ -211,21 +249,34 @@ def restore_path(ownership: dict[str,Any]) -> str:
     if path!=root/"config.toml": raise ConfigError("managed Codex config path mismatch")
     raw,mode,exists=_check_file(path); current=_path_value(_parse(raw))
     if current!=ownership.get("installed_path"): raise ConfigError("managed Codex PATH changed; preserving configuration")
-    original=ownership.get("original_path")
-    if original is None:
-        # Remove only PATH assignment, preserving every other byte and table content.
-        lines=raw.splitlines(keepends=True); active=False; out=[]
-        for line in lines:
-            stripped=line.strip()
-            if stripped.startswith(b"["): active=(stripped==_TABLE); out.append(line); continue
-            if active and re.match(rb"^\s*(?:PATH|\"PATH\"|'PATH')\s*=",line): continue
-            out.append(line)
-        restored=b"".join(out)
-    else: restored=_edit(raw,original)
+    restored=_restore_bytes(raw,ownership.get("original_path"))
     identity=_identity(path)
     if exists: _atomic(path,restored,mode,expected=raw,expected_exists=True,expected_identity=identity)
     elif restored: _atomic(path,restored,0o600)
     return "restored"
+
+def _restore_bytes(raw: bytes, original: str|None) -> bytes:
+    """Build and verify a byte-preserving restoration before ownership is removed."""
+    if original is None:
+        lines=raw.splitlines(keepends=True); active=False; headers=0; keys=0; out=[]
+        for line in lines:
+            if line.strip().startswith(b"["):
+                active=_is_path_table_header(line)
+                if active: headers+=1
+                out.append(line); continue
+            if active and re.match(rb"^\s*(?:PATH|\"PATH\"|'PATH')\s*=",line):
+                keys+=1; continue
+            out.append(line)
+        if headers != 1 or keys != 1:
+            raise ConfigError("managed PATH layout is unsupported; preserving configuration")
+        restored=b"".join(out)
+    else:
+        restored=_edit(raw,original)
+    # A syntactically valid edit is not sufficient: verify the owned field has
+    # actually returned to the recorded original value before deleting ownership.
+    if _path_value(_parse(restored)) != original:
+        raise ConfigError("Codex PATH restoration postcondition failed; preserving configuration")
+    return restored
 
 
 def commit_path_journal(config_root: Path) -> None:

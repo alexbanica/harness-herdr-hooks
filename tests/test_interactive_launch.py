@@ -168,6 +168,39 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(kwargs["env"]["HERDR_PANE_ID"], "p2")
         self.assertFalse((self.store.root / "payloads" / f"{request}.json").exists())
 
+    def test_claimed_launch_preserves_selected_state_root_without_forwarding_environment(self):
+        from harness_herdr_hooks.launch import _state_root, run_claimed_launch
+        executable = Path(os.sys.executable).resolve()
+        for overrides in (
+            {"HARNESS_HERDR_STATE_ROOT": str(self.root / "harness-state")},
+            {"XDG_STATE_HOME": str(self.root / "xdg-state")},
+            ({"HARNESS_HERDR_STATE_ROOT": str(self.root / "harness-state"),
+              "XDG_STATE_HOME": str(self.root / "xdg-state")}),
+        ):
+            with self.subTest(overrides=overrides):
+                selected = Path(overrides.get("HARNESS_HERDR_STATE_ROOT") or overrides["XDG_STATE_HOME"])
+                store = LaunchStore(selected / "harness-herdr-hooks" / "launches")
+                request = store.create(["prompt"], native_executable=executable,
+                                       cwd=self.root, profile="/profile")
+                spawn = Mock(return_value=Mock(wait=Mock(return_value=0)))
+                run_claimed_launch(
+                    request, store=store,
+                    verify_destination=lambda *a: {"HERDR_ENV": "1", "HERDR_PANE_ID": "p2"},
+                    environ={"PATH": "/bin", **overrides,
+                             "API_SECRET": "do-not-forward", "CODEX_THREAD_ID": "parent",
+                             "HARNESS_HERDR_DISPLAY": "1"}, popen=spawn)
+                child_env = spawn.call_args.kwargs["env"]
+                self.assertEqual(_state_root(child_env), selected.resolve())
+                self.assertEqual(child_env["HARNESS_HERDR_STATE_ROOT"], str(selected))
+                if "XDG_STATE_HOME" in overrides:
+                    self.assertEqual(child_env["XDG_STATE_HOME"], overrides["XDG_STATE_HOME"])
+                else:
+                    self.assertNotIn("XDG_STATE_HOME", child_env)
+                self.assertNotIn("API_SECRET", child_env)
+                self.assertNotIn("CODEX_THREAD_ID", child_env)
+                self.assertNotIn("HARNESS_HERDR_DISPLAY", child_env)
+                self.assertEqual(spawn.call_count, 1)
+
     def test_outside_and_display_bypass_router(self):
         router = Mock()
         for env in ({}, {"HERDR_ENV": "1", "HARNESS_HERDR_DISPLAY": "1"}):

@@ -1,6 +1,8 @@
 import tempfile
 import unittest
 import multiprocessing
+import threading
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -14,7 +16,7 @@ from harness_herdr_hooks.state import StateStore, save_binding
 from harness_herdr_hooks.model import parent_to_dict, session_to_dict
 
 
-def _real_close_chain(root):
+def _real_close_chain(root, exited=False, mutation=None):
     """Child-process target: exercise NativeRuntime.close_owned_pane end to end."""
     parent, context = fixtures()
     store = StateStore(Path(root), "real-close")
@@ -22,6 +24,14 @@ def _real_close_chain(root):
     proxy = FakeProxy()
     provider = FakeProvider(proxy)
     runtime = FakeRuntime(provider)
+    live_pid = os.getpid()
+    stat_fields = Path(f"/proc/{live_pid}/stat").read_text().rsplit(")", 1)[1].split()
+    live_start_ticks = int(stat_fields[19])
+    pinned_pid = 2147483647 if exited else live_pid
+    runtime.capture_owned_process = lambda *_args: {
+        "pid": pinned_pid, "start_ticks": 999 if exited else live_start_ticks,
+        "uid": os.getuid(), "executable": "/usr/bin/codex", "cwd": "/tmp",
+        **({"tty": "/dev/pts/test", "tty_identity": [1, 2, 3]} if exited else {})}
     coordinator = Coordinator(store, runtime)
     child = Session(context, "parent", "child", Path("/tmp"), Lifecycle.RUNNING,
                     True, 1.0, ("parent",), None, "subagent", "t1", "t1")
@@ -37,8 +47,11 @@ def _real_close_chain(root):
         socket_path = Path("/tmp/codex.sock")
         closed = False
         def process_info(self, _pane):
-            return {"foreground_processes": [{"pid": 42, "name": "codex", "cwd": "/tmp"}]}
+            return {"foreground_processes": [] if exited else [{"pid": live_pid, "name": "codex", "cwd": "/tmp"}],
+                    **({"tty": "/dev/pts/test"} if exited else {})}
         def snapshot(self):
+            if mutation == "generation": store.begin_generation(context.key(), "t2", turn_id="t2")
+            elif mutation == "suppressed": store.mark_suppressed(context.key(), "manual close observed")
             return {"panes": [{"pane_id": "p1", "workspace_id": "w1", "tab_id": "w1:t1", "agent_session": {}}]}
         def close(self, _pane): self.closed = True
     herdr = Herdr()
@@ -48,15 +61,19 @@ def _real_close_chain(root):
     native._process_matches = lambda *_args: True
     with patch("harness_herdr_hooks.coordinator.matches_agent_session_ref", return_value=True), \
          patch("harness_herdr_hooks.herdr._codex_proc_proof",
-               return_value=SimpleNamespace(pid=42, start_ticks=99, uid=1000,
+               return_value=SimpleNamespace(pid=live_pid, start_ticks=live_start_ticks, uid=os.getuid(),
                                             executable=Path("/usr/bin/codex"), cwd=Path("/tmp"))):
         coordinator.runtime = native
         provider.status = {"type": "idle"}
         proxy.turns = [{"id": "t1", "status": "completed", "itemsView": "notLoaded", "items": []}]
-        coordinator.handle(parent, Session(context, "parent", "child", Path("/tmp"),
-            Lifecycle.FINISHED, False, 1.0, ("parent",), None, "subagent", "t1", "t1"))
-    if not herdr.closed:
+        with patch("harness_herdr_hooks.attach._tty_identity", return_value=(1, 2, 3)), \
+             patch("harness_herdr_hooks.attach._tty_has_no_processes", return_value=True):
+            coordinator.handle(parent, Session(context, "parent", "child", Path("/tmp"),
+                Lifecycle.FINISHED, False, 1.0, ("parent",), None, "subagent", "t1", "t1"))
+    if mutation is None and not herdr.closed:
         raise AssertionError("real NativeRuntime close path did not close pane")
+    if mutation is not None and herdr.closed:
+        raise AssertionError(f"NativeRuntime closed after final snapshot {mutation} mutation")
 
 
 def _advance_generation_during_close(root):
@@ -205,11 +222,36 @@ class CompletionTests(unittest.TestCase):
             self.fail("NativeRuntime.close_owned_pane deadlocked reentering StateStore.generation")
         self.assertEqual(process.exitcode, 0)
 
+    def test_real_native_close_chain_closes_proven_empty_exited_display(self):
+        ctx = multiprocessing.get_context("fork")
+        process = ctx.Process(target=_real_close_chain, args=(self.tmp.name, True))
+        process.start()
+        process.join(4)
+        if process.is_alive():
+            process.terminate()
+            process.join(2)
+            self.fail("exited-display NativeRuntime close exceeded watchdog")
+        self.assertEqual(process.exitcode, 0)
+
+    def test_real_native_close_revalidates_generation_and_suppression_after_snapshot(self):
+        for mutation in ("generation", "suppressed"):
+            with self.subTest(mutation=mutation):
+                ctx = multiprocessing.get_context("fork")
+                process = ctx.Process(target=_real_close_chain, args=(self.tmp.name, False, mutation))
+                process.start()
+                process.join(4)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(2)
+                    self.fail(f"NativeRuntime {mutation} revalidation exceeded watchdog")
+                self.assertEqual(process.exitcode, 0)
+
     def test_successful_close_is_monotonic_across_repeated_terminal_polls(self):
         self.proxy.turns = [self.turn("t1", "inProgress")]
         self.coordinator.handle(self.parent, self.child("t1"))
         self.proxy.turns = [self.turn("t1", "completed")]
         self.provider.status = {"type": "idle"}
+        self.store.mark_generation_terminal(self.context.key(), "t1", "t1", "completed")
         child = self.child("t1", Lifecycle.FINISHED)
         self.coordinator.handle(self.parent, child)
         self.provider.status = {"type": "unknown"}
@@ -248,6 +290,76 @@ class CompletionTests(unittest.TestCase):
             process.join(2)
             self.fail("terminal close held state lock during generation change")
         self.assertEqual(process.exitcode, 0)
+
+    def test_concurrent_terminal_observation_claims_only_one_close(self):
+        self.proxy.turns = [self.turn("t1", "inProgress")]
+        self.coordinator.handle(self.parent, self.child("t1"))
+        self.proxy.turns = [self.turn("t1", "completed")]
+        self.provider.status = {"type": "idle"}
+        self.store.mark_generation_terminal(self.context.key(), "t1", "t1", "completed")
+        entered, release = threading.Event(), threading.Event()
+        original_close = self.runtime.close_owned_pane
+        def blocked_close(*args):
+            entered.set()
+            if not release.wait(2):
+                return False
+            return original_close(*args)
+        self.runtime.close_owned_pane = blocked_close
+        results = []
+        first = threading.Thread(target=lambda: results.append(
+            self.coordinator._handle_terminal(self.parent, self.child("t1", Lifecycle.FINISHED),
+                                              self.context.key(), "t1", "completed")))
+        first.start()
+        self.assertTrue(entered.wait(2), "first close did not reach runtime")
+        second = self.coordinator._handle_terminal(self.parent, self.child("t1", Lifecycle.FINISHED),
+                                                   self.context.key(), "t1", "completed")
+        self.assertEqual(second.decision, Decision.WAIT)
+        release.set()
+        first.join(2)
+        self.assertFalse(first.is_alive(), "claimed close did not finish")
+        self.assertEqual(len(self.runtime.closed), 1)
+        self.assertNotIn("cleanup_claim", self.store.record(self.context.key()))
+
+    def test_manual_suppression_during_unlocked_close_is_preserved(self):
+        self.proxy.turns = [self.turn("t1", "inProgress")]
+        self.coordinator.handle(self.parent, self.child("t1"))
+        self.proxy.turns = [self.turn("t1", "completed")]
+        self.provider.status = {"type": "idle"}
+        original_close = self.runtime.close_owned_pane
+        def suppress(*args):
+            self.store.mark_suppressed(self.context.key(), "manual close observed")
+            return original_close(*args)
+        self.runtime.close_owned_pane = suppress
+        self.coordinator.handle(self.parent, self.child("t1", Lifecycle.FINISHED))
+        record = self.store.record(self.context.key())
+        self.assertEqual(record["status"], "suppressed")
+        self.assertNotEqual(record.get("cleanup", {}).get("outcome"), "closed")
+
+    def test_abandoned_cleanup_claim_is_reclaimed_after_owner_exit(self):
+        self.proxy.turns = [self.turn("t1", "inProgress")]
+        self.coordinator.handle(self.parent, self.child("t1"))
+        self.proxy.turns = [self.turn("t1", "completed")]
+        self.provider.status = {"type": "idle"}
+        with self.store.locked() as state:
+            state["records"][self.context.key()]["cleanup_claim"] = {
+                "token": "abandoned", "generation": "t1",
+                "binding_id": self.runtime.attached[0][1],
+                "owner_pid": 2147483647, "owner_start_ticks": 1}
+        result = self.coordinator.handle(self.parent, self.child("t1", Lifecycle.FINISHED))
+        self.assertEqual(result.decision, Decision.SKIP)
+        self.assertEqual(len(self.runtime.closed), 1)
+        self.assertNotIn("cleanup_claim", self.store.record(self.context.key()))
+
+    def test_runtime_close_exception_releases_claim(self):
+        self.proxy.turns = [self.turn("t1", "inProgress")]
+        self.coordinator.handle(self.parent, self.child("t1"))
+        self.proxy.turns = [self.turn("t1", "completed")]
+        self.provider.status = {"type": "idle"}
+        def fail(*_args):
+            raise RuntimeError("provider failure")
+        self.runtime.close_owned_pane = fail
+        self.coordinator.handle(self.parent, self.child("t1", Lifecycle.FINISHED))
+        self.assertNotIn("cleanup_claim", self.store.record(self.context.key()))
 
     def test_unverified_terminal_cleanup_is_recorded(self):
         self.proxy.turns = [self.turn("t1", "inProgress")]
@@ -311,6 +423,64 @@ class CompletionTests(unittest.TestCase):
                          on_end=lambda: calls.append("ended"))
         self.assertEqual(calls, ["provider-closed"])
 
+    def test_initial_snapshot_failure_does_not_seed_baseline_and_recovery_excludes_existing_child(self):
+        store = StateStore(Path(self.tmp.name) / "startup", "test")
+        child = self.child("existing")
+        class Runtime:
+            checks = 0
+            def verify_parent(inner, _parent): return True
+            def sessions(inner, _parent):
+                inner.checks += 1
+                if inner.checks == 1:
+                    def broken():
+                        yield child
+                        raise RuntimeError("provider iterator failed")
+                    return broken()
+                return [child]
+        runtime = Runtime()
+        coordinator = Coordinator(store, runtime)
+        self.assertEqual(coordinator.observe_initial(self.parent).decision, Decision.WAIT)
+        self.assertFalse(store.baseline_ready())
+        self.assertEqual(coordinator.observe_initial(self.parent).decision, Decision.BASELINE)
+        self.assertTrue(store.baseline_ready())
+        self.assertEqual(coordinator.handle(self.parent, child).decision, Decision.SKIP)
+
+    def test_failed_startup_snapshot_cannot_be_accepted_on_restart_with_old_baseline(self):
+        store = StateStore(Path(self.tmp.name) / "restart", "test")
+        store.establish_baseline({"previous"})
+        class Runtime:
+            def verify_parent(self, _parent): return True
+            def sessions(self, _parent):
+                def broken():
+                    yield self.child("partial")
+                    raise RuntimeError("provider iterator failed")
+                return broken()
+        result = Coordinator(store, Runtime()).observe_initial(self.parent)
+        self.assertEqual(result.decision, Decision.WAIT)
+        with store.locked() as state:
+            self.assertEqual(set(state["baseline"]), {"previous"})
+
+    def test_successful_empty_startup_snapshot_is_valid(self):
+        store = StateStore(Path(self.tmp.name) / "empty", "test")
+        class Runtime:
+            def verify_parent(self, _parent): return True
+            def sessions(self, _parent): return iter(())
+        self.assertEqual(Coordinator(store, Runtime()).observe_initial(self.parent).decision,
+                         Decision.BASELINE)
+        self.assertTrue(store.baseline_ready())
+
+    def test_parent_verification_change_during_initial_snapshot_rejects_baseline(self):
+        store = StateStore(Path(self.tmp.name) / "parent-change", "test")
+        class Runtime:
+            checks = 0
+            def verify_parent(inner, _parent):
+                inner.checks += 1
+                return inner.checks == 1
+            def sessions(self, _parent): return iter(())
+        self.assertEqual(Coordinator(store, Runtime()).observe_initial(self.parent).decision,
+                         Decision.WAIT)
+        self.assertFalse(store.baseline_ready())
+
     def test_lock_owning_observer_publishes_running_then_ended(self):
         calls = []
         class Runtime:
@@ -318,7 +488,9 @@ class CompletionTests(unittest.TestCase):
             def __init__(self, *_args): pass
             def verify_parent(self, _parent):
                 self.checks += 1
-                return self.checks <= 2
+                # Observer startup verifies the parent before and after the
+                # initial provider snapshot, then once more before polling.
+                return self.checks <= 3
             def observe_initial(self, _parent): return Outcome(Decision.BASELINE)
             def sessions(self, _parent): return []
         class Provider:

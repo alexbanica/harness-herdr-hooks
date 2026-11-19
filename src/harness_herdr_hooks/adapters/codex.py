@@ -726,7 +726,10 @@ class CodexRuntimeAdapter:
             except Exception:
                 continue
             proof = bound_child.creation_proof
-            if (binding.get("kind") != "standalone" or binding.get("outcome", {}).get("status") != "attached"
+            attached_outcome = binding.get("outcome", {}).get("status") == "attached"
+            verified_reuse = (binding.get("ownership") == "reused"
+                              and record.get("ownership") == "reused")
+            if (binding.get("kind") != "standalone" or not (attached_outcome or verified_reuse)
                     or context_to_dict(bound_child.context) != context_to_dict(child_context)
                     or context_to_dict(bound_parent.context) != context_to_dict(parent.context)
                     or bound_parent.session_path != parent.session_path

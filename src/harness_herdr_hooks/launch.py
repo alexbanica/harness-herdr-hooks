@@ -322,6 +322,14 @@ def run_claimed_launch(request_id: str, *, store: LaunchStore,
     child_env = {k: v for k, v in environ.items()
                  if k in {"HOME", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "COLORTERM", "TMPDIR", "XDG_RUNTIME_DIR", "SSH_AUTH_SOCK"}
                  or k.startswith("HERDR_")}
+    # The native client starts from the destination pane's environment, so
+    # carry the exact state root selected by this verified launch store.
+    # Preserve XDG_STATE_HOME independently for native client behavior; the
+    # explicit HARNESS override keeps nested integration work on this store.
+    state_root = store.root.parent.parent.resolve()
+    child_env["HARNESS_HERDR_STATE_ROOT"] = str(state_root)
+    if "XDG_STATE_HOME" in environ:
+        child_env["XDG_STATE_HOME"] = environ["XDG_STATE_HOME"]
     child_env["CODEX_HOME"] = profile
     child_env.pop("CODEX_THREAD_ID", None)
     child_env.pop("HARNESS_HERDR_DISPLAY", None)

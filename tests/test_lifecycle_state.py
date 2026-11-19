@@ -9,6 +9,7 @@ from harness_herdr_hooks.model import (
 from harness_herdr_hooks.state import (
     StateStore, binding_is_close_owned, load_existing_binding, save_binding,
 )
+from harness_herdr_hooks.coordinator import Coordinator
 
 
 def make_session():
@@ -84,6 +85,15 @@ class LifecycleStateTests(unittest.TestCase):
         self.assertFalse(restarted.mark_generation_terminal("child", "turn-1", "turn-1", "failed"))
         self.assertEqual(restarted.generation("child")["generation"], "turn-2")
 
+    def test_terminal_metadata_does_not_erase_manual_suppression(self):
+        self.store.begin_generation("child", "turn-1", turn_id="turn-1")
+        self.store.mark_suppressed("child", "manual close observed")
+        self.assertTrue(self.store.mark_generation_terminal("child", "turn-1", "turn-1", "completed"))
+        record = self.store.generation("child")
+        self.assertEqual(record["status"], "suppressed")
+        self.assertEqual(record["turn_status"], "completed")
+        self.assertIn("turn-1", record["terminal_generations"])
+
     def test_superseded_generation_cannot_replay_or_erase_current_binding(self):
         self.store.begin_generation("child", "turn-1", turn_id="turn-1")
         with self.store.locked() as data:
@@ -131,6 +141,80 @@ class LifecycleStateTests(unittest.TestCase):
         data = json.loads(path.read_text())
         self.assertEqual(data["schema"], 2)
         self.assertEqual(data["baseline"], ["old"])
+
+    def test_pending_cleanup_snapshot_is_persisted_and_suppression_wins(self):
+        self.store.begin_generation("child", "turn-1", turn_id="turn-1")
+        with self.store.locked() as data:
+            data["records"]["child"].update(status="attached", binding_id="b1", ownership="created")
+        self.assertIn("child", StateStore(self.root, "test").pending_cleanup_records())
+        self.store.mark_suppressed("child", "manual close")
+        self.assertNotIn("child", self.store.pending_cleanup_records())
+
+    def test_runtime_reconciles_persisted_owned_child_missing_from_discovery(self):
+        from harness_herdr_hooks.coordinator import NativeRuntime
+        from harness_herdr_hooks.model import parent_from_dict
+        child = make_session()
+        parent = parent_from_dict(session_parent())
+        save_binding(self.root, "bind-1", {
+            "parent": session_parent(), "child": session_to_dict(child), "pane_id": "p1",
+            "backend_pid": None, "server_socket": "/tmp/herdr.sock", "entrypoint": "/tmp/bin",
+            "shell_pid": 12, "ownership": "created", "generation": "turn-1", "turn_id": "turn-1"})
+        self.store.begin_generation(child.context.key(), "turn-1", turn_id="turn-1")
+        with self.store.locked() as data:
+            data["records"][child.context.key()].update(status="attached", binding_id="bind-1", ownership="created")
+        class Provider:
+            def sessions(self, _parent): return ()
+        runtime = NativeRuntime.__new__(NativeRuntime)
+        runtime.store, runtime.provider, runtime.state_root = self.store, Provider(), self.root
+        runtime.verify_parent = lambda _parent: True
+        self.assertEqual(runtime.initial_sessions(parent), [])
+        reconciled = list(runtime.sessions(parent))
+        self.assertEqual(len(reconciled), 1)
+        self.assertEqual(reconciled[0].generation, "turn-1")
+
+    def test_initial_native_snapshot_catches_lazy_provider_failure_and_accepts_empty(self):
+        from harness_herdr_hooks.coordinator import NativeRuntime
+        from harness_herdr_hooks.model import parent_from_dict
+        parent = parent_from_dict(session_parent())
+        class Provider:
+            def sessions(self, _parent):
+                def broken():
+                    yield make_session()
+                    raise RuntimeError("lazy enumeration failed")
+                return broken()
+        runtime = NativeRuntime.__new__(NativeRuntime)
+        runtime.provider = Provider()
+        runtime.verify_parent = lambda _parent: True
+        self.assertIsNone(runtime.initial_sessions(parent))
+        runtime.provider.sessions = lambda _parent: iter(())
+        self.assertEqual(runtime.initial_sessions(parent), [])
+
+    def test_terminal_confirmation_accepts_not_loaded_but_rejects_active_and_newer(self):
+        class Proxy:
+            turns = []
+            def request(inner, method, params):
+                self.assertEqual(method, "thread/turns/list")
+                self.assertEqual(params["itemsView"], "notLoaded")
+                return {"data": inner.turns, "nextCursor": None}
+        class Provider:
+            proxy = Proxy()
+            thread_status = "notLoaded"
+            def _read_thread(inner, _thread_id):
+                return {"status": {"type": inner.thread_status}}
+        class Runtime:
+            provider = Provider()
+        child = make_session()
+        self.store.begin_generation(child.context.key(), "turn-1", turn_id="turn-1")
+        coordinator = Coordinator(self.store, Runtime())
+        Provider.proxy.turns = [{"id": "turn-1", "status": "completed", "items": []}]
+        self.store.note_stop_hint(child.context.key(), "turn-1", "turn-1", stop_hook_active=True)
+        self.assertEqual(coordinator._confirmed_terminal(child, "turn-1"), "completed")
+        Provider.thread_status = "active"
+        self.assertIsNone(coordinator._confirmed_terminal(child, "turn-1"))
+        Provider.thread_status = "idle"
+        Provider.proxy.turns = [{"id": "turn-2", "status": "inProgress", "items": []},
+                                {"id": "turn-1", "status": "completed", "items": []}]
+        self.assertIsNone(coordinator._confirmed_terminal(child, "turn-1"))
 
     def test_legacy_binding_is_never_close_owned_and_creation_is_positive(self):
         record = {"parent": session_parent(), "child": session_to_dict(make_session()), "pane_id": "p1", "backend_pid": None,

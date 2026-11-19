@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from harness_herdr_hooks.cli import (_HerdrLaunchRouter, _native_codex_executable, _process_pin,
-                                     _verify_launch_destination, _verified_pane_root)
+                                     _observer_command_matches, _verify_launch_destination, _verified_pane_root)
 from harness_herdr_hooks.adapters.codex import CodexRuntimeAdapter
 from harness_herdr_hooks.launch import LaunchStore
 from harness_herdr_hooks.model import Context, Harness, ParentBinding, parent_to_dict
@@ -432,6 +432,24 @@ class LaunchRouterProofTests(unittest.TestCase):
         self.assertIsNone(_process_pin(42, expected={**pin, "start_ticks": 124}, proc_root=self.root / "proc"))
         (proc / "status").write_text("Uid:\t99999\t99999\t99999\t99999\n")
         self.assertIsNone(_process_pin(42, proc_root=self.root / "proc"))
+
+    def test_observer_command_binds_private_source_and_exact_binding(self):
+        proc = self.root / "proc" / "42"
+        proc.mkdir(parents=True)
+        fields=["S"]+["0"]*18+["123"]+["0"]*5
+        (proc/"stat").write_text("42 (observer) "+" ".join(fields))
+        (proc/"status").write_text(f"Uid:\t{os.getuid()}\t{os.getuid()}\t{os.getuid()}\t{os.getuid()}\n")
+        (proc/"exe").symlink_to(sys.executable)
+        (proc/"cmdline").write_bytes((sys.executable+"\0-m\0harness_herdr_hooks\0observe\0owned-binding\0").encode())
+        (proc/"environ").write_bytes(b"PYTHONPATH=/owned/src\0")
+        pin=_process_pin(42,proc_root=self.root/"proc")
+        observer={"source_root":"/owned/src","binding_id":"owned-binding","pin":pin}
+        self.assertTrue(_observer_command_matches(42,observer,proc_root=self.root/"proc"))
+        observer["binding_id"]="foreign-binding"
+        self.assertFalse(_observer_command_matches(42,observer,proc_root=self.root/"proc"))
+        fields[19]="124"
+        (proc/"stat").write_text("42 (observer) "+" ".join(fields))
+        self.assertFalse(_observer_command_matches(42,observer,proc_root=self.root/"proc"))
 
     def test_acknowledgement_poll_observes_claimed_then_acknowledged(self):
         root = self.root / "harness-herdr-hooks" / "launches"

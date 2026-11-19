@@ -239,7 +239,10 @@ class StateStore:
                 terminal.append(generation)
             record["terminal_generations"] = terminal
             record["turn_status"] = status
-            record["status"] = "finished"
+            # Terminal metadata can arrive after an explicit manual suppression.
+            # Keep suppression authoritative while retaining the backend result.
+            if record.get("status") != "suppressed":
+                record["status"] = "finished"
             return True
 
     def generation(self, session_key: str) -> dict[str, Any] | None:
@@ -412,6 +415,17 @@ class StateStore:
                 candidate["retry_after"] = float(now)
                 return True
             return False
+    def pending_cleanup_records(self) -> dict[str, dict[str, Any]]:
+        """Snapshot persisted attached generations that may need terminal reconciliation."""
+        with self.locked() as data:
+            return {key: dict(value) for key, value in data.get("records", {}).items()
+                    if isinstance(value, dict) and value.get("status") in {"attached", "finished"}
+                    and value.get("ownership") == "created"
+                    and value.get("kind", "subagent") == "subagent"
+                    and value.get("generation") and value.get("turn_id")
+                    and value.get("binding_id") and value.get("status") != "suppressed"
+                    and not (isinstance(value.get("cleanup"), dict)
+                             and value["cleanup"].get("outcome") in {"closed", "manual-close"})}
 
 
 def _binding_path(root: Path, opaque_id: str, *, create: bool) -> Path:

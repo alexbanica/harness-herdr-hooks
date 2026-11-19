@@ -332,3 +332,135 @@ worktree, bounded live qualification, assurance and branch/PR delivery.
 Implementation requires invoking implement with this pair in a new assistant
 conversation/session. No implementation, commit, push, hook installation, smoke
 task, or pane mutation has been performed in this planning session.
+
+## Amendment 1 — 2026-11-19 — reconcile the advanced predecessor
+
+- Amendment ID: HHH-004-PLAN-A1
+- Previous version: original approved HHH-004-PLAN, file SHA-256
+  `54a5adfe0fc40dce6369a8e3357de543e219492cf11ba0385f82b85bea86fa6d`.
+- Approval: Automatically approved on 2026-11-19 after independent readiness
+  review under the originating implementation request, as recorded below.
+- Request and purpose: the user's `$implement
+  specs/PLAN-codex-standalone-creation-events.md` invocation on 2026-11-19.
+  The authorized checkpoint `93457ef2892d39728a3e76e95889cc214ba97870`
+  was published to the planned branch and DRAFT PR
+  [#3](https://github.com/alexbanica/harness-herdr-hooks/pull/3). During execution,
+  the predecessor advanced to `4774fc5e5b1763be5b9b4eabef3c5edcfd2ad1d1`.
+  GitHub reports PR #3 as conflicting. Reconciling this delivered dependency
+  is required to leave a reviewable integration without rewriting published work.
+
+### Changes against the previous version
+
+| Section / requirement | Before | After | Reason |
+| --- | --- | --- | --- |
+| Source dependency and tested base | Exact HHH-002 checkpoint `274b54c0d813b79774b1d7b88e3d5abb5dcfec82` | Integrate delivered predecessor `4774fc5e5b1763be5b9b4eabef3c5edcfd2ad1d1`, which contains that checkpoint, into published HHH-004 head `93457ef2892d39728a3e76e95889cc214ba97870` | Concurrent cleanup, routed-state and owned-PATH fixes cause textual conflicts. Do not discard either lineage. |
+| Delivery preparation | Detached new-branch preparation before first commit | Continue the same clean, exclusively owned delivery worktree and branch; verify local/upstream/remote checkpoint equality, then parent performs `git merge --no-commit --no-ff 4774fc5e5b1763be5b9b4eabef3c5edcfd2ad1d1` | Preserve published ancestry; no reset, rebase, force push, replacement branch or PR. |
+| Conflict ownership | Original U10–U80 ownership | Parent owns Git and mechanical document reconciliation; developer owns `coordinator.py`, `state.py`, and `tests/test_pane_ownership.py` conflict resolution, plus narrowly necessary compatibility corrections in already named HHH-004 source/tests | Read-only merge-tree identifies exactly these three source/test conflicts and four documentation conflicts. |
+| Integration validation and delivery | Checks on the original pinned source | Full combined suite and static/operator checks on the reconciled tree, full independent code/contract review, consolidated corrections, final independent QA, documentation synchronization, then one non-force merge commit/push to the same branch and PR | Earlier 156-test evidence remains checkpoint evidence, not proof of the new combined tree. Verify PR head/base and mergeability after publication. |
+
+### Preserved behavior and impact
+
+The approved SPEC is unchanged, file SHA-256
+`a506853924126c74aca1d73b9b36d2c379db3bd0e52b46238bb5440dc2e53423`.
+R1–R7 and A1–A6, privacy, exact-parent/backend proof, bounded reader/retries,
+standalone retention, native ancestry and lifecycle isolation, and all exclusions
+remain unchanged. This is a source/dependency integration amendment, not a new
+product behavior or additional runtime authority.
+
+The upstream HHH-002 SPEC remains byte-identical with its pinned digest. The
+upstream PLAN now records separate user approval of original HHH-002-PLAN plus
+HHH-002-PLAN-A1; its delivered file SHA-256 is
+`f01ad1559049dd303b5b231235c8bfcc8f88cc015b53363c68343f6e6bb822fd`.
+Inherit it unchanged from the dependency; HHH-004 does not approve, rewrite, or
+perform its unrelated remaining qualification. In particular, the former
+planning-time description of that amendment as pending does not confer approval.
+Preserve the delivered native cleanup claims, suppression, startup-baseline and
+observer-health behavior, and routed state/PATH ownership fixes. Never apply
+subagent cleanup to standalone records.
+
+The same worktree, branch, origin, PR #3 and predecessor PR base remain selected.
+Only the delivery branch receives a local dependency integration and non-force
+publication. The prohibition on merging PR #3 into its base, main integration,
+deployment, release, tag, live daemon restart and unrelated profile changes is
+unchanged. Other worktrees, invoking main and installed-source references remain
+untouched. Retain the original invoking artifact copies as recovery snapshots
+while DRAFT; the amended artifact on this delivery branch is the effective PLAN.
+
+### Deterministic integration and assurance units
+
+1. **A10 — Parent Git preparation.** Reverify clean source checkpoint/upstream
+   equality, dependency ancestry and exact incoming SHA. Preserve the original
+   approved artifact preimage and the amendment bytes. Perform the stated
+   no-commit merge only after this complete effective PLAN is automatically
+   approved. Do not abort/reset/stash or advance another branch.
+2. **A20 — Bounded developer.** Resolve only the three named source/test conflicts,
+   preserving both sets of tests and HHH-002 native cleanup/startup semantics
+   alongside HHH-004 explicit proof, standalone claims, retention and baseline
+   exclusion. The auto-merged CLI, adapter, attachment, installer/configuration,
+   launch and other tests are direct compatibility checks, not permission to
+   reopen their design. Report a concrete incompatibility before expanding edits.
+   Literal conflict-marker removal cannot be test-first; preserve both existing
+   suites, then add focused interaction regressions before functional corrections.
+3. **A30 — Parent mechanical documents.** Reconcile `docs/contracts.md`,
+   `docs/install-codex.md`, `docs/troubleshooting.md`, and `docs/validation.md`
+   without discarding either lineage's contracts or evidence. Final semantic
+   documentation synchronization remains the writer's post-QA unit.
+4. **A40–A60 — Full assurance.** Freeze the integrated diff and dependency evidence;
+   run the complete standard-library suite plus the original compileall, shell,
+   Node, JSON, isolated operator and diff checks. Independent code and contract
+   reviewers cover the full HHH-004 change against the incoming dependency and
+   affected shared behavior. Wait for both reports, dispose all findings, perform
+   one consolidated correction batch and affected checks, then independent final
+   QA. Repeat only under the original qualifying-evidence rule. Security review
+   remains untriggered; this remains one technical agent-presentation capability,
+   not multiple interacting business domains, so architect assurance is not
+   triggered. A final documentation writer updates the original six owned files
+   and records the actual combined-tree evidence and retained native gaps.
+5. **A70 — Parent delivery.** Stage only reconciled/accepted merge paths and this
+   amended PLAN, verify unchanged SPEC/reference bytes and inherited predecessor
+   artifacts, commit the integration with both published parents, push non-force
+   to the existing upstream, and verify remote/upstream/PR head equality and the
+   unchanged PR base. Verify that the conflict is resolved against this incoming
+   dependency. No duplicate PR or base-branch merge is authorized. Retain DRAFT
+   while A5 is unavailable and retain the recovery worktree; a checkpoint is not
+   completion or a continuation gate.
+
+Each specialist retains fresh context, exact hashes/ownership, the five-minute
+bound and JSON handoff rules. Parent alone performs Git and final acceptance.
+
+### Requirement-to-delivery trace
+
+| Criteria | Integration units and owned boundary | Validation / terminal evidence |
+| --- | --- | --- |
+| R1–R4, R6; A1–A3 | A20 source/test conflicts and the existing parser/adapter/CLI/state paths; A40–A60 assurance | Both lineages' complete tests, shared baseline/claim/restart regressions, native proof and isolated operator checks; full code/contract review and QA |
+| R5, R7; A4 | A20 native cleanup/standalone-kind boundary, inherited route/PATH changes; A40–A60 | Standalone retention, suppression, terminal cleanup, startup-baseline and observer/status regressions; no live success inferred |
+| A5 | Original parent-owned bounded live unit unchanged | Still blocked by mismatched invoking/Herdr identities; preserve exact missing native evidence and perform no speculative live effect |
+| A6 | A30 mechanical reconciliation and A60 writer, original six documentation files | Accurate final combined-tree results, limits and qualification gaps; link/diff checks |
+| Delivery / all criteria | A10 and A70, existing worktree/branch/PR | Non-force preserved ancestry, exact artifact hashes, remote/upstream/PR head/base and mergeability; blocked DRAFT while A5 remains unmet |
+
+### Planning assurance
+
+Independent plan-readiness-reviewer `HHH004-A1-readiness` reviewed the complete
+original PLAN plus A1 at file SHA-256
+`0a5469a33a3e25070b6c43141af51086f2ccd63f64126d93fd380c04a034eb3a`
+against the unchanged approved SPEC digest above. Its JSON handoff reported no
+findings and covered R1–R7/A1–A6, dependency preservation, merge parents,
+ownership, validation, live-effect limits and non-force delivery. The parent
+verified the identity, evidence and complete semantic coverage. This is advisory
+assurance, not reviewer approval; subsequent edits record assurance and automatic
+approval only, without changing the reviewed implementation choices.
+
+### Approval record
+
+Automatically approved on 2026-11-19: the complete effective original approved
+HHH-004-PLAN plus HHH-004-PLAN-A1, paired with the unchanged approved SPEC. The
+authorization is the user's originating `$implement` request and the active
+implementation amendment rule: required PLAN amendments resume automatically
+after artifact generation, mandatory readiness assurance and finding resolution.
+Reason: published PR #3 conflicts with the independently delivered predecessor
+revision, so preserving and integrating both lineages is required. Approved scope
+is exactly A10–A70 above, with unchanged feature behavior, delivery destination,
+external-effect limits and outstanding A5 evidence. Original document status,
+original body and earlier approval history remain unchanged. This record does
+not claim manual user review of the generated amendment or approval of any
+unrelated predecessor work.

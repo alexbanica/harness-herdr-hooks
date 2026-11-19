@@ -16,8 +16,13 @@ loading, or complete pane attachment support.
 - **No Codex pane appears:** confirm that the selected profile was loaded by a
   user-owned parent after install and that any native trust prompt for changed
   hooks was handled. Check status fields separately: registration/configuration,
-  observed trust/load, backend, observer, and pane outcome. Unknown is not
-  success. Verify Codex CLI and running app-server 0.170.0, Herdr 0.9.5/protocol
+  loaded helper revision, observed trust/load, backend, observer, and pane
+  outcome. Observer states are `running`, `stale`, `unknown`, or `ended`. A
+  registered path or source checkout does not prove the running helper loaded
+  that revision. A native thread `notLoaded` response or missing items alone
+  is not terminal evidence; it can participate only with successful status
+  evidence plus exact matching terminal-turn metadata and no newer running work.
+  Verify Codex CLI and running app-server 0.170.0, Herdr 0.9.5/protocol
   22, and exact selected profile/backend binding. The verified default daemon
   and explicit Unix endpoints are supported; `--no-daemon` and ambiguous modes
   fail closed. Outside-Herdr events remain silent. Do not bypass trust or change
@@ -39,6 +44,18 @@ loading, or complete pane attachment support.
   unrelated children are not safe to open. No old sessions are backfilled.
   OpenCode `idle` alone does not prove that a session is finished or attachable.
   This is expected fail-closed behavior, not a prompt to resume the parent.
+- **An owned Codex pane remains open after a child disappears:** disappearance
+  from discovery, a missing or unloaded helper, and `notLoaded` item data do
+  not prove completion. Cleanup requires positive terminal metadata for the
+  exact turn/task generation, no newer running work, and revalidated pane and
+  process ownership. Manual closure suppresses reopening for that child. A
+  helper replacement uses the parent-owned bounded operation and only a proven
+  integration-owned helper may be retired. Read-only `status` does not retire
+  or reconcile a helper. Unknown, unowned, or ambiguous panes are retained.
+- **Initial session baseline could not be established:** new-session attachment
+  stays skipped until the observer obtains and persists the initial baseline.
+  This avoids treating pre-existing sessions as new children; inspect observer
+  status and allow the next normal lifecycle observation to retry.
 - **Pane title is absent or unexpected:** names come one way from the native
   session title after sanitization. Pane names do not control native session
   titles. Duplicate prevention uses session identity, not title.
@@ -47,10 +64,13 @@ loading, or complete pane attachment support.
   agents are left untouched. Verify `status` for the selected config root.
 
 Native user-owned approval/trust and profile reload must follow Codex's own
-controls. This delivery has not yet demonstrated active-profile hook loading,
-native child display/cleanup, or ordinary launch routing. No automatic daemon
-restart or trust bypass is supported. OpenCode native qualification and the
-predecessor macOS gap remain separate.
+controls. A live bare `codex` invocation was acknowledged once in an unfocused
+Herdr tab, and its launch payload was removed; its pane remained at the native
+confirmation UI. This does not demonstrate same-thread/subagent attachment,
+completion cleanup, client exit to a usable shell, or active-profile loading of
+the current source revision. No automatic daemon restart or trust bypass is
+supported. OpenCode native qualification and the predecessor macOS gap remain
+separate.
 
 ## Standalone task discovery
 
