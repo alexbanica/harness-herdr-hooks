@@ -298,7 +298,7 @@ class StateStore:
 
     def commit_task_records(self, cursor: dict[str, Any], events: list[Any], *,
                             parent: dict[str, Any], context: dict[str, Any],
-                            destination: dict[str, Any], now: float) -> int:
+                            destination: dict[str, Any], now: float) -> tuple[int, bool]:
         """Atomically advance a reader cursor with its validated ID-only events.
 
         The caller supplies already-validated U10 events and bounded authority
@@ -323,6 +323,7 @@ class StateStore:
             outcomes = state.setdefault("outcomes", [])
             keys = {x["event_key"] for x in pending} | {x["event_key"] for x in outcomes}
             added = 0
+            overflow = False
             for event in events:
                 ep = getattr(event, "parent_id", None) or getattr(event, "parent_thread_id", None)
                 turn = getattr(event, "turn_id", None)
@@ -342,7 +343,11 @@ class StateStore:
                 if key in keys:
                     continue
                 if len(pending) >= 128:
-                    raise UnsafeState("pending task event limit reached")
+                    # The read cursor and bounded queue must commit together. A
+                    # burst beyond capacity is skipped explicitly, without
+                    # retaining event payloads or rolling the cursor back.
+                    overflow = True
+                    continue
                 pending.append({"event_key": key, "parent_id": ep,
                                 "turn_id": turn, "item_id": item,
                                 "child_id": child, "cwd_sha256": cwd_hash,
@@ -350,9 +355,19 @@ class StateStore:
                                 "status": "pending", "attempts": 0,
                                 "first_seen": float(now), "retry_after": float(now)})
                 keys.add(key); added += 1
+            if overflow:
+                diagnostic_key = hashlib.sha256(json.dumps(
+                    ["bounded-overflow", cursor], sort_keys=True,
+                    separators=(",", ":")).encode()).hexdigest()
+                state["outcomes"] = [x for x in outcomes if x["event_key"] != diagnostic_key]
+                if len(state["outcomes"]) >= 256:
+                    state["outcomes"] = state["outcomes"][-255:]
+                state["outcomes"].append({"event_key": diagnostic_key,
+                                          "child_id": "bounded-overflow",
+                                          "status": "rejected"})
             state.update(cursor=cursor, authority=authority)
             _validate_task_discovery(state)
-            return added
+            return added, overflow
 
     def update_task_candidate(self, event_key: str, *, status: str,
                               now: float, retry: bool = False,

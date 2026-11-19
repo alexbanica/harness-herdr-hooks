@@ -98,7 +98,7 @@ def _runtime_status(root:Path,profile:str)->dict:
     reasons={"parent_file_missing","parent_file_mismatch","unsafe_parent_file","metadata_unavailable",
              "candidate_expired","future_timestamp","task_finished","task_mismatch","unsupported_envelope",
              "unsupported_record_format","retry_exhausted","attachment_pending","invalid_cwd","cwd_mismatch",
-             "status_deferred"}
+             "status_deferred","pending_limit"}
     if task.get("reason") in reasons:
         task_status["reason"]=task["reason"]
     health=task.get("current_health")

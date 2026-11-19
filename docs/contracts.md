@@ -92,7 +92,10 @@ restart.
 The Codex adapter routes supported ordinary interactive `codex` shell commands
 through the profile-owned PATH prefix. It classifies commands before routing,
 starts a destination client once with a bounded private payload, and retains a
-usable shell after client exit. Informational/tooling commands, `exec`, resume,
+usable shell after client exit. Standalone attachment invokes its helper without
+a shell-level `exec`, so the original shell remains available; the helper still
+replaces itself with the native client using `os.execvpe`. The subagent wrapper
+behavior is unchanged. Informational/tooling commands, `exec`, resume,
 absolute paths, deliberate PATH bypasses, remote hosted backends, and
 `--no-daemon` sessions are outside this routing qualification. Terminal child
 cleanup correlates stop hints with turn ID/generation and metadata-only terminal
@@ -130,7 +133,11 @@ replacement/truncation, restart, duplicates and concurrent observers. A private
 cursor and minimum ID-only associations/outcomes support recovery and
 deduplication; prompts, raw results, conversation text and partial bytes are
 not persisted. Limits are 1 MiB per read/record, 256 records per pass, JSON
-depth 12, 128 pending associations and 512 characters per ID. Metadata
+depth 12, 128 pending associations and 512 characters per ID. If a pass would
+exceed the pending limit, the cursor advances atomically with the bounded state:
+up to 128 associations are retained, excess candidates are skipped, and one
+ID-only aggregate rejected marker records the overflow for that read. Polling
+continues, and status health reports the bounded `pending_limit` reason. Metadata
 verification allows at most three attempts within a 30-second window; retry
 time is monotonic within a process and persisted timestamps are bounded on
 restart. Unsupported

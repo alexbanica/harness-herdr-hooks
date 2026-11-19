@@ -13,10 +13,11 @@ class AttachError(AttachmentUnavailable):
         super().__init__(message); self.pane_id=pane_id; self.retryable=retryable
 _SUPPORTED_SHELLS={'sh','bash','zsh','dash','ksh'}
 
-def wrapper_command(entrypoint:Path,binding_id:str)->str:
+def wrapper_command(entrypoint:Path,binding_id:str,*,preserve_shell:bool=False)->str:
     if not entrypoint.is_absolute() or not binding_id or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_' for c in binding_id):
         raise ValueError('expected absolute entrypoint and opaque binding ID')
-    return 'exec '+shlex.quote(str(entrypoint))+' attach '+shlex.quote(binding_id)
+    command=shlex.quote(str(entrypoint))+' attach '+shlex.quote(binding_id)
+    return command if preserve_shell else 'exec '+command
 
 def shell_is_ready(process_info:dict)->bool:
     shell_pid=process_info.get('shell_pid'); fg=process_info.get('foreground_processes')
@@ -186,7 +187,7 @@ def _close_failed_before_exec(client:HerdrClient,state_root:Path,binding_id:str,
 
 def attach_in_new_pane(client:HerdrClient,runtime:Any,parent:object,child:object,entrypoint:Path,
                        binding_id:str,state_root:Path,backend_pid:int|None=None,
-                       on_pane_created:Callable[[str,dict],None]|None=None)->str:
+                       on_pane_created:Callable[[str,dict],None]|None=None,*,preserve_shell:bool=False)->str:
     """Revalidate before splitting; persist ownership before sending wrapper text."""
     if not state_root.is_absolute(): raise AttachmentUnavailable('state root must be absolute')
     try: parent_verified=runtime.verify_parent(parent)
@@ -212,7 +213,7 @@ def attach_in_new_pane(client:HerdrClient,runtime:Any,parent:object,child:object
         latest=client.process_info(pane)
         if not shell_is_ready(latest) or latest.get('shell_pid')!=info.get('shell_pid'):
             raise AttachmentUnavailable('shell changed before wrapper launch')
-        client.send_text(pane,wrapper_command(entrypoint,binding_id))
+        client.send_text(pane,wrapper_command(entrypoint,binding_id,preserve_shell=preserve_shell))
         client.send_keys(pane,['enter'])
         provider=getattr(runtime,'provider',None)
         if provider is None or not callable(getattr(provider,'attach_argv',None)):

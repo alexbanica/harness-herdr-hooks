@@ -835,7 +835,8 @@ class NativeRuntime:
         try:
             pane_id = attach_in_new_pane(self.herdr, self, parent, child, self.entrypoint,
                                          binding_id, self.state_root, self.backend_pid,
-                                         on_pane_created=created)
+                                         on_pane_created=created,
+                                         preserve_shell=child.kind == "standalone")
             attached = bool(pane_id and record.get("pane_id") == pane_id and self.owned_pane_state(parent, child, binding_id) == "live")
             if attached:
                 update_binding_outcome(self.state_root, binding_id, "attached", record.get("shell_pid"))

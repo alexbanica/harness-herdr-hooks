@@ -56,6 +56,24 @@ class RuntimeStatusTests(unittest.TestCase):
             "recognition": "recognized", "verification": "unknown",
             "attachment": "unknown", "reason": "unsupported_envelope"})
 
+    def test_pending_limit_reason_survives_without_exposing_untrusted_text(self):
+        cli._runtime_write(self.root, str(self.profile), lambda d: d.update(task_discovery={
+            "recognition": "recognized", "verification": "pending",
+            "attachment": "unknown", "reason": "pending_limit",
+            "current_health": {"state": "deferred", "reason": "pending_limit"},
+            "raw": "private event payload"}))
+        task = cli._runtime_status(self.root, str(self.profile))["task_discovery"]
+        self.assertEqual(task, {"recognition": "recognized", "verification": "pending",
+                                "attachment": "unknown", "reason": "pending_limit",
+                                "current_health": {"state": "deferred", "reason": "pending_limit"}})
+        cli._runtime_write(self.root, str(self.profile), lambda d: d.update(task_discovery={
+            "recognition": "recognized", "verification": "pending",
+            "attachment": "unknown", "reason": "private event payload",
+            "current_health": {"state": "deferred", "reason": "private event payload"}}))
+        task = cli._runtime_status(self.root, str(self.profile))["task_discovery"]
+        self.assertNotIn("reason", task)
+        self.assertEqual(task["current_health"], {"state": "deferred"})
+
     def test_current_task_failure_replaces_stale_success_and_exposes_only_reason_code(self):
         adapter = object.__new__(__import__("harness_herdr_hooks.adapters.codex", fromlist=["CodexRuntimeAdapter"]).CodexRuntimeAdapter)
         adapter.context = type("C", (), {"profile": str(self.profile)})()

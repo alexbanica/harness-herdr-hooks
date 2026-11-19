@@ -45,12 +45,12 @@ class StandaloneTaskStateTests(unittest.TestCase):
                    "backend_instance": "inst", "session_id": "parent"}
         destination = {"server_id": "s", "workspace_id": "w", "tab_id": "t", "pane_id": "p"}
         self.assertEqual(self.store.commit_task_records(cursor, [event, event], parent=parent,
-                         context=context, destination=destination, now=10), 1)
+                         context=context, destination=destination, now=10), (1, False))
         state = StateStore(Path(self.tmp.name), "standalone-test").task_discovery()
         self.assertEqual(state["cursor"], cursor)
         self.assertEqual(len(state["pending"]), 1)
         self.assertEqual(self.store.commit_task_records(cursor, [event], parent=parent,
-                         context=context, destination=destination, now=11), 0)
+                         context=context, destination=destination, now=11), (0, False))
         key = state["pending"][0]["event_key"]
         self.assertTrue(self.store.update_task_candidate(key, status="pending", now=12,
                                                          retry=True, reason="metadata unavailable"))
@@ -110,7 +110,7 @@ class StandaloneTaskStateTests(unittest.TestCase):
         valid = SimpleNamespace(parent_id="parent", turn_id="turn", item_id="item",
                                 child_id="child", cwd_sha256=None)
         self.assertEqual(self.store.commit_task_records(cursor, [invalid, valid], parent=parent,
-                         context=context, destination=destination, now=10), 1)
+                         context=context, destination=destination, now=10), (1, False))
         state = self.store.task_discovery()
         self.assertEqual(state["cursor"], cursor)
         self.assertEqual([item["turn_id"] for item in state["pending"]], ["turn"])
@@ -131,7 +131,7 @@ class StandaloneTaskStateTests(unittest.TestCase):
         self.assertEqual(state["outcomes"][0]["status"], "rejected")
         self.assertEqual(self.store.commit_task_records(c, [event], parent={"parent_id": "parent", "path": "/tmp/a", "device": 1, "inode": 1, "owner_uid": 1},
           context={"profile": "p", "backend_id": "b", "backend_instance": "i", "session_id": "parent"},
-          destination={"server_id": "s", "workspace_id": "w", "tab_id": "t", "pane_id": "p"}, now=5), 0)
+          destination={"server_id": "s", "workspace_id": "w", "tab_id": "t", "pane_id": "p"}, now=5), (0, False))
 
     def test_verification_reservations_allow_three_attempts_then_reject(self):
         event = SimpleNamespace(parent_id="parent", turn_id="turn", item_id="item",
@@ -149,6 +149,43 @@ class StandaloneTaskStateTests(unittest.TestCase):
         self.assertEqual(self.store.task_discovery()["pending"][0]["attempts"], 3)
         self.assertFalse(self.store.reserve_task_verification(key, now=5))
         self.assertEqual(self.store.task_discovery()["outcomes"][0]["status"], "rejected")
+
+    def test_pending_overflow_skips_safely_and_advances_cursor_across_restart(self):
+        parent = {"parent_id": "parent", "path": "/tmp/r.jsonl", "device": 1,
+                  "inode": 2, "owner_uid": 1}
+        context = {"profile": "p", "backend_id": "b", "backend_instance": "i",
+                   "session_id": "parent"}
+        destination = {"server_id": "s", "workspace_id": "w", "tab_id": "t", "pane_id": "p"}
+        events = [SimpleNamespace(parent_id="parent", turn_id="turn", item_id=f"item-{i}",
+                                  child_id=f"child-{i}", cwd_sha256=None, secret="raw payload")
+                  for i in range(130)]
+        cursor = {"device": 1, "inode": 2, "offset": 100, "parent_id": "parent",
+                  "path": "/tmp/r.jsonl", "observed_size": 100, "skip_to_newline": False}
+        self.assertEqual(self.store.commit_task_records(cursor, events, parent=parent,
+                         context=context, destination=destination, now=10), (128, True))
+        state = StateStore(Path(self.tmp.name), "standalone-test").task_discovery()
+        self.assertEqual(state["cursor"], cursor)
+        self.assertEqual(len(state["pending"]), 128)
+        self.assertEqual(state["outcomes"][-1]["status"], "rejected")
+        self.assertEqual(state["outcomes"][-1]["child_id"], "bounded-overflow")
+        self.assertNotIn("raw payload", (self.store.root / "state.json").read_text())
+
+        next_cursor = dict(cursor, offset=200, observed_size=200)
+        restarted = StateStore(Path(self.tmp.name), "standalone-test")
+        self.assertEqual(restarted.commit_task_records(next_cursor, events[128:], parent=parent,
+                         context=context, destination=destination, now=11), (0, True))
+        self.assertEqual(restarted.task_discovery()["cursor"], next_cursor)
+        self.assertEqual(len(restarted.task_discovery()["pending"]), 128)
+        for candidate in list(restarted.task_discovery()["pending"]):
+            restarted.update_task_candidate(candidate["event_key"], status="rejected", now=12)
+        final_cursor = dict(next_cursor, offset=300, observed_size=300)
+        newer = SimpleNamespace(parent_id="parent", turn_id="turn-new", item_id="new-item",
+                                 child_id="new-child", cwd_sha256=None)
+        self.assertEqual(restarted.commit_task_records(final_cursor, [newer], parent=parent,
+                         context=context, destination=destination, now=13), (1, False))
+        final_state = restarted.task_discovery()
+        self.assertEqual(final_state["cursor"], final_cursor)
+        self.assertEqual([x["child_id"] for x in final_state["pending"]], ["new-child"])
 
 
 if __name__ == "__main__": unittest.main()

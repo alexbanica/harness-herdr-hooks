@@ -598,7 +598,7 @@ class CodexRuntimeAdapter:
                               "metadata_unavailable", "candidate_expired", "future_timestamp",
                               "task_finished", "task_mismatch", "unsupported_envelope",
                               "unsupported_record_format", "retry_exhausted", "attachment_pending",
-                              "invalid_cwd", "cwd_mismatch", "status_deferred"}:
+                              "invalid_cwd", "cwd_mismatch", "status_deferred", "pending_limit"}:
                     current["reason"] = reason
                 elif reason is None and any(value not in {"unknown", "observing", "deferred"}
                                             for value in (recognition, verification, attachment)):
@@ -607,12 +607,12 @@ class CodexRuntimeAdapter:
                     "parent_file_missing", "parent_file_mismatch", "unsafe_parent_file",
                     "metadata_unavailable", "candidate_expired", "future_timestamp",
                     "unsupported_envelope", "unsupported_record_format", "retry_exhausted",
-                    "invalid_cwd", "cwd_mismatch", "status_deferred"} else "healthy"}
+                    "invalid_cwd", "cwd_mismatch", "status_deferred", "pending_limit"} else "healthy"}
                 if health["state"] == "deferred" and reason in {
                     "parent_file_missing", "parent_file_mismatch", "unsafe_parent_file",
                     "metadata_unavailable", "candidate_expired", "future_timestamp",
                     "unsupported_envelope", "unsupported_record_format", "retry_exhausted",
-                    "invalid_cwd", "cwd_mismatch", "status_deferred"}:
+                    "invalid_cwd", "cwd_mismatch", "status_deferred", "pending_limit"}:
                     health["reason"] = reason
                 current["current_health"] = health
                 data["task_discovery"] = current
@@ -676,14 +676,17 @@ class CodexRuntimeAdapter:
             destination = {"server_id": parent.herdr_server_id,
                            "workspace_id": parent.workspace_id,
                            "tab_id": parent.tab_id, "pane_id": parent.pane_id}
-            store.commit_task_records(read.cursor.to_dict(), list(read.events), parent=authority,
-                                      context=context_pin, destination=destination, now=time.time())
+            _added, overflow = store.commit_task_records(
+                read.cursor.to_dict(), list(read.events), parent=authority,
+                context=context_pin, destination=destination, now=time.time())
         reasons = {"unsupported record format": "unsupported_envelope",
                    "parent rollout replaced": "parent_file_mismatch",
                    "parent rollout truncated": "parent_file_mismatch",
                    "cursor identity changed": "parent_file_mismatch",
                    "oversized record skipped": "unsupported_envelope"}
         reason = reasons.get(read.reason or "")
+        if overflow:
+            reason = "pending_limit"
         self._standalone_status("recognized" if read.events else "observing",
                                 "pending" if read.events else "unknown", "unknown", reason)
         discovery = store.task_discovery()
@@ -863,6 +866,10 @@ class CodexRuntimeAdapter:
                                                 now=logical_now + max(0.0, time.monotonic() - mono_now),
                                                 reason="metadata unavailable")
                     self._standalone_status("recognized", "deferred", "unknown", "metadata_unavailable")
+        if overflow:
+            # Candidate processing may replace the capture reason with a retry
+            # result. Preserve the aggregate bounded-skip health after the pass.
+            self._standalone_status("observing", "unknown", "unknown", "pending_limit")
 
     def _read_thread(self, thread_id: str) -> Mapping[str, Any]:
         result = self.proxy.request("thread/read", {"threadId": thread_id, "includeTurns": False})

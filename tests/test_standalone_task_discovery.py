@@ -37,6 +37,73 @@ def event(parent='parent', child='standalone', turn='turn', item='item'):
 
 
 class StandaloneDiscoveryTests(unittest.TestCase):
+    def test_reader_adapter_poll_bounds_overflow_and_resumes_after_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); profile = root / 'profile'; sessions = profile / 'sessions'
+            sessions.mkdir(parents=True); parent_file = sessions / 'parent.jsonl'
+            parent_file.write_text(json.dumps({'type': 'session_meta', 'payload': {'id': 'parent'}}) + '\n')
+            context = Context(Harness.CODEX, str(profile), profile, profile, profile,
+                              '/socket', 'parent', '1:2:3')
+            parent = ParentBinding(context, 'server', 'ws', 'tab', 'pane', session_path=parent_file)
+            state_root = root / 'state'
+            proxy = Proxy([{'id': 'parent', 'path': str(parent_file)}])
+
+            def adapter():
+                value = object.__new__(CodexRuntimeAdapter)
+                value.context = context; value.task_store_root = state_root; value.proxy = proxy
+                return value
+
+            first = adapter()
+            self.assertEqual(list(first.sessions(parent)), [])  # Bind at parent-file EOF.
+            with parent_file.open('a') as out:
+                for index in range(129):
+                    out.write(json.dumps(event(child=f'child-{index}', turn=f'turn-{index}',
+                                               item=f'item-{index}')) + '\n')
+            for index in range(129):
+                proxy.rows[f'child-{index}'] = {
+                    'id': f'child-{index}', 'cwd': '/work',
+                    'status': {'type': 'active', 'activeFlags': []}}
+
+            self.assertEqual(len(list(first.sessions(parent))), 128)
+            store = StateStore(state_root, context.key()[:32])
+            first_state = store.task_discovery()
+            self.assertEqual(len(first_state['pending']), 128)
+            self.assertEqual(first_state['cursor']['offset'], parent_file.stat().st_size)
+            self.assertEqual(len({item['item_id'] for item in first_state['pending']}), 128)
+            self.assertEqual(first_state['outcomes'][-1]['child_id'], 'bounded-overflow')
+            from harness_herdr_hooks.cli import _runtime_status
+            task = _runtime_status(state_root, str(profile))['task_discovery']
+            self.assertEqual(task['reason'], 'pending_limit')
+            self.assertEqual(task['current_health'],
+                             {'state': 'deferred', 'reason': 'pending_limit'})
+            self.assertNotIn('content', json.dumps(task))
+
+            restarted = adapter()
+            self.assertEqual(len(list(restarted.sessions(parent))), 128)
+            second_state = store.task_discovery()
+            self.assertEqual(len(second_state['pending']), 128)
+            self.assertEqual({item['item_id'] for item in second_state['pending']},
+                             {f'item-{index}' for index in range(128)})
+            self.assertEqual(second_state['cursor'], first_state['cursor'])
+
+            # Drain the deferred batch, then prove a later append is read and
+            # verified through the same adapter path.
+            for candidate in list(second_state['pending']):
+                store.update_task_candidate(candidate['event_key'], status='rejected', now=10)
+            proxy.rows['later-child'] = {
+                'id': 'later-child', 'cwd': '/work',
+                'status': {'type': 'active', 'activeFlags': []}}
+            with parent_file.open('a') as out:
+                out.write(json.dumps(event(child='later-child', turn='later-turn',
+                                           item='later-item')) + '\n')
+            later_sessions = list(restarted.sessions(parent))
+            self.assertEqual(len(later_sessions), 1)
+            self.assertEqual(later_sessions[0].context.session_id, 'later-child')
+            self.assertEqual(later_sessions[0].lifecycle, Lifecycle.RUNNING)
+            final_state = store.task_discovery()
+            self.assertEqual([item['item_id'] for item in final_state['pending']], ['later-item'])
+            self.assertGreater(final_state['cursor']['offset'], second_state['cursor']['offset'])
+
     def _attached_replay_fixture(self, root, creation_cwd=None):
         root = Path(root); profile = root / 'profile'; sessions = profile / 'sessions'
         sessions.mkdir(parents=True); parent_file = sessions / 'parent.jsonl'
