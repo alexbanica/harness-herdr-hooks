@@ -1,14 +1,90 @@
 import tempfile
 import unittest
+import multiprocessing
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from harness_herdr_hooks.coordinator import Coordinator, run_observer
+from harness_herdr_hooks.coordinator import Coordinator, NativeRuntime, run_observer
 from harness_herdr_hooks import cli
 from harness_herdr_hooks.model import (
     Context, Decision, Harness, Lifecycle, Outcome, ParentBinding, Session,
 )
-from harness_herdr_hooks.state import StateStore
+from harness_herdr_hooks.state import StateStore, save_binding
+from harness_herdr_hooks.model import parent_to_dict, session_to_dict
+
+
+def _real_close_chain(root):
+    """Child-process target: exercise NativeRuntime.close_owned_pane end to end."""
+    parent, context = fixtures()
+    store = StateStore(Path(root), "real-close")
+    store.establish_baseline(set())
+    proxy = FakeProxy()
+    provider = FakeProvider(proxy)
+    runtime = FakeRuntime(provider)
+    coordinator = Coordinator(store, runtime)
+    child = Session(context, "parent", "child", Path("/tmp"), Lifecycle.RUNNING,
+                    True, 1.0, ("parent",), None, "subagent", "t1", "t1")
+    proxy.turns = [{"id": "t1", "status": "inProgress", "itemsView": "notLoaded", "items": []}]
+    coordinator.handle(parent, child)
+    binding = runtime.attached[0][1]
+    save_binding(Path(root), binding, {"parent": parent_to_dict(parent),
+        "child": session_to_dict(child), "pane_id": "p1", "backend_pid": None,
+        "server_socket": "/tmp/codex.sock", "entrypoint": "/bin/true",
+        "shell_pid": None, "ownership": "created", "kind": "subagent",
+        "generation": "t1", "turn_id": "t1"})
+    class Herdr:
+        socket_path = Path("/tmp/codex.sock")
+        closed = False
+        def process_info(self, _pane):
+            return {"foreground_processes": [{"pid": 42, "name": "codex", "cwd": "/tmp"}]}
+        def snapshot(self):
+            return {"panes": [{"pane_id": "p1", "workspace_id": "w1", "tab_id": "w1:t1", "agent_session": {}}]}
+        def close(self, _pane): self.closed = True
+    herdr = Herdr()
+    native = NativeRuntime(store, provider, herdr, Path("/bin/true"), state_root=Path(root))
+    native.verify_parent = lambda _parent: True
+    native.owned_pane_state = lambda *_args: "live"
+    native._process_matches = lambda *_args: True
+    with patch("harness_herdr_hooks.coordinator.matches_agent_session_ref", return_value=True), \
+         patch("harness_herdr_hooks.herdr._codex_proc_proof",
+               return_value=SimpleNamespace(pid=42, start_ticks=99, uid=1000,
+                                            executable=Path("/usr/bin/codex"), cwd=Path("/tmp"))):
+        coordinator.runtime = native
+        provider.status = {"type": "idle"}
+        proxy.turns = [{"id": "t1", "status": "completed", "itemsView": "notLoaded", "items": []}]
+        coordinator.handle(parent, Session(context, "parent", "child", Path("/tmp"),
+            Lifecycle.FINISHED, False, 1.0, ("parent",), None, "subagent", "t1", "t1"))
+    if not herdr.closed:
+        raise AssertionError("real NativeRuntime close path did not close pane")
+
+
+def _advance_generation_during_close(root):
+    parent, context = fixtures()
+    store = StateStore(Path(root), "stale-generation")
+    store.establish_baseline(set())
+    proxy = FakeProxy()
+    provider = FakeProvider(proxy)
+    runtime = FakeRuntime(provider)
+    coordinator = Coordinator(store, runtime)
+    child = Session(context, "parent", "child", Path("/tmp"), Lifecycle.RUNNING,
+                    True, 1.0, ("parent",), None, "subagent", "t1", "t1")
+    proxy.turns = [{"id": "t1", "status": "inProgress", "itemsView": "notLoaded", "items": []}]
+    coordinator.handle(parent, child)
+    key = context.key()
+    original_close = runtime.close_owned_pane
+    def advance(*args):
+        store.generation(key)
+        store.begin_generation(key, "t2", turn_id="t2")
+        return original_close(*args)
+    runtime.close_owned_pane = advance
+    provider.status = {"type": "idle"}
+    proxy.turns = [{"id": "t1", "status": "completed", "itemsView": "notLoaded", "items": []}]
+    coordinator.handle(parent, Session(context, "parent", "child", Path("/tmp"),
+        Lifecycle.FINISHED, False, 1.0, ("parent",), None, "subagent", "t1", "t1"))
+    record = store.record(key)
+    if record.get("generation") != "t2" or record.get("cleanup", {}).get("outcome") == "closed":
+        raise AssertionError("stale terminal cleanup overwrote new generation")
 
 
 class FakeProxy:
@@ -116,6 +192,19 @@ class CompletionTests(unittest.TestCase):
         self.assertEqual(record["cleanup"], {"outcome": "closed", "generation": "t1"})
         self.assertTrue(all(p["itemsView"] == "notLoaded" for p in self.proxy.items_requested))
 
+    def test_real_native_close_chain_completes_without_state_lock_deadlock(self):
+        # A subprocess watchdog turns the former flock self-deadlock into a
+        # bounded failure instead of hanging the entire suite.
+        ctx = multiprocessing.get_context("fork")
+        process = ctx.Process(target=_real_close_chain, args=(self.tmp.name,))
+        process.start()
+        process.join(4)
+        if process.is_alive():
+            process.terminate()
+            process.join(2)
+            self.fail("NativeRuntime.close_owned_pane deadlocked reentering StateStore.generation")
+        self.assertEqual(process.exitcode, 0)
+
     def test_successful_close_is_monotonic_across_repeated_terminal_polls(self):
         self.proxy.turns = [self.turn("t1", "inProgress")]
         self.coordinator.handle(self.parent, self.child("t1"))
@@ -128,6 +217,37 @@ class CompletionTests(unittest.TestCase):
         self.assertEqual(len(self.runtime.closed), 1)
         self.assertEqual(self.store.record(self.context.key())["cleanup"],
                          {"outcome": "closed", "generation": "t1"})
+
+    def test_resumed_generation_closes_and_remains_monotonic(self):
+        self.proxy.turns = [self.turn("t1", "inProgress")]
+        self.coordinator.handle(self.parent, self.child("t1"))
+        self.proxy.turns = [self.turn("t1", "completed")]
+        self.provider.status = {"type": "idle"}
+        self.coordinator.handle(self.parent, self.child("t1", Lifecycle.FINISHED))
+        self.assertTrue(self.store.begin_generation(self.context.key(), "t2", turn_id="t2"))
+        self.proxy.turns = [self.turn("t2", "inProgress")]
+        self.coordinator.handle(self.parent, self.child("t2"))
+        self.proxy.turns = [self.turn("t2", "completed")]
+        resumed = self.child("t2", Lifecycle.FINISHED)
+        self.coordinator.handle(self.parent, resumed)
+        self.assertEqual(self.store.record(self.context.key())["cleanup"],
+                         {"outcome": "closed", "generation": "t2"})
+        close_count = len(self.runtime.closed)
+        self.coordinator.handle(self.parent, resumed)
+        self.assertEqual(len(self.runtime.closed), close_count)
+        self.assertEqual(close_count, 2)
+
+    def test_terminal_close_runs_without_state_lock_and_preserves_new_generation(self):
+        # Keep the lock-reentry regression bounded even against old code.
+        ctx = multiprocessing.get_context("fork")
+        process = ctx.Process(target=_advance_generation_during_close, args=(self.tmp.name,))
+        process.start()
+        process.join(4)
+        if process.is_alive():
+            process.terminate()
+            process.join(2)
+            self.fail("terminal close held state lock during generation change")
+        self.assertEqual(process.exitcode, 0)
 
     def test_unverified_terminal_cleanup_is_recorded(self):
         self.proxy.turns = [self.turn("t1", "inProgress")]

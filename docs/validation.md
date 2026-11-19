@@ -6,12 +6,12 @@ native acceptance. Passing the former does not establish full support.
 
 | Area | Evidence obtained | Qualification limit |
 | --- | --- | --- |
-| Source/static | All 101 tests passed independently and on Python 3.11 and 3.12; Python compile, `sh -n`, Codex JSON, native Node plugin syntax, and diff checks passed. Controlled coverage includes version guard, stale generations, observer health/cleanup outcomes, Herdr schema without argv, Python 3.13, expiry/state roots, config absence/symlink identity, and Codex lifecycle/config/launch behavior. | Static/controlled checks do not prove native attachment, cleanup, or launch routing. |
-| Operator install | Isolated native `features list`, shim `--version`, install/reinstall/uninstall passed. Install/config transaction and ownership checks are included in the 101-test suite. | Isolated profiles are not user-profile reload or native trust evidence. |
+| Source/static | All 104 standard-library tests passed on Python 3.11 and 3.12; independent QA also passed all 104 on Python 3.12.3. Python compilation and diff checks passed. Controlled coverage includes version guard, stale generations, observer health/cleanup outcomes, Herdr schema without argv, Python 3.13, expiry/state roots, config absence/symlink identity, Codex lifecycle/config/launch behavior, and cleanup-lock watchdog regressions. | Static/controlled checks do not prove native attachment, cleanup, or launch routing. |
+| Operator install | Isolated native `features list`, shim `--version`, install/reinstall/uninstall passed. Install/config transaction and ownership checks are included in the 104-test suite. | Isolated profiles are not user-profile reload or native trust evidence. |
 | Herdr API and controlled lifecycle fixtures | The isolated Herdr 0.9.5 server returned protocol-22 snapshots and process metadata; a sole foreground Bash PID passed the shell-readiness check. Separate controlled fixtures covered parent/title/fallback handling, sanitization, revocation, startup baselines, pending creation, and pane retention/cleanup. | The lifecycle fixtures used controlled Herdr metadata. They do not establish native child placement, concurrency, manual-close, profile/server races, or platform acceptance. |
 | OpenCode native API | Isolated OpenCode 1.19.5 loopback API check created a synthetic parent/child metadata relation without prompts. Provider ancestor normalization and idle-skip behavior passed against a controlled Herdr stub. | No authorized real native child, added-turn comparison, complete profile/backend matrix, or full concurrency evidence. Fixture API evidence is not native child-attachment acceptance. |
-| Codex native API | Read-only Codex CLI/app-server 0.170.0 and Herdr 0.9.5/protocol 22 checks loaded the existing parent, selected profile, and metadata API without a prompt or model turn. Isolated native features query and adapter shim checks passed. | These checks do not establish the changed active profile loaded the new adapter/hooks, trust, or native child/ordinary-launch behavior. |
-| Native pane observation | Parent PATH did not begin with the new adapter. After isolating QA children, no new Herdr pane appeared; pre-existing tab panes were unchanged. | Parent session has not loaded the selected-profile change. No display, cleanup, or shell launch acceptance is claimed. |
+| Codex native API | Read-only Codex CLI/app-server 0.170.0 and Herdr 0.9.5/protocol 22 checks loaded the existing parent, selected profile, and metadata API without a prompt or model turn. Isolated native features query and adapter shim checks passed. The user reports all hooks active and trusted; current profile runtime observation reports `native_hook_loading`. | These checks do not establish native child attachment or ordinary-launch behavior. The current tool-request thread (`01a1f354`) differs from the actual Herdr pane thread (`01a1f3f9`); the read-only router check returned `Codex hook root does not match pane thread`. |
+| Native pane observation | Three created bindings recorded failed attachment attempts with no wrapper outcome. Their panes were closed, so the attachment error is unavailable. The current read-only router check reported a thread/root mismatch. | Do not infer that hooks are unloaded or untrusted. Native attachment, cleanup, and routing acceptance remain unverified. The active helper/backend was not restarted; no trust bypass or pane mutation was performed. |
 | Credentials/accounts | The OpenCode fixture had no model configured. The isolated Codex account query, without token refresh, returned no account and required OpenAI authentication. | No real credentials were copied or used. User-authorized native child creation/attachment and provider acceptance remain outstanding. |
 
 The operator results above came from isolated private profiles. This
@@ -57,3 +57,24 @@ and state roots, and config absence/symlink identity. Review also corrected
 the interpretation of `stop_hook_active`: [version-matched Codex hook source](https://github.com/openai/codex/blob/rust-v0.170.0/codex-rs/core/src/hook_runtime.rs)
 shows it indicates re-entry after a same-turn continuation, so it is not
 evidence that the current stop request is terminal.
+
+
+## HHH-002 cleanup-lock correction evidence
+
+The reviewed cleanup path previously held `StateStore.locked` while calling
+`NativeRuntime.close_owned_pane`; the real runtime re-entered store generation
+lookup and flock, causing a permanent deadlock. Cleanup now snapshots state under
+the lock, performs native checks and pane closure after releasing it, then uses a
+guarded persistence step. A real `NativeRuntime` plus real `StateStore` watchdog
+regression and a state-advanced-during-close watchdog regression each failed on
+the baseline within 4.007 and 4.010 seconds, respectively, and pass with the
+correction. Independent review findings concerning the prior-generation closed
+cleanup guard and an unbounded second watchdog test were corrected; resumed
+generation completion and repeated-poll coverage were added. These source tests
+verify the bounded regression cases, not native attachment or live cleanup.
+
+The source correction does not establish that it caused the earlier recorded
+attachment attempts to fail. The wrapper outcome and pane error were unavailable,
+and native attachment/cleanup/routing acceptance remains unverified. The PR
+metadata is user-marked ready for review; the internal validation status above
+remains DRAFT with Definition of Done unmet.

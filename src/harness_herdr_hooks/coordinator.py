@@ -63,6 +63,8 @@ class Coordinator:
             if terminal_status:
                 self.store.mark_generation_terminal(key, generation, child.turn_id or generation,
                                                     terminal_status)
+        if lifecycle == Lifecycle.FINISHED or terminal_status:
+            return self._handle_terminal(parent, child, key, generation, terminal_status)
         with self.store.locked() as state:
             if not state.get("baseline_ready"):
                 return Outcome(Decision.SKIP, "initial baseline is not established")
@@ -81,36 +83,6 @@ class Coordinator:
             if key in state.get("baseline", ()):
                 return Outcome(Decision.SKIP, "pre-existing session")
             if rec.get("status") == "suppressed": return Outcome(Decision.SKIP, "pane was manually closed")
-            if lifecycle == Lifecycle.FINISHED or terminal_status:
-                binding_id = rec.get("binding_id")
-                cleanup = rec.get("cleanup")
-                if (isinstance(cleanup, dict) and cleanup.get("outcome") == "closed"
-                        and cleanup.get("generation") == generation):
-                    return Outcome(Decision.SKIP, "confirmed task completed; owned pane already closed", binding_id)
-                if binding_id and terminal_status and child.kind == "subagent":
-                    try:
-                        pane_state = self.runtime.owned_pane_state(parent, child, binding_id)
-                    except Exception:
-                        pane_state = "unknown"
-                    if pane_state == "closed":
-                        rec.update(cleanup={"outcome": "manual-close", "generation": generation})
-                        state["records"][key] = rec
-                        return Outcome(Decision.SKIP, "pane was manually closed", binding_id)
-                    close = getattr(self.runtime, "close_owned_pane", None)
-                    process_pin = rec.get("process_pin")
-                    if (callable(close) and (child.context.harness.value != "codex" or process_pin)
-                            and close(parent, child, binding_id, generation, terminal_status,
-                                      process_pin)):
-                        rec.update(status="finished", terminal_status=terminal_status,
-                                   cleanup={"outcome": "closed", "generation": generation})
-                        state["records"][key] = rec
-                        return Outcome(Decision.SKIP, "confirmed task completed; owned pane closed", binding_id)
-                    outcome = "reused" if rec.get("ownership") == "reused" else "retained-unverified"
-                else:
-                    outcome = "retained-unverified"
-                rec.update(cleanup={"outcome": outcome, "generation": generation})
-                state["records"][key] = rec
-                return Outcome(Decision.SKIP, "task terminal or state unknown; pane retained", binding_id)
             if rec.get("status") == "attached":
                 pane_state = self.runtime.owned_pane_state(parent, child, rec["binding_id"])
                 if pane_state == "closed":
@@ -182,6 +154,73 @@ class Coordinator:
             state["records"][key] = rec
         return Outcome(Decision.FAILED if next_attempt >= MAX_RETRIES else Decision.WAIT,
                        "attach failed", binding, next_attempt)
+
+    def _handle_terminal(self, parent: ParentBinding, child: Session, key: str,
+                         generation: str, terminal_status: str | None) -> Outcome:
+        """Snapshot under lock, perform provider/Herdr checks unlocked, then persist safely."""
+        with self.store.locked() as state:
+            if not state.get("baseline_ready"):
+                return Outcome(Decision.SKIP, "initial baseline is not established")
+            records = state["records"]
+            pending = set(state.get("pending_created", ()))
+            rec = records.get(key, {})
+            if key in pending:
+                pending.remove(key)
+                state["pending_created"] = sorted(pending)
+                if not rec:
+                    rec = {"status": "pending", "attempts": 0}
+                    records[key] = rec
+            if key in state.get("baseline", ()):
+                return Outcome(Decision.SKIP, "pre-existing session")
+            if rec.get("status") == "suppressed":
+                return Outcome(Decision.SKIP, "pane was manually closed")
+            binding_id = rec.get("binding_id")
+            cleanup = rec.get("cleanup")
+            if (isinstance(cleanup, dict) and cleanup.get("outcome") == "closed"
+                    and cleanup.get("generation") == generation):
+                return Outcome(Decision.SKIP, "confirmed task completed; owned pane already closed", binding_id)
+            snapshot = dict(rec)
+        # All native/provider/Herdr calls run without state.lock. In particular,
+        # NativeRuntime.close_owned_pane rechecks persisted generation metadata.
+        outcome = "retained-unverified"
+        pane_state = "unknown"
+        if binding_id and terminal_status and child.kind == "subagent":
+            try:
+                pane_state = self.runtime.owned_pane_state(parent, child, binding_id)
+            except Exception:
+                pane_state = "unknown"
+            if pane_state == "closed":
+                outcome = "manual-close"
+            else:
+                close = getattr(self.runtime, "close_owned_pane", None)
+                process_pin = snapshot.get("process_pin")
+                if (callable(close) and (child.context.harness.value != "codex" or process_pin)
+                        and close(parent, child, binding_id, generation, terminal_status, process_pin)):
+                    outcome = "closed"
+                elif snapshot.get("ownership") == "reused":
+                    outcome = "reused"
+        with self.store.locked() as state:
+            rec = state["records"].get(key, {})
+            # Do not let a slow close/check overwrite manual suppression or a
+            # newer generation/binding installed while the lock was released.
+            identity_fields = ("generation", "turn_id", "binding_id", "kind",
+                               "ownership", "process_pin")
+            if (any(rec.get(field) != snapshot.get(field) for field in identity_fields) or
+                    rec.get("status") == "suppressed" or
+                    (isinstance(rec.get("cleanup"), dict) and
+                     rec["cleanup"] != snapshot.get("cleanup") and
+                     rec["cleanup"].get("outcome") == "closed" and
+                     rec["cleanup"].get("generation") == rec.get("generation"))):
+                return Outcome(Decision.SKIP, "task state changed during terminal cleanup", binding_id)
+            if outcome == "closed":
+                rec.update(status="finished", terminal_status=terminal_status,
+                           cleanup={"outcome": "closed", "generation": generation})
+                reason = "confirmed task completed; owned pane closed"
+            else:
+                rec.update(cleanup={"outcome": outcome, "generation": generation})
+                reason = "pane was manually closed" if outcome == "manual-close" else "task terminal or state unknown; pane retained"
+            state["records"][key] = rec
+        return Outcome(Decision.SKIP, reason, binding_id)
 
     def _retry(self, key: str, binding: str, attempts: int) -> None:
         with self.store.locked() as state:
