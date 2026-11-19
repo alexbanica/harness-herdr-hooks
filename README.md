@@ -1,21 +1,24 @@
 # Harness Herdr Hooks
 
 Harness Herdr Hooks observes new Codex and OpenCode sessions created from a
-verified parent session in a Herdr pane. When a running child can be attached
-through its existing native backend, it opens that same session in an unfocused
-pane in the parent's Herdr tab. It never sends a prompt or starts replacement
-work for that attached child. A supported ordinary interactive Codex command
-is routed with its requested prompt once and leaves a usable shell after the
-client exits. Session titles flow one way to Herdr pane names. Finished or
+verified parent session in a Herdr pane. For qualified Codex app/TUI local
+rollouts, it also recognizes a successful `codex_tui.create_thread` result
+from that exact parent and verifies the returned task independently. When a
+running task can be attached through its existing native backend, it opens
+that same session in an unfocused pane in the parent's Herdr tab. It never
+sends a prompt or starts replacement work for that attached task. A supported
+ordinary interactive Codex command is routed with its requested prompt once and
+leaves a usable shell after the client exits. Session titles flow one way to Herdr pane names. Finished or
 unverified children are skipped; activity outside Herdr is a silent no-op.
 
 **Status: DRAFT / experimental.** Source and isolated operator/API checks pass
 for the behaviors listed in [validation](docs/validation.md), but complete
-native acceptance is blocked. Native Codex hook loading and trust have not
-been demonstrated in a user-owned parent session, so child display/cleanup and
-ordinary interactive launch routing remain unqualified. Complete profile/backend and race coverage and
-macOS runtime evidence also remain outstanding. This project does not claim
-complete support or Definition of Done.
+native acceptance is blocked. Standalone task discovery depends on a
+version-qualified local rollout record format; live automatic capture and
+attachment have not been demonstrated in a correctly bound user-owned parent.
+Other native Codex hook trust/reload, profile/backend and race coverage, and
+macOS runtime evidence remain outstanding. This project does not claim complete
+support or Definition of Done.
 
 ## Quick start
 
@@ -53,13 +56,13 @@ bypass trust, or change daemon settings. See [Codex setup](docs/install-codex.md
 
 ## Example
 
-From a qualified Codex or OpenCode session already running in a Herdr pane, ask
-the native agent to spawn a child using its normal task or subagent feature. A
-new, verified, still-running and attachable child is shown in another pane in
-that same Herdr tab; it does not receive a new prompt. Its pane label follows
-the child title when available. Exact existing-session attach command forms are
-documented as reference only; they have not been accepted as end-to-end native
-child evidence. See [validation](docs/validation.md).
+From a qualified Codex or OpenCode session already running in a Herdr pane, use
+the native child feature. Codex standalone discovery applies specifically when
+the app's `codex_tui.create_thread` tool returns successfully and its typed
+completion is recorded in the verified parent rollout. A new, independently
+verified, running and attachable task can appear in another pane in that same
+Herdr tab, without a repeated prompt. This live capture path remains unqualified;
+see [validation](docs/validation.md) and [contracts](docs/contracts.md).
 
 ## Local state and ownership
 

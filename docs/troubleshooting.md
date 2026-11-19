@@ -71,3 +71,26 @@ completion cleanup, client exit to a usable shell, or active-profile loading of
 the current source revision. No automatic daemon restart or trust bypass is
 supported. OpenCode native qualification and the predecessor macOS gap remain
 separate.
+
+## Standalone task discovery
+
+For a missing standalone task pane, inspect `status` fields independently:
+recognition, verification, attachment, and `current_health`. Health describes
+the latest observer pass; a later healthy pass does not erase an earlier
+recognition or attachment outcome. Bounded reasons include `parent_file_missing`
+or `parent_file_mismatch` (the exact parent rollout cannot be bound),
+`unsafe_parent_file`, `unsupported_envelope` / `unsupported_record_format`,
+`metadata_unavailable` / `status_deferred`, `task_mismatch`,
+`invalid_cwd` / `cwd_mismatch`, `candidate_expired`, `retry_exhausted`, and
+`attachment_pending`. These diagnostics do not include prompt or transcript
+content. Only successful typed `codex_tui.create_thread` completion records
+from the verified parent qualify; `PostToolUse`, `exec` text, native delegation
+ancestry, titles and timestamps are not substitutes. No historical task
+backfill occurs.
+
+Live qualification requires the actual Herdr-bound parent pane/session to
+match the invoking Codex parent and its native rollout file. A different
+Codex session ID is an identity mismatch; do not compensate with a different
+profile, task, or pane or restart the shared daemon. Keep any retained
+installation source in place until an explicitly authorized replacement is
+installed and verified. See [validation](validation.md).

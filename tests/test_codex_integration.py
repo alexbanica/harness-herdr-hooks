@@ -74,7 +74,7 @@ class NativeHookBootstrapTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _run_parent_event(self, ref):
+    def _run_parent_event(self, ref, *, event=None, rows=None):
         from harness_herdr_hooks.cli import _parent_from_event
 
         class Provider(FakeProvider):
@@ -83,16 +83,16 @@ class NativeHookBootstrapTests(unittest.TestCase):
                 provider_self.closed = True
             _verified_chain = staticmethod(CodexRuntimeAdapter._verified_chain)
 
-        provider = Provider(self.rows)
+        provider = Provider(self.rows if rows is None else rows)
         pane = {"pane_id": "pane-root", "tab_id": "tab-root", "workspace_id": "workspace-root",
                 "agent_session": ref, "cwd": str(self.root)}
         client = Mock()
         client.snapshot.return_value = {"panes": [pane]}
         client.server_identity.return_value = "server-root"
         client.process_info.return_value = {"foreground_processes": [{"pid": 71, "name": "codex"}]}
-        event = {"hook_event_name": "SubagentStart", "session_id": "child-thread",
-                 "agent_id": "child-thread", "agent_type": "explorer", "turn_id": "turn-1",
-                 "cwd": str(self.root), "transcript_path": None, "extra_native_field": "ignored"}
+        event = event or {"hook_event_name": "SubagentStart", "session_id": "child-thread",
+                          "agent_id": "child-thread", "agent_type": "explorer", "turn_id": "turn-1",
+                          "cwd": str(self.root), "transcript_path": None, "extra_native_field": "ignored"}
         proof = {"socket_target": "/tmp/codex.sock", "socket_identity": [1, 2, 3],
                  "executable": "/usr/bin/codex", "pid": 71, "uid": os.getuid(), "start_ticks": 2}
         with patch.dict(os.environ, self.env, clear=False), \
@@ -111,13 +111,44 @@ class NativeHookBootstrapTests(unittest.TestCase):
                 parent, pid, cwd, created = result
                 self.assertEqual(parent.context.session_id, "root-thread")
                 self.assertEqual(parent.context.backend_id, "/tmp/codex.sock")
-                self.assertEqual(parent.session_path, Path("/runs/root.jsonl") if ref["kind"] == "path" else None)
+                self.assertEqual(parent.session_path, Path("/runs/root.jsonl"))
                 self.assertIsNone(pid)
                 self.assertEqual(cwd, self.root)
                 self.assertEqual(created.identity.session_id, "child-thread")
                 self.assertNotEqual(created.identity.session_id, parent.context.session_id)
                 self.assertTrue(provider.closed)
                 self.assertEqual(client.verify_parent.call_count, 1)
+
+    def test_session_start_crosschecks_supplied_transcript_with_native_root_path(self):
+        base_event = {"hook_event_name": "SessionStart", "session_id": "root-thread",
+                      "cwd": str(self.root)}
+        cases = (
+            ("matching", "/runs/root.jsonl", self.rows, True),
+            ("mismatch", "/runs/other.jsonl", self.rows, False),
+            ("relative", "runs/root.jsonl", self.rows, False),
+            ("missing-native-path", "/runs/root.jsonl", [{"id": "root-thread"}, self.rows[1]], False),
+            ("null-hook-path", None, [{"id": "root-thread"}, self.rows[1]], True),
+        )
+        for label, hook_path, rows, succeeds in cases:
+            with self.subTest(label=label):
+                event = {**base_event, "transcript_path": hook_path}
+                if succeeds:
+                    parent, _, _, _ = self._run_parent_event(
+                        {"kind": "id", "value": "root-thread"}, event=event, rows=rows)[0]
+                    self.assertEqual(parent.session_path, Path("/runs/root.jsonl") if label == "matching" else None)
+                else:
+                    with self.assertRaisesRegex(ValueError, "transcript path"):
+                        self._run_parent_event({"kind": "id", "value": "root-thread"}, event=event, rows=rows)
+
+    def test_subagent_transcript_path_remains_child_scoped(self):
+        event = {"hook_event_name": "SubagentStart", "session_id": "child-thread",
+                 "agent_id": "child-thread", "agent_type": "explorer", "turn_id": "turn-1",
+                 "cwd": str(self.root), "transcript_path": "/runs/child.jsonl"}
+        parent, _, _, created = self._run_parent_event(
+            {"kind": "id", "value": "root-thread"}, event=event)[0]
+        self.assertEqual(parent.context.session_id, "root-thread")
+        self.assertEqual(parent.session_path, Path("/runs/root.jsonl"))
+        self.assertEqual(created.identity.session_id, "child-thread")
 
     def test_missing_loaded_root_and_mismatched_child_ancestry_fail_before_parent_verification(self):
         from harness_herdr_hooks.cli import _parent_from_event

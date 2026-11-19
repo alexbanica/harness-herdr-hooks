@@ -68,6 +68,27 @@ class Session:
     kind: str = "subagent"
     turn_id: str | None = None
     generation: str | None = None
+    creation_proof: "CreationProof | None" = None
+
+
+@dataclass(frozen=True, slots=True)
+class CreationProof:
+    """Minimum ID-only evidence associating a standalone task with its parent."""
+    parent_id: str
+    turn_id: str
+    item_id: str
+    child_id: str
+    cwd_sha256: str | None = None
+
+    def __post_init__(self) -> None:
+        if any(not isinstance(x, str) or not x for x in
+               (self.parent_id, self.turn_id, self.item_id, self.child_id)):
+            raise ValueError("invalid creation proof identity")
+        if self.parent_id == self.child_id:
+            raise ValueError("creation proof child must differ from parent")
+        if self.cwd_sha256 is not None and (not isinstance(self.cwd_sha256, str) or
+                len(self.cwd_sha256) != 64 or any(c not in "0123456789abcdef" for c in self.cwd_sha256)):
+            raise ValueError("invalid creation cwd digest")
 
 
 class Decision(str, Enum):
@@ -143,28 +164,54 @@ def parent_from_dict(v: object) -> ParentBinding:
 
 
 def session_to_dict(s: Session) -> dict[str, object]:
-    return {"context": context_to_dict(s.context), "parent_session_id": s.parent_session_id,
+    result = {"context": context_to_dict(s.context), "parent_session_id": s.parent_session_id,
             "title": s.title, "cwd": str(s.cwd), "lifecycle": s.lifecycle.value,
             "attachable": s.attachable, "observed_at": s.observed_at, "ancestry": list(s.ancestry),
             "session_path": str(s.session_path.resolve(strict=False)) if s.session_path else None,
             "kind": s.kind, "turn_id": s.turn_id, "generation": s.generation}
+    if s.creation_proof is not None:
+        result["creation_proof"] = creation_proof_to_dict(s.creation_proof)
+    return result
 
 
 def session_from_dict(v: object) -> Session:
     old_keys = {"context", "parent_session_id", "title", "cwd", "lifecycle", "attachable", "observed_at", "ancestry"}
     path_keys = old_keys | {"session_path"}
     new_keys = path_keys | {"kind", "turn_id", "generation"}
-    if not isinstance(v, dict) or set(v) not in (old_keys, path_keys, new_keys): raise ValueError("serialized record has unknown or missing fields")
+    proof_keys = new_keys | {"creation_proof"}
+    if not isinstance(v, dict) or set(v) not in (old_keys, path_keys, new_keys, proof_keys): raise ValueError("serialized record has unknown or missing fields")
     d = v
     if not isinstance(d["cwd"], str) or not Path(d["cwd"]).is_absolute() or not isinstance(d["attachable"], bool) or not isinstance(d["observed_at"], (int, float)) or not isinstance(d["ancestry"], list) or not all(isinstance(x, str) for x in d["ancestry"]): raise ValueError("invalid serialized session")
     if d["parent_session_id"] is not None and not isinstance(d["parent_session_id"], str): raise ValueError("invalid parent session ID")
     if d["title"] is not None and not isinstance(d["title"], str): raise ValueError("invalid session title")
     kind = d.get("kind", "subagent")
-    if kind not in {"subagent", "independent"}: raise ValueError("invalid session kind")
+    if kind not in {"subagent", "independent", "standalone"}: raise ValueError("invalid session kind")
     if any(d.get(k) is not None and (not isinstance(d[k], str) or not d[k]) for k in ("turn_id", "generation")):
         raise ValueError("invalid session turn generation")
     path = _canonical_optional_path(d.get("session_path"))
-    return Session(context_from_dict(d["context"]), d["parent_session_id"], d["title"], Path(d["cwd"]), Lifecycle(d["lifecycle"]), d["attachable"], float(d["observed_at"]), tuple(d["ancestry"]), path, kind, d.get("turn_id"), d.get("generation"))
+    proof = creation_proof_from_dict(d["creation_proof"]) if "creation_proof" in d else None
+    context = context_from_dict(d["context"])
+    if kind == "standalone":
+        if proof is None or proof.child_id != context.session_id or proof.parent_id != d["parent_session_id"]:
+            raise ValueError("standalone session requires matching creation proof")
+    elif proof is not None:
+        raise ValueError("creation proof is only valid for standalone sessions")
+    return Session(context, d["parent_session_id"], d["title"], Path(d["cwd"]), Lifecycle(d["lifecycle"]), d["attachable"], float(d["observed_at"]), tuple(d["ancestry"]), path, kind, d.get("turn_id"), d.get("generation"), proof)
+
+
+def creation_proof_to_dict(p: CreationProof) -> dict[str, object]:
+    result = {"parent_id": p.parent_id, "turn_id": p.turn_id,
+              "item_id": p.item_id, "child_id": p.child_id}
+    if p.cwd_sha256 is not None:
+        result["cwd_sha256"] = p.cwd_sha256
+    return result
+
+
+def creation_proof_from_dict(v: object) -> CreationProof:
+    required = {"parent_id", "turn_id", "item_id", "child_id"}
+    if not isinstance(v, dict) or set(v) not in (required, required | {"cwd_sha256"}):
+        raise ValueError("invalid creation proof fields")
+    return CreationProof(v["parent_id"], v["turn_id"], v["item_id"], v["child_id"], v.get("cwd_sha256"))
 
 
 def _canonical_optional_path(value: object) -> Path | None:

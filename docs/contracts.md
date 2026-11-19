@@ -92,7 +92,10 @@ restart.
 The Codex adapter routes supported ordinary interactive `codex` shell commands
 through the profile-owned PATH prefix. It classifies commands before routing,
 starts a destination client once with a bounded private payload, and retains a
-usable shell after client exit. Informational/tooling commands, `exec`, resume,
+usable shell after client exit. Standalone attachment invokes its helper without
+a shell-level `exec`, so the original shell remains available; the helper still
+replaces itself with the native client using `os.execvpe`. The subagent wrapper
+behavior is unchanged. Informational/tooling commands, `exec`, resume,
 absolute paths, deliberate PATH bypasses, remote hosted backends, and
 `--no-daemon` sessions are outside this routing qualification. Terminal child
 cleanup correlates stop hints with turn ID/generation and metadata-only terminal
@@ -109,3 +112,51 @@ revision runtime loading. Native trust/reload, terminal pane closure, and full
 profile/backend/race coverage remain unverified; macOS runtime remains a
 separate predecessor gap. Do not infer support for an unobserved native path
 from these contracts.
+
+## Codex standalone creation events
+
+In addition to native subagent events, Codex observes only newly appended,
+typed local rollout records for a successful `codex_tui.create_thread`
+completion. The record must name the exact bound parent and include turn/item
+identities and one unambiguous returned child ID. The event is a candidate
+association, not ancestry proof: the exact task is re-read from the same
+verified profile/backend and must be positively running/attachable. Native task
+metadata supplies cwd for an ID-only result; an optional result cwd is retained
+only as a normalized-path SHA-256 and must match native metadata. Missing cwd,
+unknown status, or unavailable metadata defers or rejects attachment.
+
+The rollout file must be the owner-controlled regular file bound to the
+verified parent's native path under that profile's sessions directory. The
+reader does not backfill its initial boundary, follows only appended records,
+and correlates parent/turn/item IDs. It handles partial writes,
+replacement/truncation, restart, duplicates and concurrent observers. A private
+cursor and minimum ID-only associations/outcomes support recovery and
+deduplication; prompts, raw results, conversation text and partial bytes are
+not persisted. Limits are 1 MiB per read/record, 256 records per pass, JSON
+depth 12, 128 pending associations and 512 characters per ID. If a pass would
+exceed the pending limit, the cursor advances atomically with the bounded state:
+up to 128 associations are retained, excess candidates are skipped, and one
+ID-only aggregate rejected marker records the overflow for that read. Polling
+continues, and status health reports the bounded `pending_limit` reason. Metadata
+verification allows at most three attempts within a 30-second window; retry
+time is monotonic within a process and persisted timestamps are bounded on
+restart. Unsupported
+envelopes fail closed with a bounded status reason.
+
+This dependency is version-qualified to the observed Codex CLI 0.170.0 app/TUI
+rollout envelope and Herdr 0.9.5/protocol 22 on Linux/WSL. It is not a stable
+public Codex API guarantee. Native `PostToolUse` delivery for the app-owned tool
+is unverified and not used. No `exec` JavaScript parsing, `codexDelegation`
+inference, title/cwd/time parent inference, broad history scan, or arbitrary
+root-task discovery is supported. Standalone tasks are separate sessions, not
+native subagents; their panes remain after completion and client exit and are
+not closed by subagent cleanup.
+
+Status exposes recognition, verification, and attachment separately. Its
+`current_health` reflects the latest observer pass, while stage outcomes retain
+meaningful prior outcomes. Current health reports bounded reasons such as
+parent-file binding failure, unsupported record, metadata unavailability,
+invalid/mismatched cwd, expired candidate, or exhausted retry. Attachment stage
+reports pending, attached, deferred, rejected, or unknown as applicable; it is
+not a separate detailed failure-reason channel. Status does not expose prompt
+or transcript content.

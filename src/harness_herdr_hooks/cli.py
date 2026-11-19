@@ -63,7 +63,7 @@ def _runtime_write(root:Path,profile:str,mutate)->None:
         os.close(lockfd); raise ValueError("unsafe runtime state lock")
     fcntl.flock(lockfd,fcntl.LOCK_EX)
     try:
-        data=_runtime_read(path); data={k:v for k,v in data.items() if k in {"schema","updated","hook","observer"}}
+        data=_runtime_read(path); data={k:v for k,v in data.items() if k in {"schema","updated","hook","observer","task_discovery"}}
         data.setdefault("schema",1); mutate(data); data["updated"]=time.time()
         raw=json.dumps(data,sort_keys=True,separators=(",",":" )).encode()
         if len(raw)>_RUNTIME_MAX_BYTES: raise ValueError("runtime evidence exceeds bound")
@@ -88,8 +88,27 @@ def _record_hook(root:Path,parent:ParentBinding)->None:
 
 def _runtime_status(root:Path,profile:str)->dict:
     data=_runtime_read(_runtime_path(root,profile)); hook=data.get("hook",{})
+    task=data.get("task_discovery",{})
+    if not isinstance(task,dict): task={}
+    task_status={
+        "recognition":task.get("recognition") if task.get("recognition") in {"unknown","observing","recognized","deferred","rejected"} else "unknown",
+        "verification":task.get("verification") if task.get("verification") in {"unknown","pending","verified","deferred","rejected"} else "unknown",
+        "attachment":task.get("attachment") if task.get("attachment") in {"unknown","pending","attached","deferred","rejected"} else "unknown",
+    }
+    reasons={"parent_file_missing","parent_file_mismatch","unsafe_parent_file","metadata_unavailable",
+             "candidate_expired","future_timestamp","task_finished","task_mismatch","unsupported_envelope",
+             "unsupported_record_format","retry_exhausted","attachment_pending","invalid_cwd","cwd_mismatch",
+             "status_deferred","pending_limit"}
+    if task.get("reason") in reasons:
+        task_status["reason"]=task["reason"]
+    health=task.get("current_health")
+    if isinstance(health,dict) and health.get("state") in {"healthy","deferred"}:
+        current_health={"state":health["state"]}
+        if health.get("reason") in reasons: current_health["reason"]=health["reason"]
+        task_status["current_health"]=current_health
     result={"native_hook_loading":"observed" if hook.get("observed") is True else "unknown",
             "last_verified_binding":"unknown","observer":"unknown",
+            "task_discovery":task_status,
             "attachment":{"known":False,"observed_counts":{}},
             "cleanup":{"known":False,"outcomes":{}},"ownership":{"known":False,"counts":{}}}
     if hook.get("observed") is True:
@@ -446,6 +465,7 @@ def _parent_from_event(command:str, payload:bytes, client:HerdrClient):
         sock=Path(proof["socket_target"]); backend_instance="{}:{}:{}".format(*proof["socket_identity"][:3])
         event=parse_hook(payload,profile=str(codex_home),config_root=codex_home,data_root=codex_home,state_root=codex_home,
                          verified_backend_id=str(sock),verified_backend_instance=backend_instance)
+        hook_transcript_path=json.loads(payload).get("transcript_path")
         context=Context(Harness.CODEX,str(codex_home),codex_home,codex_home,codex_home,str(sock),event.identity.session_id,backend_instance)
         provider=CodexRuntimeAdapter(context,executable=str(_native_codex_executable(codex_home)))
         try:
@@ -464,7 +484,13 @@ def _parent_from_event(command:str, payload:bytes, client:HerdrClient):
                 chain=provider._verified_chain(event.identity.session_id,rows,root_id)
                 if chain is None: raise ValueError("Codex child source chain does not reach pane root")
             context=replace(context,session_id=root_id)
-            session_path=Path(provider._read_thread(root_id)["path"]).resolve(strict=False) if ref["kind"]=="path" else None
+            root_path=provider._read_thread(root_id).get("path")
+            if event.event_name=="SessionStart" and hook_transcript_path is not None:
+                if (not isinstance(root_path,str) or not Path(root_path).is_absolute()
+                        or not Path(hook_transcript_path).is_absolute()
+                        or Path(root_path).resolve(strict=False)!=Path(hook_transcript_path).resolve(strict=False)):
+                    raise ValueError("Codex hook transcript path does not match native pane root")
+            session_path=Path(root_path).resolve(strict=False) if isinstance(root_path,str) and Path(root_path).is_absolute() else None
         finally: provider.close()
         parent=ParentBinding(context,client.server_identity(),os.environ["HERDR_WORKSPACE_ID"],os.environ["HERDR_TAB_ID"],pane_id,
                              session_path=session_path,backend_proof=proof)
@@ -520,7 +546,7 @@ def _provider(parent:ParentBinding,pid:int|None,client:HerdrClient):
     if parent.context.harness==Harness.CODEX:
         proof=parent.backend_proof or {}; executable=proof.get("executable")
         if not isinstance(executable,str) or not Path(executable).is_absolute(): raise ValueError("recorded native Codex executable proof missing")
-        return CodexRuntimeAdapter(parent.context,executable=executable)
+        return CodexRuntimeAdapter(parent.context,executable=executable,task_store_root=_state_root())
     if pid is None: raise ValueError("OpenCode backend PID missing")
     return OpenCodeRuntimeAdapter(parent.context,pid,herdr_client=client)
 

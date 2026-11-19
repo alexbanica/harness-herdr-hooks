@@ -105,3 +105,18 @@ bin/harness-herdr-hooks uninstall codex --config-dir /path/to/codex-profile
 Uninstall removes only unchanged owned handlers, adapter files, and PATH edit.
 It preserves changed/conflicting entries and does not change other profiles,
 terminate agents, or close panes.
+
+## Standalone task discovery
+
+The qualified capture input is the local Codex app/TUI rollout record for a
+successful `codex_tui.create_thread` completion. Recognition requires the exact
+typed `event_msg` / `item_completed` association and a returned child ID; the
+verified parent pins the backend authority; independently verified native
+task metadata supplies the task cwd. This is not
+`PostToolUse` delivery, parsed `exec` JavaScript, or native Codex delegation
+ancestry. A standalone task remains a separate session, and its pane is retained
+after completion or client exit. No prompt is added. See
+[contracts](contracts.md) for bounds and exclusions.
+
+Task status retains meaningful recognition, verification and attachment outcomes
+separately from `current_health`; see [contracts](contracts.md).
