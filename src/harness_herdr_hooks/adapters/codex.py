@@ -878,6 +878,56 @@ class CodexRuntimeAdapter:
             raise RuntimeError("invalid Codex thread/read response")
         return thread
 
+    def main_metadata(self, parent: ParentBinding) -> tuple[Context, str | None]:
+        """Resolve the provider-native main conversation and its current title.
+
+        A Codex parent link is ancestry only when the child is independently
+        marked as a native subagent. This deliberately stops at standalone or
+        other independent conversations even when they carry parent metadata.
+        """
+        self._check_parent(parent)
+        current_id = parent.context.session_id
+        seen: set[str] = set()
+        for depth in range(33):
+            if current_id in seen:
+                raise ValueError("Codex conversation ancestry contains a cycle")
+            seen.add(current_id)
+            row = self._read_thread(current_id)
+            if row.get("id") != current_id:
+                raise ValueError("Codex returned a different conversation")
+            parent_id = row.get("parentThreadId")
+            source = row.get("source")
+            subagent = source.get("subAgent") if isinstance(source, dict) else None
+            if parent_id is not None and not (
+                    isinstance(source, str) and source in {"cli", "exec"}):
+                if not isinstance(source, dict) or "subAgent" not in source:
+                    raise ValueError("Codex conversation source classification is unknown or malformed")
+            if isinstance(source, dict) and "subAgent" in source:
+                if (set(source) != {"subAgent"} or not isinstance(subagent, dict)
+                        or set(subagent) != {"thread_spawn"}):
+                    raise ValueError("Codex native subagent classification is malformed")
+            spawn_marker = isinstance(subagent, dict) and "thread_spawn" in subagent
+            if spawn_marker:
+                spawn = subagent.get("thread_spawn")
+                if (not isinstance(spawn, dict)
+                        or not isinstance(spawn.get("parent_thread_id"), str)
+                        or not spawn.get("parent_thread_id")
+                        or not isinstance(parent_id, str)
+                        or spawn["parent_thread_id"] != parent_id):
+                    raise ValueError("Codex native subagent ancestry is malformed")
+            if parent_id is not None and not isinstance(parent_id, str):
+                raise ValueError("Codex conversation ancestry is malformed")
+            if not parent_id or not self._is_native_child(row, parent_id):
+                title = row.get("name")
+                return (Context(Harness.CODEX, self.context.profile, self.context.config_root,
+                                self.context.data_root, self.context.state_root,
+                                self.context.backend_id, current_id, self.context.backend_instance),
+                        title.strip() or None if isinstance(title, str) else None)
+            if depth == 32:
+                raise ValueError("Codex conversation ancestry exceeds 32 hops")
+            current_id = parent_id
+        raise ValueError("Codex conversation ancestry is invalid")
+
     def can_attach_now(self, parent: ParentBinding, child: Session) -> bool:
         self._check_parent(parent)
         if child.kind == "standalone":

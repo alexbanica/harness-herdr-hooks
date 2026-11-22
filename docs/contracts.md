@@ -160,3 +160,45 @@ invalid/mismatched cwd, expired candidate, or exhausted retry. Attachment stage
 reports pending, attached, deferred, rejected, or unknown as applicable; it is
 not a separate detailed failure-reason channel. Status does not expose prompt
 or transcript content.
+
+## HHH-005 subagent-tab contract
+
+For a verified main-session root, the first newly eligible running, attachable
+native subagent lazily creates one unfocused managed tab in that root's verified
+Herdr server/workspace. Later siblings and verified nested subagents share it;
+independent main sessions have separate associations. Each child attaches once
+with its own native identity and cwd. Existing panes are not migrated, and
+legacy same-tab bindings retain their prior lifecycle.
+
+The tab label is `Subagents: <main title> [short main ID]`. Until a title is
+available, the harness name is used. The displayed ID begins with eight
+characters and expands as needed to distinguish managed labels. Control
+characters are removed and the title portion is bounded; the full verified
+identity, not the label, controls ownership. Main title changes rename only the
+still-owned tab. Child title changes rename only that child's pane. These
+operations preserve main placement and focus.
+
+When a managed tab becomes verifiably empty, Herdr removes it automatically,
+including after manual last-pane closure or failed first attachment. The
+integration recognizes that removal as success; it does not issue `tab.close`. The integration does not empty occupied tabs: retained
+OpenCode children and user-added shell panes prevent removal. Codex's existing
+owned completion cleanup remains in force; OpenCode's prior post-attachment
+pane retention remains in force. Manual removal suppresses duplicate events for
+removed child displays; genuinely new eligible work can create a later tab.
+Ambiguous ownership, ancestry, changed server incarnation, unsafe cleanup, or
+unknown creation outcomes fail closed with a bounded diagnostic. An invalid
+association never authorizes guessing a replacement tab.
+
+### HHH-005 qualification
+
+Deterministic source QA passed 271 tests on Python 3.12.3 and 3.11.14. Static
+checks and isolated public install/status/uninstall checks passed; details and
+limits are in [validation](validation.md). A transient first Python 3.12 run
+observed 118 sessions where the test expected 128; the focused check and full
+reruns passed, with no reproducible regression. The concern was low and timing-
+sensitive; no repeat cycle reproduced it. Herdr 0.9.5 / protocol 22 targeted
+`tab.create`, `pane.split`, `tab.rename`, and last-pane closure were observed on
+Nov 19 without focus change. This did not qualify either harness's native
+subagent attachment, nested grouping, or full lifecycle. Codex trust/reload is
+pending the user, and OpenCode native qualification was unavailable. Overall
+status remains DRAFT.

@@ -120,3 +120,20 @@ after completion or client exit. No prompt is added. See
 
 Task status retains meaningful recognition, verification and attachment outcomes
 separately from `current_health`; see [contracts](contracts.md).
+
+## Subagent tab placement
+
+New eligible native subagents share one lazy, unfocused managed Herdr tab per
+verified main session; nested children join that tab. Its label follows the
+main session title and short ID, while child titles continue to name their
+panes. Existing panes are not migrated. Root-specific records remain in the
+selected integration state root; workspace tab-operation and label coordination
+uses the canonical per-UID account-home `.local/state` anchor described in
+[isolation](isolation.md). Unsafe or symlinked anchor paths fail closed rather
+than falling back to profile-local coordination.
+
+Implementation and isolated validation are complete, but native subagent
+attachment and grouping have not been qualified. The current Codex profile
+still needs the user's normal hook trust/reload step. A targeted Herdr 0.9.5 /
+protocol 22 tab-operation observation is not native Codex attachment evidence;
+see [validation](validation.md).

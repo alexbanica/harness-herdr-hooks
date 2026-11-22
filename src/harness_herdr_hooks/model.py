@@ -45,6 +45,70 @@ class ParentBinding:
     backend_proof: Mapping[str, object] | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class SubagentDestination:
+    """Optional destination authority kept separate from the original parent proof."""
+    root_context: Context
+    herdr_server_id: str
+    workspace_id: str
+    tab_id: str
+    generation: str
+    initial_pane_id: str
+    child_pane_id: str | None = None
+
+
+def destination_to_dict(value: SubagentDestination) -> dict[str, object]:
+    return {"root_context": context_to_dict(value.root_context),
+            "herdr_server_id": value.herdr_server_id, "workspace_id": value.workspace_id,
+            "tab_id": value.tab_id, "generation": value.generation,
+            "initial_pane_id": value.initial_pane_id, "child_pane_id": value.child_pane_id}
+
+
+def destination_from_dict(value: object) -> SubagentDestination:
+    keys = {"root_context", "herdr_server_id", "workspace_id", "tab_id", "generation", "initial_pane_id", "child_pane_id"}
+    if not isinstance(value, dict) or set(value) != keys:
+        raise ValueError("invalid subagent destination fields")
+    for key in ("herdr_server_id", "workspace_id", "tab_id", "generation", "initial_pane_id"):
+        limit = 256 if key == "generation" else 512
+        if (not isinstance(value[key], str) or not value[key] or len(value[key]) > limit
+                or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in value[key])):
+            raise ValueError("invalid subagent destination identity")
+    child = value["child_pane_id"]
+    if child is not None and (not isinstance(child, str) or not child or len(child) > 512
+                              or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in child)):
+        raise ValueError("invalid subagent child pane identity")
+    return SubagentDestination(context_from_dict(value["root_context"]), value["herdr_server_id"],
+                               value["workspace_id"], value["tab_id"], value["generation"],
+                               value["initial_pane_id"], child)
+
+
+def validate_binding_destination(destination: SubagentDestination, parent: ParentBinding,
+                                 child: Session, *, kind: str, generation: str | None,
+                                 pane_id: str | None) -> None:
+    """Require an integration destination to remain rooted in the original parent proof."""
+    if kind != "subagent" or child.kind != "subagent":
+        raise ValueError("only subagent bindings may have a tab destination")
+    root = destination.root_context
+    if root != parent.context:
+        raise ValueError("destination root does not match original parent context")
+    if (root.session_id == child.context.session_id
+            or (root.harness, root.profile, root.config_root.resolve(), root.data_root.resolve(),
+                root.state_root.resolve(), root.backend_id, root.backend_instance)
+            != (child.context.harness, child.context.profile, child.context.config_root.resolve(),
+                child.context.data_root.resolve(), child.context.state_root.resolve(),
+                child.context.backend_id, child.context.backend_instance)):
+        raise ValueError("destination child is outside the root session context")
+    if (destination.herdr_server_id != parent.herdr_server_id
+            or destination.workspace_id != parent.workspace_id):
+        raise ValueError("destination server or workspace differs from original parent")
+    if destination.tab_id == parent.tab_id or destination.initial_pane_id == parent.pane_id:
+        raise ValueError("destination must identify a separate managed tab")
+    if generation is not None and (not isinstance(generation, str) or not generation or len(generation) > 512):
+        raise ValueError("invalid binding generation")
+    if pane_id is not None and destination.child_pane_id is not None and pane_id != destination.child_pane_id:
+        raise ValueError("destination child pane differs from binding pane pin")
+
+
 class Lifecycle(str, Enum):
     STARTING = "starting"
     RUNNING = "running"

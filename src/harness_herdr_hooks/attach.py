@@ -6,6 +6,7 @@ from typing import Callable, Any
 from .herdr import HerdrClient, HerdrError
 from .environment import child_environment
 from .model import Harness, parent_from_dict, session_from_dict
+from .model import destination_from_dict, validate_binding_destination
 
 class AttachmentUnavailable(RuntimeError): pass
 class AttachError(AttachmentUnavailable):
@@ -104,6 +105,43 @@ def _runtime(parent:Any,child:Any,client:HerdrClient,backend_pid:int|None):
     if not backend_pid: raise AttachmentUnavailable('OpenCode backend PID missing')
     return OpenCodeRuntimeAdapter(parent.context,backend_pid,herdr_client=client)
 
+def _managed_claim_contains(state_root:Path,parent:Any,destination:Any,pane_id:str|None=None)->bool:
+    """Check the exact committed root claim without taking operation locks."""
+    try:
+        from .state import StateStore
+        from .tabs import SubagentTabManager
+        state=StateStore(state_root,'tabs-read')
+        manager=SubagentTabManager(state,parent.context,destination.herdr_server_id,destination.workspace_id)
+        with manager.root_store.locked() as data:
+            claim=data.get('subagent_tab')
+            panes=claim.get('pane_ids') if isinstance(claim,dict) else None
+            return bool(isinstance(claim,dict) and claim.get('status')=='created'
+                and claim.get('server_id')==destination.herdr_server_id
+                and claim.get('workspace_id')==destination.workspace_id
+                and claim.get('tab_id')==destination.tab_id
+                and claim.get('generation')==destination.generation
+                and claim.get('initial_pane_id')==destination.initial_pane_id
+                and isinstance(panes,list) and (pane_id is None or pane_id in panes))
+    except (KeyError,TypeError,ValueError,OSError): return False
+
+def binding_tab_id(state_root:Path,record:dict,parent:Any)->str|None:
+    """Resolve a managed destination from the binding and current root claim.
+
+    This deliberately takes only the short state lock. Wrapper startup can
+    happen while its parent observer holds the tab operation lock.
+    """
+    raw=record.get('destination')
+    if raw is None: return None
+    try:
+        destination=destination_from_dict(raw)
+        child=session_from_dict(record['child'])
+        validate_binding_destination(destination,parent,child,kind=record.get('kind','subagent'),
+                                    generation=record.get('generation'),pane_id=record.get('pane_id'))
+        if not _managed_claim_contains(state_root,parent,destination,record.get('pane_id')): return None
+        return destination.tab_id
+    except (KeyError,TypeError,ValueError,OSError):
+        return None
+
 def exec_binding(binding_id:str,environment:dict[str,str]|None=None)->None:
     """Load and verify one binding, then exec its existing native child session."""
     if not binding_id or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_' for c in binding_id):
@@ -121,9 +159,13 @@ def exec_binding(binding_id:str,environment:dict[str,str]|None=None)->None:
     parent=parent_from_dict(record['parent']); child=session_from_dict(record['child'])
     socket_path=Path(record['server_socket'])
     if socket_path!=Path(socket_value) or not socket_path.is_absolute(): raise AttachmentUnavailable('binding socket differs from pane marker')
+    destination_tab=binding_tab_id(root,record,parent)
+    if record.get('destination') is not None and destination_tab is None:
+        raise AttachmentUnavailable('managed destination association is stale or invalid')
     pane_id=record['pane_id']; client=HerdrClient(socket_path); snap=client.snapshot()
     pane=next((p for p in snap.get('panes',[]) if p.get('pane_id')==pane_id),None)
-    if (pane_id!=env.get('HERDR_PANE_ID') or not pane or pane.get('tab_id')!=parent.tab_id
+    expected_tab=destination_tab or parent.tab_id
+    if (pane_id!=env.get('HERDR_PANE_ID') or not pane or pane.get('tab_id')!=expected_tab
             or pane.get('workspace_id')!=parent.workspace_id or pane.get('tab_id')!=env.get('HERDR_TAB_ID')
             or pane.get('workspace_id')!=env.get('HERDR_WORKSPACE_ID')
             or client.server_identity()!=parent.herdr_server_id):
@@ -176,7 +218,10 @@ def _close_failed_before_exec(client:HerdrClient,state_root:Path,binding_id:str,
                 or record.get('server_socket')!=str(client.socket_path)
                 or not client.verify_parent(parent,record.get('backend_pid'))): return False
         snap=client.snapshot(); pane=next((p for p in snap.get('panes',[]) if p.get('pane_id')==record['pane_id']),None)
-        if (not pane or pane.get('workspace_id')!=parent.workspace_id or pane.get('tab_id')!=parent.tab_id
+        managed_tab=binding_tab_id(state_root,record,parent)
+        if record.get('destination') is not None and managed_tab is None: return False
+        expected_tab=managed_tab or parent.tab_id
+        if (not pane or pane.get('workspace_id')!=parent.workspace_id or pane.get('tab_id')!=expected_tab
                 or pane.get('agent_session') is not None): return False
         info=client.process_info(record['pane_id'])
         if info.get('shell_pid')!=record['shell_pid'] or info.get('foreground_processes') not in ([],None): return False
@@ -187,14 +232,45 @@ def _close_failed_before_exec(client:HerdrClient,state_root:Path,binding_id:str,
 
 def attach_in_new_pane(client:HerdrClient,runtime:Any,parent:object,child:object,entrypoint:Path,
                        binding_id:str,state_root:Path,backend_pid:int|None=None,
-                       on_pane_created:Callable[[str,dict],None]|None=None,*,preserve_shell:bool=False)->str:
+                       on_pane_created:Callable[[str,dict],None]|None=None,*,preserve_shell:bool=False,
+                       destination:Any=None,initial_pane_id:str|None=None,target_pane_id:str|None=None)->str:
     """Revalidate before splitting; persist ownership before sending wrapper text."""
     if not state_root.is_absolute(): raise AttachmentUnavailable('state root must be absolute')
     try: parent_verified=runtime.verify_parent(parent)
     except (TypeError,AttributeError) as exc: raise AttachmentUnavailable('runtime cannot verify selected parent binding') from exc
     if not parent_verified: raise AttachmentUnavailable('parent pane/backend binding is unverified; no pane created')
     if not runtime.can_attach_now(parent,child): raise AttachmentUnavailable('child is no longer attachable; no pane created')
-    pane=client.split(parent,child.cwd,env={'HARNESS_HERDR_STATE_ROOT':str(state_root)})
+    if destination is None:
+        pane=client.split(parent,child.cwd,env={'HARNESS_HERDR_STATE_ROOT':str(state_root)})
+    else:
+        from .model import validate_binding_destination
+        validate_binding_destination(destination,parent,child,kind='subagent',generation=destination.generation,pane_id=None)
+        if not _managed_claim_contains(state_root,parent,destination):
+            raise AttachmentUnavailable('managed destination claim is stale or uncommitted')
+        snap=client.snapshot()
+        panes=snap.get('panes') if isinstance(snap,dict) else None
+        if client.server_identity()!=destination.herdr_server_id:
+            raise AttachmentUnavailable('managed destination server identity changed')
+        if target_pane_id is None:
+            initial=next((p for p in panes or [] if isinstance(p,dict) and p.get('pane_id')==initial_pane_id),None)
+            if (not initial or initial.get('workspace_id')!=destination.workspace_id
+                    or initial.get('tab_id')!=destination.tab_id or initial.get('pane_id')!=destination.initial_pane_id):
+                raise AttachmentUnavailable('initial managed pane snapshot is outside the exact destination')
+            pane=initial_pane_id
+            if initial.get('agent_session') is not None or initial.get('cwd')!=str(child.cwd.resolve()):
+                raise AttachmentUnavailable('initial managed pane is not an unused child target')
+        else:
+            pane=target_pane_id
+            # A split may be anchored to any pane in the exact currently
+            # claimed managed tab. The anchor itself may be a user's pane;
+            # Herdr's split operation leaves that pane and its process intact.
+            # The root claim (checked above), exact destination snapshot and
+            # pinned server below are the authority, not ownership of anchor.
+            target=next((p for p in panes or [] if isinstance(p,dict) and p.get('pane_id')==pane),None)
+            if (not target or target.get('workspace_id')!=destination.workspace_id or target.get('tab_id')!=destination.tab_id):
+                raise AttachmentUnavailable('managed split target is outside the destination tab')
+            pane=client.split_subagent_tab(pane,destination.workspace_id,destination.tab_id,child.cwd,
+                                           env={'HARNESS_HERDR_STATE_ROOT':str(state_root)})
     info=None; initial_shell_pid=None
     for _ in range(3):
         info=client.process_info(pane)
@@ -206,7 +282,9 @@ def attach_in_new_pane(client:HerdrClient,runtime:Any,parent:object,child:object
     if not info or not shell_is_ready(info):
         raise AttachError('shell readiness unproven; new pane retained because absence of user activity cannot be proven',pane,retryable=False)
     if on_pane_created is None: raise AttachError('binding persistence callback required; pane retained without launch',pane,retryable=False)
-    try: on_pane_created(pane,info)
+    try:
+        if destination is None: on_pane_created(pane,info)
+        else: on_pane_created(pane,info,destination)
     except Exception as exc: raise AttachError('binding persistence failed before launch; pane retained',pane,retryable=False) from exc
     try:
         # Check immediately before writing to ensure shell is still the same sole foreground process.

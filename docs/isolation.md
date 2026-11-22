@@ -78,3 +78,32 @@ optional normalized cwd, context/destination pins, and retry/outcome metadata;
 it excludes prompts, raw tool results, transcript text and partial record
 bytes. This local-record association is not cryptographic ancestry proof and
 does not establish native subagent lineage.
+
+## HHH-005 subagent-tab state
+
+Tab identity is rooted in the full verified main-session context, harness,
+profile/backend incarnation, Herdr server and workspace. Titles, cwd, inherited
+environment and displayed short IDs are not ancestry or ownership proof.
+Siblings and verified nested children share the root association; independent
+sessions do not. Existing panes are not migrated, and a stale or invalidated
+association cannot authorize adoption or movement to another tab.
+
+Root-specific tab claims, child bindings and lifecycle records remain in the
+selected integration state root. To coordinate label reservations and tab
+operations across profiles and both harnesses, the implementation uses one
+canonical private workspace anchor beneath the current OS UID's account home
+(`.local/state`), resolved from the account database rather than inherited
+`HOME`, XDG, or profile variables. It admits path components through no-follow
+directory checks, rejects symlinks, non-directories, unsafe ownership or
+permissions, and does not fall back to profile-local coordination. Missing
+`.local/state` components may be created only below an admitted owner-controlled
+parent with private mode. Existing safe modes are preserved. This anchor is
+initialized only after verified Herdr runtime binding; it is not a public
+configuration override. Diagnostics identify rejected anchor components
+without weakening isolation.
+
+Cleanup revalidates ownership and contents and coordinates against new
+attachments. Empty managed tabs may close; retained children and user work are
+never closed to manufacture emptiness. Source tests of the anchor and protocol
+fixtures are not evidence of native harness qualification; see
+[validation](validation.md).

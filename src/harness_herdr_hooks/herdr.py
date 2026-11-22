@@ -215,6 +215,58 @@ class HerdrClient:
         pane=pane_info.get('pane_id') if pane_info else None
         if not isinstance(pane,str) or not pane or pane_info.get('workspace_id')!=parent.workspace_id or pane_info.get('tab_id')!=parent.tab_id or pane_info.get('focused') is not False: raise HerdrError('split did not acknowledge pane ID')
         return pane
+    def create_subagent_tab(self, workspace_id: str, cwd: Path, label: str,
+                            env: dict[str, str] | None = None) -> tuple[str, str]:
+        """Create an unfocused protocol-22 tab and return its acknowledged tab/root pane IDs."""
+        if not workspace_id or not label or len(label) > 64 or not cwd.is_absolute():
+            raise HerdrError('invalid subagent tab creation request')
+        expected_cwd = str(cwd.resolve())
+        params = {'workspace_id': workspace_id, 'cwd': expected_cwd,
+                  'label': label, 'focus': False}
+        if env is not None:
+            if set(env) != {'HARNESS_HERDR_STATE_ROOT'} or not Path(env['HARNESS_HERDR_STATE_ROOT']).is_absolute():
+                raise HerdrError('tab creation accepts only the absolute integration state hint')
+            params['env'] = dict(env)
+        r = self.request('tab.create', params)
+        tab, pane = r.get('tab'), r.get('root_pane')
+        if (r.get('type') != 'tab_created' or not isinstance(tab, dict) or not isinstance(pane, dict)
+                or not all(isinstance(x, str) and x for x in (tab.get('tab_id'), pane.get('pane_id')))
+                or tab.get('workspace_id') != workspace_id or pane.get('workspace_id') != workspace_id
+                or pane.get('tab_id') != tab.get('tab_id') or tab.get('focused') is not False
+                or tab.get('label') != label or pane.get('focused') is not False or pane.get('cwd') != expected_cwd):
+            raise HerdrError('tab creation acknowledgement failed strict identity checks')
+        return tab['tab_id'], pane['pane_id']
+
+    def split_subagent_tab(self, target_pane_id: str, workspace_id: str, tab_id: str,
+                           cwd: Path, env: dict[str, str] | None = None) -> str:
+        if not all((target_pane_id, workspace_id, tab_id)) or not cwd.is_absolute():
+            raise HerdrError('invalid subagent split request')
+        params = {'direction': 'right', 'target_pane_id': target_pane_id,
+                  'workspace_id': workspace_id, 'cwd': str(cwd.resolve()), 'focus': False}
+        if env is not None:
+            if set(env) != {'HARNESS_HERDR_STATE_ROOT'} or not Path(env['HARNESS_HERDR_STATE_ROOT']).is_absolute():
+                raise HerdrError('split accepts only the absolute integration state hint')
+            params['env'] = dict(env)
+        r = self.request('pane.split', params)
+        pane = r.get('pane')
+        if (r.get('type') != 'pane_info' or not isinstance(pane, dict)
+                or not isinstance(pane.get('pane_id'), str) or not pane.get('pane_id')
+                or pane.get('workspace_id') != workspace_id or pane.get('tab_id') != tab_id
+                or pane.get('pane_id') == target_pane_id or pane.get('focused') is not False
+                or pane.get('cwd') != str(cwd.resolve())):
+            raise HerdrError('split acknowledgement failed strict destination checks')
+        return pane['pane_id']
+
+    def rename_subagent_tab(self, tab_id: str, workspace_id: str, label: str) -> None:
+        if not tab_id or not workspace_id or not label or len(label) > 64:
+            raise HerdrError('invalid tab rename request')
+        r = self.request('tab.rename', {'tab_id': tab_id, 'label': label})
+        tab = r.get('tab')
+        if (r.get('type') != 'tab_info' or not isinstance(tab, dict)
+                or tab.get('tab_id') != tab_id or tab.get('workspace_id') != workspace_id
+                or tab.get('label') != label or not isinstance(tab.get('focused'), bool)):
+            raise HerdrError('tab rename acknowledgement failed strict identity checks')
+
     @staticmethod
     def safe_label(title:str|None,harness:str,session_id:str,limit:int=64)->str:
         raw=title or f'{harness} {session_id[:8]}'
