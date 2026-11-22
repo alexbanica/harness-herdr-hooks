@@ -12,10 +12,13 @@ reading event input or touching integration state.
 ## Harness boundaries
 
 - **Codex:** Only bounded Codex hook metadata and native app-server interfaces
-  are used. Codex 0.170.0 supports the verified selected-profile shared default
-  daemon and explicit Unix `--remote` endpoints; `--no-daemon` and unknown
-  launch modes are refused. The socket alias/target, user ownership, private
-  directory, process identity, and backend incarnation are pinned. Optional
+  are used. Eligibility requires successful transport and initialization,
+  expected profile identity, and valid methods and response fields for the operation. Release metadata is diagnostic
+  only, including when absent or unfamiliar. Codex 0.170.0 was observed in
+  earlier validation. Codex 0.171.0 passed fixtures and a read-only daemon probe.
+  Supported launch modes use the verified selected-profile shared default daemon
+  or a verified explicit Unix `--remote` endpoint. The socket alias/target, user ownership,
+  private directory, process identity, and backend incarnation are pinned. Optional
   Herdr foreground argv is not required. `CODEX_HOME` (or `~/.codex`) selects
   the profile; it does not prove that the backend is private. Codex's owned
   command adapter is added only to that profile's literal shell PATH setting.
@@ -65,6 +68,11 @@ cross-profile/backend isolation, authorized real child display and completion
 cleanup, ordinary launch routing, and all race/concurrency paths remain
 unqualified. macOS runtime is a separate outstanding predecessor gap. These
 remain acceptance work; no complete support claim is made.
+
+App-server compatibility errors are bounded to the failed stage and method,
+with the daemon release when known; they omit credentials, transcript text, and
+raw responses. Shared-daemon pane attachment requires independent verification
+of pane markers and native session references.
 
 ## Standalone Codex task records
 

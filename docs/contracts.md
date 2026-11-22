@@ -23,7 +23,7 @@ observer, and pane outcomes; unknown observations are not success.
 
 ## Native events and identity
 
-Codex 0.170.0 hooks are registered for `SessionStart`, `SubagentStart`, and
+Codex hooks are registered for `SessionStart`, `SubagentStart`, and
 `SubagentStop`; bounded JSON validates required fields while tolerating
 additional fields, and discards transcript/message contents. Child hook
 `session_id` and `agent_id` identify the child; ancestry is independently
@@ -33,6 +33,18 @@ endpoint are supported; `--no-daemon` and unknown launch modes are refused.
 The socket alias/target, owner, private containing directory, incarnation,
 profile, and Herdr pane/session binding are verified. Optional Herdr argv is
 not required; process metadata and OS inspection establish process identity.
+
+App-server eligibility depends on the interface required by the operation. Initialization, selected-profile identity, and the methods and required
+response fields for the requested operation must validate. Extra response
+fields are accepted. Missing or unfamiliar release metadata is allowed when
+those checks pass. A failed transport, method, or required response produces a
+concise diagnostic naming its stage and method and the observed release when
+available, without credentials, transcript content, or raw response dumps.
+Codex 0.170.0 remains historical observed-release evidence. Codex 0.171.0
+passed current fixtures and a read-only initialization and metadata probe.
+Pane attachment requires independent evidence of pane identity. Missing
+shared-daemon pane markers or native session references remain separate
+attachment failures.
 
 The OpenCode 1.19.5 plugin forwards bounded, allowlisted metadata for
 `session.created`, `session.updated`, `session.status`, and `session.idle` over a
@@ -143,10 +155,10 @@ time is monotonic within a process and persisted timestamps are bounded on
 restart. Unsupported
 envelopes fail closed with a bounded status reason.
 
-This dependency is version-qualified to the observed Codex CLI 0.170.0 app/TUI
-rollout envelope and Herdr 0.9.5/protocol 22 on Linux/WSL. It is not a stable
-public Codex API guarantee. Native `PostToolUse` delivery for the app-owned tool
-is unverified and not used. No `exec` JavaScript parsing, `codexDelegation`
+The typed rollout envelope was observed with Codex CLI 0.170.0 and Herdr
+0.9.5/protocol 22 on Linux/WSL. The adapter validates that envelope when it
+reads standalone task records. Native `PostToolUse`
+delivery for the app-owned tool is unverified and not used. No `exec` JavaScript parsing, `codexDelegation`
 inference, title/cwd/time parent inference, broad history scan, or arbitrary
 root-task discovery is supported. Standalone tasks are separate sessions, not
 native subagents; their panes remain after completion and client exit and are

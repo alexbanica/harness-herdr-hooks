@@ -22,11 +22,19 @@ loading, or complete pane attachment support.
   that revision. A native thread `notLoaded` response or missing items alone
   is not terminal evidence; it can participate only with successful status
   evidence plus exact matching terminal-turn metadata and no newer running work.
-  Verify Codex CLI and running app-server 0.170.0, Herdr 0.9.5/protocol
-  22, and exact selected profile/backend binding. The verified default daemon
-  and explicit Unix endpoints are supported; `--no-daemon` and ambiguous modes
-  fail closed. Outside-Herdr events remain silent. Do not bypass trust or change
+  Verify the required app-server interface and exact selected profile/backend
+  binding, plus Herdr 0.9.5/protocol 22. Eligibility depends on successful
+  initialization, identity, required methods, and valid required response
+  fields. If a required step
+  fails, use the concise diagnostic's stage and method to identify the failed
+  contract. The observed daemon release is included when available. A reported
+  release is diagnostic metadata. Supported endpoints are the verified default
+  daemon and verified explicit Unix sockets. Outside-Herdr events remain silent. Do not bypass trust or change
   socket permissions.
+- **Codex app-server method or response is incompatible:** the bounded error
+  identifies the failing transport, initialization, method, or response stage
+  and names the requested method, with the daemon release when available. It
+  omits credentials, transcript content, and raw response dumps.
 - **Ordinary `codex` command does not route:** the parent must load the selected
   profile's concrete `shell_environment_policy.set.PATH` after installation.
   Absolute executable paths, deliberate PATH overrides, informational/tooling

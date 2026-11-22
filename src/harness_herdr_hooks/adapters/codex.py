@@ -1,4 +1,4 @@
-"""Codex 0.170.0 hook and existing-app-server adapter primitives.
+"""Codex app-server hook and existing-app-server adapter primitives.
 
 Hook values are treated only as event identity hints. Backend identity must be
 independently established by the caller before any routing or attachment.
@@ -118,14 +118,15 @@ def parse_hook(payload: str | bytes | Mapping[str, Any], *, profile: str,
                      obj.get("agent_id"), obj.get("agent_type"), obj.get("stop_hook_active"))
 
 
+def _backend_failure(proxy: AppServerProxy, stage: str, method: str, reason: str) -> str:
+    version = getattr(proxy, "server_version", None)
+    suffix = f" (daemon {version})" if version else " (daemon version unknown)"
+    return f"Codex app-server {stage} failed for {method}: {reason}{suffix}"
+
+
 class AppServerProxy:
     """Small JSON-RPC client over Codex's stdio proxy to an existing socket."""
-    QUALIFIED_SERVER_VERSION = "0.170.0"
-    _USER_AGENT_VERSION = re.compile(
-        r"^codex-tui/(0\.170\.0) \([A-Za-z0-9 ._-]{1,80}; [A-Za-z0-9._-]{1,40}\)"
-        r"(?: herdr/\d{1,3}\.\d{1,3}\.\d{1,3} "
-        r"\(harness-herdr-hooks; \d{1,3}\.\d{1,3}\.\d{1,3}\))?$"
-    )
+    _USER_AGENT_VERSION = re.compile(r"^codex-tui/(\d{1,9}\.\d{1,9}\.\d{1,9}(?:[-+][A-Za-z0-9.-]{1,32})?)(?:\s|$)")
 
     def __init__(self, executable: str, socket_path: Path, *, context: Context, timeout: float = 5.0,
                  popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
@@ -158,30 +159,42 @@ class AppServerProxy:
         self._in_startup = True
         self.server_version: str | None = None
         try:
-            self._handshake(self._startup_deadline)
+            try:
+                self._handshake(self._startup_deadline)
+            except TimeoutError as exc:
+                raise TimeoutError(_backend_failure(
+                    self, "transport", "initialize", "WebSocket handshake timed out")) from exc
+            except (RuntimeError, OSError) as exc:
+                raise self._failure("transport", "initialize", "WebSocket handshake failed") from exc
             initialized = self.request("initialize", {"clientInfo": {"name": "harness-herdr-hooks", "version": "0.1.0"},
                                                        "capabilities": {"experimentalApi": True}})
-            self.server_version = self._qualified_version(initialized)
+            self.server_version = self._reported_version(initialized)
             if initialized.get("codexHome") != str(context.config_root.resolve()):
-                raise ValueError("Codex app-server home does not match the selected profile")
-            self.notify("initialized", {})
+                raise ValueError(_backend_failure(
+                    self, "profile check", "initialize", "home does not match selected profile"))
+            try:
+                self.notify("initialized", {})
+            except TimeoutError as exc:
+                raise TimeoutError(_backend_failure(
+                    self, "transport", "initialized", "notification timed out")) from exc
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise type(exc)(_backend_failure(self, "transport", "initialized", "notification failed")) from exc
             self._in_startup = False
         except BaseException:
             self.close()
             raise
 
     @classmethod
-    def _qualified_version(cls, initialized: object) -> str:
-        """Require the native server version from initialize before automation."""
-        if not isinstance(initialized, dict):
-            raise ValueError("Codex app-server initialize response is invalid")
+    def _reported_version(cls, initialized: Mapping[str, Any]) -> str | None:
+        """Return the daemon release when its diagnostic format is recognized."""
         user_agent = initialized.get("userAgent")
         if not isinstance(user_agent, str):
-            raise ValueError("Codex app-server version is missing")
+            return None
         match = cls._USER_AGENT_VERSION.match(user_agent)
-        if match is None or match.group(1) != cls.QUALIFIED_SERVER_VERSION:
-            raise ValueError("Codex app-server version is unsupported")
-        return match.group(1)
+        return match.group(1) if match else None
+
+    def _failure(self, stage: str, method: str, reason: str) -> RuntimeError:
+        return RuntimeError(_backend_failure(self, stage, method, reason))
 
     def _inspect_socket(self) -> tuple[int, int, int, int]:
         info = self._lstat(self.socket_path)
@@ -322,8 +335,11 @@ class AppServerProxy:
 
     def request(self, method: str, params: Mapping[str, Any]) -> Mapping[str, Any]:
         if self._proc.stdin is None or self._proc.stdout is None or self._proc.poll() is not None:
-            raise RuntimeError("Codex proxy is unavailable")
-        self._verify_socket()
+            raise self._failure("transport", method, "proxy unavailable")
+        try:
+            self._verify_socket()
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise type(exc)(_backend_failure(self, "transport", method, "socket identity check failed")) from exc
         self._next_id += 1
         request_id = self._next_id
         wire = json.dumps({"jsonrpc": "2.0", "id": request_id, "method": method,
@@ -331,19 +347,36 @@ class AppServerProxy:
         if len(wire) > 1024 * 1024:
             raise ValueError("Codex request exceeds 1 MiB")
         deadline = min(time.monotonic() + self.timeout, self._startup_deadline) if self._in_startup else time.monotonic() + self.timeout
-        self._send_frame(1, wire, deadline)
+        try:
+            self._send_frame(1, wire, deadline)
+        except TimeoutError as exc:
+            raise TimeoutError(_backend_failure(self, "transport", method, "request timed out")) from exc
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise type(exc)(_backend_failure(self, "transport", method, "request send failed")) from exc
         while True:
-            opcode, payload = self._recv_message(deadline)
+            try:
+                opcode, payload = self._recv_message(deadline)
+            except TimeoutError as exc:
+                raise TimeoutError(_backend_failure(self, "transport", method, "request timed out")) from exc
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise type(exc)(_backend_failure(self, "transport", method, "response exchange failed")) from exc
             if opcode != 1:
-                raise RuntimeError("Codex app-server sent a non-text JSON-RPC message")
-            msg = json.loads(payload)
+                raise self._failure("transport", method, "non-text response")
+            try:
+                msg = json.loads(payload)
+            except ValueError:
+                raise ValueError(_backend_failure(self, "response", method, "invalid JSON-RPC message")) from None
+            except RecursionError:
+                raise self._failure("response", method, "invalid JSON-RPC message") from None
             if not isinstance(msg, dict) or msg.get("id") != request_id:
                 continue
+            if type(msg["id"]) is not int:
+                raise self._failure("response", method, "invalid JSON-RPC response ID")
             if "error" in msg:
-                raise RuntimeError("Codex app-server request failed")
+                raise self._failure("method", method, "server rejected request")
             result = msg.get("result")
             if not isinstance(result, dict):
-                raise RuntimeError("invalid Codex app-server response")
+                raise self._failure("response", method, "required result object missing")
             return result
 
     def close(self) -> None:
@@ -376,18 +409,18 @@ def list_threads(proxy: AppServerProxy, *, parent_id: str | None = None,
         result = proxy.request("thread/list", params)
         data = result.get("data")
         if not isinstance(data, list):
-            raise RuntimeError("invalid Codex thread/list data")
+            raise RuntimeError(_backend_failure(proxy, "response", "thread/list", "invalid data"))
         for thread in data:
             if not isinstance(thread, dict):
-                raise RuntimeError("invalid Codex thread record")
+                raise RuntimeError(_backend_failure(proxy, "response", "thread/list", "invalid thread record"))
             yield thread
         cursor = result.get("nextCursor")
-        if not cursor:
+        if cursor is None:
             return
-        if not isinstance(cursor, str) or cursor in seen:
-            raise RuntimeError("invalid or cyclic Codex pagination cursor")
+        if not isinstance(cursor, str) or not cursor or cursor in seen:
+            raise RuntimeError(_backend_failure(proxy, "response", "thread/list", "invalid or cyclic pagination cursor"))
         seen.add(cursor)
-    raise RuntimeError("Codex pagination limit exceeded")
+    raise RuntimeError(_backend_failure(proxy, "response", "thread/list", "pagination limit exceeded"))
 
 
 def list_loaded_threads(proxy: AppServerProxy) -> set[str]:
@@ -401,15 +434,15 @@ def list_loaded_threads(proxy: AppServerProxy) -> set[str]:
         result = proxy.request("thread/loaded/list", params)
         data = result.get("data")
         if not isinstance(data, list) or any(not isinstance(item, str) for item in data):
-            raise RuntimeError("invalid Codex thread/loaded/list data")
+            raise RuntimeError(_backend_failure(proxy, "response", "thread/loaded/list", "invalid data"))
         loaded.update(data)
         cursor = result.get("nextCursor")
-        if not cursor:
+        if cursor is None:
             return loaded
-        if not isinstance(cursor, str) or cursor in seen:
-            raise RuntimeError("invalid or cyclic Codex pagination cursor")
+        if not isinstance(cursor, str) or not cursor or cursor in seen:
+            raise RuntimeError(_backend_failure(proxy, "response", "thread/loaded/list", "invalid or cyclic pagination cursor"))
         seen.add(cursor)
-    raise RuntimeError("Codex loaded-thread pagination limit exceeded")
+    raise RuntimeError(_backend_failure(proxy, "response", "thread/loaded/list", "pagination limit exceeded"))
 
 
 def list_turn_metadata(proxy: AppServerProxy, thread_id: str, *, page_size: int = 100,
@@ -430,23 +463,23 @@ def list_turn_metadata(proxy: AppServerProxy, thread_id: str, *, page_size: int 
         page = proxy.request("thread/turns/list", params)
         rows = page.get("data")
         if not isinstance(rows, list):
-            raise RuntimeError("invalid Codex thread/turns/list data")
+            raise RuntimeError(_backend_failure(proxy, "response", "thread/turns/list", "invalid data"))
         for row in rows:
-            if not isinstance(row, dict) or not isinstance(row.get("id"), str) or row.get("status") not in {"completed", "interrupted", "failed", "inProgress"}:
-                raise RuntimeError("invalid Codex turn metadata")
+            if not isinstance(row, dict) or not isinstance(row.get("id"), str) or row.get("status") not in ("completed", "interrupted", "failed", "inProgress"):
+                raise RuntimeError(_backend_failure(proxy, "response", "thread/turns/list", "invalid turn metadata"))
             # A proxy/server violating itemsView=notLoaded is not allowed to
             # make transcript contents enter lifecycle state.
             if row.get("itemsView", "notLoaded") != "notLoaded" or row.get("items") not in (None, []):
-                raise RuntimeError("Codex turn response included transcript items")
+                raise RuntimeError(_backend_failure(proxy, "response", "thread/turns/list", "response included transcript items"))
             result.append(TurnMetadata(thread_id, row["id"], row["status"]))
         cursor = page.get("nextCursor")
         if cursor is None:
             return tuple(result)
         if not isinstance(cursor, str) or not cursor or cursor in seen:
-            raise RuntimeError("invalid or cyclic Codex turn pagination cursor")
+            raise RuntimeError(_backend_failure(proxy, "response", "thread/turns/list", "invalid or cyclic pagination cursor"))
         seen.add(cursor)
     if cursor is not None:
-        raise RuntimeError("Codex turn pagination limit exceeded")
+        raise RuntimeError(_backend_failure(proxy, "response", "thread/turns/list", "pagination limit exceeded"))
     return tuple(result)
 
 
@@ -875,7 +908,7 @@ class CodexRuntimeAdapter:
         result = self.proxy.request("thread/read", {"threadId": thread_id, "includeTurns": False})
         thread = result.get("thread")
         if not isinstance(thread, dict):
-            raise RuntimeError("invalid Codex thread/read response")
+            raise RuntimeError(_backend_failure(self.proxy, "response", "thread/read", "required thread object missing"))
         return thread
 
     def main_metadata(self, parent: ParentBinding) -> tuple[Context, str | None]:
@@ -894,18 +927,18 @@ class CodexRuntimeAdapter:
             seen.add(current_id)
             row = self._read_thread(current_id)
             if row.get("id") != current_id:
-                raise ValueError("Codex returned a different conversation")
+                raise ValueError(_backend_failure(self.proxy, "response", "thread/read", "returned a different conversation"))
             parent_id = row.get("parentThreadId")
             source = row.get("source")
             subagent = source.get("subAgent") if isinstance(source, dict) else None
             if parent_id is not None and not (
                     isinstance(source, str) and source in {"cli", "exec"}):
                 if not isinstance(source, dict) or "subAgent" not in source:
-                    raise ValueError("Codex conversation source classification is unknown or malformed")
+                    raise ValueError(_backend_failure(self.proxy, "response", "thread/read", "conversation source classification is unknown or malformed"))
             if isinstance(source, dict) and "subAgent" in source:
                 if (set(source) != {"subAgent"} or not isinstance(subagent, dict)
                         or set(subagent) != {"thread_spawn"}):
-                    raise ValueError("Codex native subagent classification is malformed")
+                    raise ValueError(_backend_failure(self.proxy, "response", "thread/read", "native subagent classification is malformed"))
             spawn_marker = isinstance(subagent, dict) and "thread_spawn" in subagent
             if spawn_marker:
                 spawn = subagent.get("thread_spawn")
@@ -914,9 +947,9 @@ class CodexRuntimeAdapter:
                         or not spawn.get("parent_thread_id")
                         or not isinstance(parent_id, str)
                         or spawn["parent_thread_id"] != parent_id):
-                    raise ValueError("Codex native subagent ancestry is malformed")
+                    raise ValueError(_backend_failure(self.proxy, "response", "thread/read", "native subagent ancestry is malformed"))
             if parent_id is not None and not isinstance(parent_id, str):
-                raise ValueError("Codex conversation ancestry is malformed")
+                raise ValueError(_backend_failure(self.proxy, "response", "thread/read", "conversation ancestry is malformed"))
             if not parent_id or not self._is_native_child(row, parent_id):
                 title = row.get("name")
                 return (Context(Harness.CODEX, self.context.profile, self.context.config_root,

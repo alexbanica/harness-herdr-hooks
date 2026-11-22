@@ -1,14 +1,16 @@
+import contextlib
+import io
 import tempfile
 import unittest
 import json
 import os
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from harness_herdr_hooks import cli
 from harness_herdr_hooks.model import Context, Harness, ParentBinding, Session, Lifecycle, parent_to_dict, session_to_dict
 from harness_herdr_hooks.state import save_binding
-from harness_herdr_hooks.adapters.codex import CodexRuntimeAdapter
+from harness_herdr_hooks.adapters.codex import AppServerProxy, CodexRuntimeAdapter
 
 
 class DisplayHookNormalizationTests(unittest.TestCase):
@@ -277,6 +279,189 @@ class DisplayHookNormalizationTests(unittest.TestCase):
         self.assertEqual(cwd,root)
         self.assertEqual(created.event_name,"SubagentStart")
         self.assertEqual(created.identity.session_id,"grandchild")
+
+
+class CodexGatewayCompatibilityTests(unittest.TestCase):
+    """Exercise the CLI gateway with an in-memory app-server transport only."""
+
+    def _run_gateway(self, failure, version="codex-tui/0.171.0", event_name="SessionStart",
+                     *, owned=True, expect_success=False):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        socket_path = root / "codex.sock"
+        socket_path.touch(exist_ok=True)
+        payload = {"hook_event_name": event_name, "session_id": "thread", "cwd": str(root),
+                   "transcript_path": None}
+        if event_name == "SubagentStart":
+            payload.update(session_id="child", agent_id="child", agent_type="worker", turn_id="turn")
+        pane = {"pane_id": "pane", "tab_id": "tab", "workspace_id": "workspace",
+                "agent_session": {"kind": "id", "value": "thread", "agent": "codex", "source": "native"},
+                "cwd": str(root)}
+
+        class Client:
+            socket_path = root / "herdr.sock"
+            def snapshot(self): return {"panes": [pane]}
+            def process_info(self, _pane):
+                return {"foreground_processes": [{"pid": 41, "name": "codex"}]}
+            def server_identity(self): return "server"
+            def verify_parent(self, parent, *_args):
+                return parent.herdr_server_id == "server"
+
+        add_cleanup = self.addCleanup
+
+        class FakeProxy(AppServerProxy):
+            def __init__(self, executable, socket, *, context):
+                # Supply the frame-boundary transport while retaining initialize,
+                # profile verification, and JSON-RPC handling from the adapter.
+                process = Mock()
+                read_fd, write_fd = os.pipe()
+                process.stdin = os.fdopen(write_fd, "wb")
+                process.stdout = os.fdopen(read_fd, "rb")
+                add_cleanup(process.stdin.close)
+                add_cleanup(process.stdout.close)
+                process.poll.return_value = None
+                super().__init__(executable, socket, context=context, popen=lambda *_a, **_kw: process)
+
+            def _inspect_socket(self):
+                changed = failure == "endpoint" and getattr(self, "initialized", False)
+                return (1, 99 if changed else 2, 3, 0o600)
+
+            def _handshake(self, _deadline):
+                if failure == "transport":
+                    raise RuntimeError("invalid transport")
+
+            def _send_frame(self, _opcode, payload, _deadline):
+                self.outgoing = json.loads(payload)
+                if self.outgoing["method"] == "initialized":
+                    self.initialized = True
+
+            def _recv_message(self, _deadline):
+                method = self.outgoing["method"]
+                reply = {"jsonrpc": "2.0", "id": self.outgoing["id"], "futureEnvelopeField": True}
+                if method == "thread/loaded/list" and failure == "invalid-json":
+                    return 1, b"credential-sentinel transcript-sentinel " + b"x" * 10000
+                if method == "thread/loaded/list" and failure == "invalid-id":
+                    reply["id"] = float(self.outgoing["id"])
+                if failure == "method" and method == "thread/loaded/list":
+                    reply["error"] = {"code": -32601, "message": "method unavailable"}
+                else:
+                    reply["result"] = self._result(method, self.outgoing["params"])
+                return 1, json.dumps(reply).encode()
+
+            def _result(self, method, params):
+                if method == "initialize":
+                    response = {"codexHome": str(root / "other" if failure == "profile" else root),
+                                "futureField": {"value": True}}
+                    if version is not None:
+                        response["userAgent"] = version
+                    return response
+                if method == "thread/loaded/list":
+                    if failure == "response": return {"data": "malformed"}
+                    if failure == "cursor": return {"data": ["thread"], "nextCursor": False}
+                    return {"data": ["thread"], "futureField": True}
+                if method == "thread/read":
+                    ident = params["threadId"]
+                    row = {"id": "wrong" if failure == "wrong-thread" else ident,
+                           "path": str(root / f"{ident}.json")}
+                    if ident == "thread" and owned is not True:
+                        row.update(parentThreadId="main", source={
+                            "subAgent": {"thread_spawn": {"parent_thread_id": "main"}}})
+                    if event_name == "SubagentStart" and ident == "child":
+                        row["parentThreadId"] = "thread"
+                        if failure != "ancestry":
+                            row["source"] = {"subAgent": {"thread_spawn": {"parent_thread_id": "thread"}}}
+                    return {"thread": row}
+                raise AssertionError(f"unexpected RPC method {method}")
+
+        executable = Path("/usr/bin/python3")
+        effects = {name: Mock() for name in ("observer", "popen", "attach", "cleanup", "create_tab")}
+        env = {"HERDR_ENV": "1", "HERDR_SOCKET_PATH": str(Client.socket_path),
+               "HERDR_PANE_ID": "pane", "HERDR_TAB_ID": "tab", "HERDR_WORKSPACE_ID": "workspace",
+               "CODEX_HOME": str(root), "HARNESS_HERDR_STATE_ROOT": str(root),
+               "HARNESS_HERDR_DISPLAY": "0" if owned is True else "1"}
+        client = Client()
+        client.create_tab = effects["create_tab"]
+        if owned == "foreign":
+            thread = Context(Harness.CODEX, str(root), root, root, root, str(socket_path), "thread", "1:2:3")
+            main = Context(Harness.CODEX, str(root), root, root, root, str(socket_path), "main", "1:2:3")
+            parent = ParentBinding(main, "foreign-server", "workspace", "tab", "root-pane")
+            child = Session(thread, "main", "thread", root, Lifecycle.UNKNOWN, True, 1.0)
+            save_binding(root, "foreign", {"parent": parent_to_dict(parent), "child": session_to_dict(child),
+                "pane_id": "pane", "server_socket": str(client.socket_path), "entrypoint": "/bin/entry",
+                "shell_pid": None, "backend_pid": None, "ownership": "created"})
+        diagnostic = io.StringIO()
+        with contextlib.redirect_stderr(diagnostic), patch.dict(os.environ, env, clear=False), \
+             patch("sys.stdin", type("Input", (), {"buffer": io.BytesIO(json.dumps(payload).encode())})()), \
+             patch.object(cli, "_herdr_client", return_value=client), \
+             patch.object(cli, "_native_codex_executable", return_value=executable), \
+             patch("harness_herdr_hooks.adapters.codex.shutil.which", return_value=str(executable)), \
+             patch("harness_herdr_hooks.cli.codex_backend_proof", return_value={
+                 "executable": str(executable), "socket_target": str(socket_path),
+                 "socket_identity": [1, 2, 3]}), \
+             patch.object(cli, "_start_observer", effects["observer"]), \
+             patch.object(cli, "_record_hook"), \
+             patch("harness_herdr_hooks.cli.subprocess.Popen", effects["popen"]), \
+             patch.object(cli, "exec_binding", effects["attach"]), \
+             patch.object(cli, "_retire_observer", effects["cleanup"]), \
+             patch.object(cli.time, "sleep"):
+            with patch("harness_herdr_hooks.cli.CodexRuntimeAdapter",
+                       side_effect=lambda context, executable=str(executable), **_kwargs:
+                           CodexRuntimeAdapter(context, executable=executable, proxy_factory=FakeProxy)):
+                result = cli.main(["codex-hook"])
+        if expect_success:
+            effects["observer"].assert_called_once()
+            for key in ("popen", "attach", "cleanup", "create_tab"):
+                effects[key].assert_not_called()
+        else:
+            for effect in effects.values():
+                effect.assert_not_called()
+        return result, diagnostic.getvalue()
+
+    def test_incompatible_transport_profile_method_and_response_fail_before_effects(self):
+        for failure, stage in (
+            ("transport", "transport failed for initialize"),
+            ("profile", "profile check failed for initialize"),
+            ("method", "method failed for thread/loaded/list"),
+            ("response", "response failed for thread/loaded/list"),
+            ("cursor", "invalid or cyclic pagination cursor"),
+            ("invalid-id", "invalid JSON-RPC response ID"),
+            ("invalid-json", "invalid JSON-RPC message"),
+        ):
+            with self.subTest(failure=failure):
+                result, diagnostic = self._run_gateway(failure)
+                self.assertEqual(result, 2)
+                self.assertIn(stage, diagnostic)
+                self.assertIn("version unknown" if failure == "transport" else "0.171.0", diagnostic)
+                self.assertNotIn("credential-sentinel", diagnostic)
+                self.assertNotIn("transcript-sentinel", diagnostic)
+                self.assertLess(len(diagnostic), 200)
+
+    def test_new_and_unknown_release_metadata_do_not_bypass_gateway_checks(self):
+        # The accepted adapter handshake reaches the gateway; each independent
+        # identity/ownership denial must still prevent observer/effect startup.
+        for version in ("codex-tui/99.0.0", None):
+            for failure, event, message in (
+                ("endpoint", "SessionStart", "socket identity check failed"),
+                ("wrong-thread", "SessionStart", "metadata identity mismatch"),
+                ("ancestry", "SubagentStart", "source chain does not reach pane root"),
+            ):
+                with self.subTest(version=version, failure=failure):
+                    result, diagnostic = self._run_gateway(failure, version, event)
+                    self.assertEqual(result, 2)
+                    self.assertIn(message, diagnostic)
+            for ownership in (False, "foreign"):
+                with self.subTest(version=version, failure="ownership", marker=ownership):
+                    result, diagnostic = self._run_gateway(None, version, owned=ownership)
+                    self.assertEqual(result, 2)
+                    self.assertIn("missing or ambiguous owned main binding", diagnostic)
+
+    def test_compatible_handshakes_reach_observer_start(self):
+        for version in ("codex-tui/0.170.0", "codex-tui/0.171.0", "codex-tui/99.0.0",
+                        "unfamiliar agent", None):
+            with self.subTest(version=version):
+                result, diagnostic = self._run_gateway("success", version, expect_success=True)
+                self.assertEqual(result, 0, diagnostic)
 
 
 if __name__ == "__main__":

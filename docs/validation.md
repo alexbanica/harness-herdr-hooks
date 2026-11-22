@@ -147,6 +147,22 @@ qualification remains outstanding. Existing predecessor OpenCode/macOS and
 other native qualification gaps remain independent. No result here establishes
 full native compatibility.
 
+## Codex adapter compatibility
+
+The approved Codex adapter compatibility change was checked with 23 focused
+tests and 275 full-suite tests. Both suites and `git diff --check` passed.
+The fixtures exercised Codex 0.170.0, 0.171.0, and future or unknown release metadata.
+
+The parent performed a read-only host-access probe using the isolated real
+adapter with the existing installed manifest and socket. It verified app-server
+0.171.0 initialization, `thread/loaded/list`, and a metadata-only
+`thread/read` whose returned thread ID matched the selected loaded ID. The default sandbox denied access to the endpoint, so the probe used host
+access. It reported the daemon release and ID match without emitting thread
+contents. The earlier Codex 0.170.0 runtime observations are recorded above.
+
+Live pane attachment remains unverified. The earlier shared-daemon investigation
+found missing pane markers and missing native pane session references.
+
 ## HHH-005 named subagent tabs
 
 This evidence applies to the integrated HHH-005 implementation under approved
