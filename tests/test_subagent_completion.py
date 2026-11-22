@@ -16,7 +16,7 @@ from harness_herdr_hooks.state import StateStore, save_binding
 from harness_herdr_hooks.model import parent_to_dict, session_to_dict
 
 
-def _real_close_chain(root, exited=False, mutation=None):
+def _real_close_chain(root, exited=False, mutation=None, managed=False, retain_user=False, pause_events=None):
     """Child-process target: exercise NativeRuntime.close_owned_pane end to end."""
     parent, context = fixtures()
     store = StateStore(Path(root), "real-close")
@@ -38,31 +38,79 @@ def _real_close_chain(root, exited=False, mutation=None):
     proxy.turns = [{"id": "t1", "status": "inProgress", "itemsView": "notLoaded", "items": []}]
     coordinator.handle(parent, child)
     binding = runtime.attached[0][1]
-    save_binding(Path(root), binding, {"parent": parent_to_dict(parent),
+    binding_record = {"parent": parent_to_dict(parent),
         "child": session_to_dict(child), "pane_id": "p1", "backend_pid": None,
         "server_socket": "/tmp/codex.sock", "entrypoint": "/bin/true",
         "shell_pid": None, "ownership": "created", "kind": "subagent",
-        "generation": "t1", "turn_id": "t1"})
+        "generation": "t1", "turn_id": "t1"}
+    if managed:
+        from harness_herdr_hooks.model import destination_to_dict
+        from harness_herdr_hooks.tabs import SubagentTabManager
+        manager = SubagentTabManager(store, parent.context, "server", "w1",
+                                     _workspace_anchor=Path(root) / "canonical")
+        class CreateClient:
+            def create_subagent_tab(self, _workspace, _cwd, label, env=None):
+                return "managed-tab", "p1"
+        with manager.operations() as token:
+            destination = manager.select_create(token, CreateClient(), Path("/tmp"), "Root", "parent", "root-gen")
+            destination = manager.bind_child(token, destination, child_pane_id="p1")
+        binding_record["destination"] = destination_to_dict(destination)
+    save_binding(Path(root), binding, binding_record)
+    if managed:
+        from harness_herdr_hooks.attach import binding_tab_id
+        if binding_tab_id(Path(root), binding_record, parent) != "managed-tab":
+            raise AssertionError("managed binding destination did not validate")
     class Herdr:
         socket_path = Path("/tmp/codex.sock")
         closed = False
+        def server_identity(self):
+            return "server"
         def process_info(self, _pane):
             return {"foreground_processes": [] if exited else [{"pid": live_pid, "name": "codex", "cwd": "/tmp"}],
                     **({"tty": "/dev/pts/test"} if exited else {})}
         def snapshot(self):
             if mutation == "generation": store.begin_generation(context.key(), "t2", turn_id="t2")
             elif mutation == "suppressed": store.mark_suppressed(context.key(), "manual close observed")
-            return {"panes": [{"pane_id": "p1", "workspace_id": "w1", "tab_id": "w1:t1", "agent_session": {}}]}
-        def close(self, _pane): self.closed = True
+            if managed:
+                return {"tabs": list(self.tabs), "panes": list(self.panes)}
+            return {"tabs": [], "panes": [{"pane_id": "p1", "workspace_id": "w1",
+                                           "tab_id": "w1:t1", "agent_session": {}}]}
+        def close(self, pane):
+            if pause_events is not None:
+                pause_events[0].set()
+                if not pause_events[1].wait(4):
+                    raise AssertionError("managed close pause was not released")
+            self.closed = pane
+            if managed:
+                self.panes = [p for p in getattr(self, "panes", []) if p.get("pane_id") != pane]
+                if not retain_user:
+                    self.tabs = []
     herdr = Herdr()
+    herdr.panes = []
+    herdr.tabs = []
+    if managed:
+        # The live transport view includes the exact managed child reference;
+        # the optional user pane is deliberately an unrelated occupant.
+        herdr.panes = [{"pane_id": "p1", "workspace_id": "w1", "tab_id": "managed-tab",
+                        "agent_session": {"kind": "id", "value": "child"}}]
+        if retain_user:
+            herdr.panes.append({"pane_id": "user-pane", "workspace_id": "w1",
+                                "tab_id": "managed-tab", "agent_session": None})
+        herdr.tabs = [{"tab_id": "managed-tab", "workspace_id": "w1",
+                       "title": "Subagents: Root [parent]"}]
     native = NativeRuntime(store, provider, herdr, Path("/bin/true"), state_root=Path(root))
     native.verify_parent = lambda _parent: True
+    if managed:
+        provider.context = parent.context
+        provider.main_metadata = lambda _parent: (parent.context, "Root")
     native.owned_pane_state = lambda *_args: "live"
     native._process_matches = lambda *_args: True
     with patch("harness_herdr_hooks.coordinator.matches_agent_session_ref", return_value=True), \
          patch("harness_herdr_hooks.herdr._codex_proc_proof",
                return_value=SimpleNamespace(pid=live_pid, start_ticks=live_start_ticks, uid=os.getuid(),
-                                            executable=Path("/usr/bin/codex"), cwd=Path("/tmp"))):
+                                            executable=Path("/usr/bin/codex"), cwd=Path("/tmp"))), \
+         patch("harness_herdr_hooks.tabs._resolve_workspace_anchor",
+               return_value=Path(root) / "canonical"):
         coordinator.runtime = native
         provider.status = {"type": "idle"}
         proxy.turns = [{"id": "t1", "status": "completed", "itemsView": "notLoaded", "items": []}]
@@ -74,6 +122,21 @@ def _real_close_chain(root, exited=False, mutation=None):
         raise AssertionError("real NativeRuntime close path did not close pane")
     if mutation is not None and herdr.closed:
         raise AssertionError(f"NativeRuntime closed after final snapshot {mutation} mutation")
+    if managed and mutation is None:
+        if herdr.closed != "p1":
+            raise AssertionError("managed cleanup did not close only the owned child pane")
+        with manager.workspace_store.locked() as data:
+            entries = [v for v in data.get("subagent_tabs", {}).get("reservations", {}).values()
+                       if v.get("root_key") == manager.root_key]
+        with manager.root_store.locked() as data:
+            claim = data.get("subagent_tab", {})
+        if retain_user:
+            if not any(p.get("pane_id") == "user-pane" for p in herdr.panes):
+                raise AssertionError("managed cleanup removed the retained user pane")
+            if claim.get("status") != "created" or not entries or entries[0].get("status") == "released":
+                raise AssertionError("user occupancy did not retain the managed claim and label")
+        elif herdr.tabs or claim.get("status") != "removed" or not entries or entries[0].get("status") != "released":
+            raise AssertionError("empty managed tab cleanup did not remove claim and release label")
 
 
 def _advance_generation_during_close(root):
@@ -102,6 +165,31 @@ def _advance_generation_during_close(root):
     record = store.record(key)
     if record.get("generation") != "t2" or record.get("cleanup", {}).get("outcome") == "closed":
         raise AssertionError("stale terminal cleanup overwrote new generation")
+
+
+def _compete_for_managed_tab(root, busy_seen, continue_event, result):
+    """Try operations in another process while managed cleanup owns both locks."""
+    from harness_herdr_hooks.tabs import OperationBusy, SubagentTabManager
+    parent, _context = fixtures()
+    store = StateStore(Path(root), "real-close")
+    manager = SubagentTabManager(store, parent.context, "server", "w1",
+                                 _workspace_anchor=Path(root) / "canonical")
+    try:
+        with manager.operations():
+            result.put("unexpectedly-acquired-during-cleanup")
+            return
+    except OperationBusy:
+        busy_seen.set()
+    if not continue_event.wait(4):
+        result.put("competitor-timeout")
+        return
+    class CreateClient:
+        def create_subagent_tab(self, _workspace, _cwd, _label, env=None):
+            return "managed-tab-next", "pane-next"
+    with manager.operations() as token:
+        destination = manager.select_create(token, CreateClient(), Path("/tmp"),
+                                            "Root", "parent", "root-next")
+    result.put((destination.tab_id, destination.generation))
 
 
 class FakeProxy:
@@ -245,6 +333,57 @@ class CompletionTests(unittest.TestCase):
                     process.join(2)
                     self.fail(f"NativeRuntime {mutation} revalidation exceeded watchdog")
                 self.assertEqual(process.exitcode, 0)
+
+    def test_real_managed_close_removes_empty_claim_and_releases_label(self):
+        ctx = multiprocessing.get_context("fork")
+        process = ctx.Process(target=_real_close_chain, args=(self.tmp.name, False, None, True, False))
+        process.start(); process.join(4)
+        if process.is_alive():
+            process.terminate(); process.join(2)
+            self.fail("managed NativeRuntime close exceeded watchdog")
+        self.assertEqual(process.exitcode, 0)
+
+    def test_real_managed_close_preserves_user_occupied_tab(self):
+        ctx = multiprocessing.get_context("fork")
+        process = ctx.Process(target=_real_close_chain, args=(self.tmp.name, False, None, True, True))
+        process.start(); process.join(4)
+        if process.is_alive():
+            process.terminate(); process.join(2)
+            self.fail("occupied managed NativeRuntime close exceeded watchdog")
+        self.assertEqual(process.exitcode, 0)
+
+    def test_managed_cleanup_serializes_cross_process_create(self):
+        ctx = multiprocessing.get_context("fork")
+        cleanup_entered, release_cleanup = ctx.Event(), ctx.Event()
+        busy_seen, continue_competitor = ctx.Event(), ctx.Event()
+        results = ctx.Queue()
+        closer = ctx.Process(target=_real_close_chain,
+                             args=(self.tmp.name, False, None, True, False,
+                                   (cleanup_entered, release_cleanup)))
+        closer.start()
+        competitor = None
+        try:
+            self.assertTrue(cleanup_entered.wait(3), "managed cleanup did not reach the close while holding operation locks")
+            competitor = ctx.Process(target=_compete_for_managed_tab,
+                                     args=(self.tmp.name, busy_seen, continue_competitor, results))
+            competitor.start()
+            self.assertTrue(busy_seen.wait(3), "concurrent process acquired the managed operation lock")
+            release_cleanup.set()
+            closer.join(3)
+            self.assertFalse(closer.is_alive(), "managed cleanup exceeded watchdog")
+            self.assertEqual(closer.exitcode, 0)
+            continue_competitor.set()
+            competitor.join(3)
+            self.assertFalse(competitor.is_alive(), "post-cleanup create exceeded watchdog")
+            self.assertEqual(competitor.exitcode, 0)
+            self.assertEqual(results.get(timeout=1), ("managed-tab-next", "root-next"))
+        finally:
+            release_cleanup.set()
+            continue_competitor.set()
+            for process in (closer, competitor):
+                if process is not None and process.is_alive():
+                    process.terminate()
+                    process.join(1)
 
     def test_successful_close_is_monotonic_across_repeated_terminal_polls(self):
         self.proxy.turns = [self.turn("t1", "inProgress")]

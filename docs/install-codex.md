@@ -39,9 +39,15 @@ or replace a conflicting path by guesswork.
 
 ## Runtime prerequisites and limits
 
-The qualification target is Codex CLI and running app-server 0.170.0, Herdr
-0.9.5 / protocol 22, Python 3.11+, POSIX `sh`, and the selected Codex
-executable in `PATH`. Codex may use its verified selected-profile shared
+Codex eligibility is based on the verified app-server interface required by
+each operation. The adapter requires a successful
+WebSocket handshake and initialization, the expected selected-profile identity,
+and valid required methods and response fields. Extra response fields are
+allowed. Missing or unfamiliar release metadata is diagnostic only when the
+required interface and identity checks pass. Codex 0.170.0 is an earlier
+observed release. Codex 0.171.0 passed current fixture and read-only daemon checks. Herdr 0.9.5 / protocol 22,
+Python 3.11+, POSIX `sh`, and the selected Codex executable in `PATH` remain
+prerequisites. Codex may use its verified selected-profile shared
 default daemon or an explicit foreground Unix endpoint such as
 `codex --remote unix:///absolute/path/to/codex.sock` (also
 `--remote=unix:///absolute/path/to/codex.sock`). Explicit `--remote unix://`
@@ -72,6 +78,12 @@ same-thread/subagent attachment, no-added-turn behavior, terminal cleanup,
 client exit to a usable shell, and current-revision runtime loading remain
 unverified. See
 [validation](validation.md) and [troubleshooting](troubleshooting.md).
+
+When an app-server transport, required method, or required response contract
+fails, the adapter reports a concise stage and method reason and includes the
+daemon release when available. These diagnostics exclude credentials,
+transcript content, and raw response dumps. Shared-daemon pane attachment
+requires a valid pane marker and native session reference.
 
 The adapter routes supported ordinary interactive `codex` shell commands from
 a verified Herdr parent. It starts the native CLI once in an unfocused pane in
@@ -120,3 +132,20 @@ after completion or client exit. No prompt is added. See
 
 Task status retains meaningful recognition, verification and attachment outcomes
 separately from `current_health`; see [contracts](contracts.md).
+
+## Subagent tab placement
+
+New eligible native subagents share one lazy, unfocused managed Herdr tab per
+verified main session; nested children join that tab. Its label follows the
+main session title and short ID, while child titles continue to name their
+panes. Existing panes are not migrated. Root-specific records remain in the
+selected integration state root; workspace tab-operation and label coordination
+uses the canonical per-UID account-home `.local/state` anchor described in
+[isolation](isolation.md). Unsafe or symlinked anchor paths fail closed rather
+than falling back to profile-local coordination.
+
+Implementation and isolated validation are complete, but native subagent
+attachment and grouping have not been qualified. The current Codex profile
+still needs the user's normal hook trust/reload step. A targeted Herdr 0.9.5 /
+protocol 22 tab-operation observation is not native Codex attachment evidence;
+see [validation](validation.md).

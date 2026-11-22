@@ -103,6 +103,7 @@ class StandaloneShellTests(unittest.TestCase):
         runtime.state_root = Path("/tmp/state")
         runtime.entrypoint = Path("/tmp/harness-herdr-hooks")
         runtime.backend_pid = None
+        runtime.provider = SimpleNamespace()
         runtime.herdr = SimpleNamespace(socket_path=Path("/tmp/socket"), rename=lambda *_: None,
                                         safe_label=lambda *args: "standalone")
         runtime.can_attach_now = lambda *_: True
@@ -124,9 +125,9 @@ class StandaloneShellTests(unittest.TestCase):
              patch("harness_herdr_hooks.coordinator.save_binding"), \
              patch("harness_herdr_hooks.coordinator.update_binding_outcome"), \
              patch("harness_herdr_hooks.attach.attach_in_new_pane", side_effect=attach):
-            for child in children:
-                self.assertTrue(runtime.open_and_attach(parent, child, "binding"))
-        self.assertEqual(calls, [True, False])
+            self.assertTrue(runtime.open_and_attach(parent, children[0], "standalone-binding"))
+            self.assertFalse(runtime.open_and_attach(parent, children[1], "metadata-less-native-binding"))
+        self.assertEqual(calls, [True])
 
 
 if __name__ == "__main__":

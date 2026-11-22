@@ -22,11 +22,19 @@ loading, or complete pane attachment support.
   that revision. A native thread `notLoaded` response or missing items alone
   is not terminal evidence; it can participate only with successful status
   evidence plus exact matching terminal-turn metadata and no newer running work.
-  Verify Codex CLI and running app-server 0.170.0, Herdr 0.9.5/protocol
-  22, and exact selected profile/backend binding. The verified default daemon
-  and explicit Unix endpoints are supported; `--no-daemon` and ambiguous modes
-  fail closed. Outside-Herdr events remain silent. Do not bypass trust or change
+  Verify the required app-server interface and exact selected profile/backend
+  binding, plus Herdr 0.9.5/protocol 22. Eligibility depends on successful
+  initialization, identity, required methods, and valid required response
+  fields. If a required step
+  fails, use the concise diagnostic's stage and method to identify the failed
+  contract. The observed daemon release is included when available. A reported
+  release is diagnostic metadata. Supported endpoints are the verified default
+  daemon and verified explicit Unix sockets. Outside-Herdr events remain silent. Do not bypass trust or change
   socket permissions.
+- **Codex app-server method or response is incompatible:** the bounded error
+  identifies the failing transport, initialization, method, or response stage
+  and names the requested method, with the daemon release when available. It
+  omits credentials, transcript content, and raw response dumps.
 - **Ordinary `codex` command does not route:** the parent must load the selected
   profile's concrete `shell_environment_policy.set.PATH` after installation.
   Absolute executable paths, deliberate PATH overrides, informational/tooling
@@ -94,3 +102,37 @@ Codex session ID is an identity mismatch; do not compensate with a different
 profile, task, or pane or restart the shared daemon. Keep any retained
 installation source in place until an explicitly authorized replacement is
 installed and verified. See [validation](validation.md).
+
+## HHH-005 subagent tabs
+
+- **No subagent tab appears:** creation is lazy; there must be a newly eligible,
+  running, attachable child under a verified Herdr main session. Existing or
+  finished children are not backfilled. Check the bounded status diagnostic
+  and selected harness/profile/server binding. Missing or ambiguous ancestry
+  fails closed.
+- **Nested child appears elsewhere or no tab is reused:** only verified native
+  ancestry and the persisted root association establish sharing. Titles, cwd,
+  short IDs and inherited environment do not. Do not rename or adopt a tab to
+  repair an identity mismatch; inspect the reported root/server/workspace and
+  association state.
+- **Tab label is generic or changed:** before root title metadata arrives, the
+  harness name is used. Root title changes update a still-owned tab; child
+  title changes affect only the pane. The label is sanitized and bounded, and
+  its displayed ID may expand to resolve collisions. A manual label does not
+  establish ownership.
+- **An empty tab remains:** the integration closes only a positively owned tab
+  whose contents are verified empty. Unknown ownership or contents fail
+  closed. Retained OpenCode child panes and user-added panes keep a tab open.
+  Removing the final pane manually is supported; a later genuinely new child
+  may create a new tab, while duplicate events for already removed displays
+  stay suppressed.
+- **Workspace coordination reports an unsafe anchor:** the canonical per-UID
+  `.local/state` anchor is resolved from the OS account record and rejects
+  symlinks, wrong ownership, unsafe permissions, or unsafe path components. It
+  deliberately does not fall back to profile-specific coordination. Correct
+  the account-home path through normal system administration; do not override
+  it with `HOME`, XDG, or another profile variable.
+- **Native behavior is uncertain:** isolated tests and targeted Herdr protocol
+  operations do not prove native Codex/OpenCode attachment or grouping. Current
+  Codex hook trust/reload remains user-owned; OpenCode native qualification
+  was unavailable. Do not infer native support from successful installation.

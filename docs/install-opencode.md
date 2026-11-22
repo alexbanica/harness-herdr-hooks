@@ -71,3 +71,18 @@ Uninstall removes only the manifest-matched symlink and ownership manifest. It
 does not remove session state, close panes, or stop agents. Retained state is
 used to support recovery and is not evidence that an integration remains
 registered.
+
+## Subagent tab placement
+
+New eligible native subagents share one lazy, unfocused managed Herdr tab per
+verified main session; nested children join that tab. The root title and short
+ID name the tab, and child titles name their panes. OpenCode retains its
+pre-existing post-attachment pane lifetime: empty-tab cleanup does not add
+completion-based child cleanup. Existing panes are not migrated.
+
+Workspace tab-operation coordination uses a canonical private per-UID anchor
+under the account home `.local/state`; it does not follow the selected
+`OPENCODE_CONFIG_DIR` or fall back to profile-local state. See
+[isolation](isolation.md). Native OpenCode subagent attachment/grouping
+qualification was unavailable, so installation and isolated tests do not prove
+native plugin loading or tab behavior; see [validation](validation.md).

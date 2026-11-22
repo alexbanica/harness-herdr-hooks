@@ -30,6 +30,7 @@ class RuntimeStatusTests(unittest.TestCase):
         self.assertEqual(cli._runtime_status(self.root, str(self.profile)), {
             "native_hook_loading": "unknown", "last_verified_binding": "unknown", "observer": "unknown",
             "task_discovery": {"recognition": "unknown", "verification": "unknown", "attachment": "unknown"},
+            "subagent_tab": {"state": "unknown", "identity": {}, "reason": "context_unavailable"},
             "attachment": {"known": False, "observed_counts": {}},
             "cleanup": {"known": False, "outcomes": {}}, "ownership": {"known": False, "counts": {}},
         })
@@ -108,6 +109,40 @@ class RuntimeStatusTests(unittest.TestCase):
         self.assertEqual(record["hook"]["backend_instance"], "backend-instance")
         self.assertNotIn("payload", record)
         self.assertNotIn("argv", record)
+
+    def test_subagent_tab_status_reads_existing_root_state_and_whitelists_fields(self):
+        cli._record_hook(self.root, self.parent)
+        digest=__import__("hashlib").sha256(json.dumps(
+            [self.parent.context.key(),self.parent.herdr_server_id,self.parent.workspace_id],
+            sort_keys=True,separators=(",", ":")).encode()).hexdigest()
+        directory=self.root/"harness-herdr-hooks"/f"tabs-root-{digest[:32]}"
+        directory.mkdir(mode=0o700,parents=True)
+        path=directory/"state.json"
+        path.write_text(json.dumps({"schema":2,"subagent_tab":{
+            "status":"created","label":"Subagents: demo","generation":"gen-1",
+            "tab_id":"tab-1","initial_pane_id":"pane-1","private":"secret"}}))
+        os.chmod(path,0o600)
+        self.assertEqual(cli._runtime_status(self.root,str(self.profile))["subagent_tab"],{
+            "state":"created","identity":{"label":"Subagents: demo","generation":"gen-1",
+            "tab_id":"tab-1","initial_pane_id":"pane-1"}})
+
+    def test_subagent_tab_status_rejects_bad_context_and_unsafe_files(self):
+        cli._runtime_write(self.root,str(self.profile),lambda d:d.update(hook={
+            "observed":True,"context_key":"bad","server_id":"server-id","workspace_id":"workspace"}))
+        self.assertEqual(cli._runtime_status(self.root,str(self.profile))["subagent_tab"],{
+            "state":"unknown","identity":{},"reason":"context_unavailable"})
+        cli._runtime_write(self.root,str(self.profile),lambda d:d.update(hook={
+            "observed":True,"context_key":self.parent.context.key(),"server_id":"server-id",
+            "workspace_id":"workspace","backend":"codex","backend_instance":"backend-instance",
+            "pane_id":"pane","tab_id":"tab"}))
+        digest=__import__("hashlib").sha256(json.dumps(
+            [self.parent.context.key(),self.parent.herdr_server_id,self.parent.workspace_id],
+            sort_keys=True,separators=(",", ":")).encode()).hexdigest()
+        directory=self.root/"harness-herdr-hooks"/f"tabs-root-{digest[:32]}"
+        directory.mkdir(mode=0o700,parents=True)
+        path=directory/"state.json"; path.write_text("{}"); os.chmod(path,0o644)
+        self.assertEqual(cli._runtime_status(self.root,str(self.profile))["subagent_tab"],{
+            "state":"unknown","identity":{},"reason":"unsafe_state"})
 
     def test_synthetic_router_verification_does_not_claim_hook_observed(self):
         router = cli._HerdrLaunchRouter({"config_root": str(self.profile)})

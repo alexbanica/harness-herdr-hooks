@@ -186,6 +186,46 @@ class OpenCodeRuntimeAdapter:
     def _get_session(self, session_id: str) -> dict[str, Any]:
         return self._record(self._get("/session/" + urllib.parse.quote(session_id, safe="")), session_id)
 
+    def main_metadata(self, parent: Any) -> tuple[Context, str | None]:
+        """Resolve the OpenCode root conversation using only its parent chain."""
+        context = getattr(parent, "context", None)
+        if not isinstance(context, Context) or not self._same_provider(context):
+            raise ValueError("OpenCode parent context does not match selected backend")
+        current_id = context.session_id
+        seen: set[str] = set()
+        for depth in range(33):
+            if current_id in seen:
+                raise ValueError("OpenCode conversation ancestry contains a cycle")
+            seen.add(current_id)
+            # Read the native record directly so absent or malformed titles are
+            # metadata gaps, while malformed identity/ancestry still fails closed.
+            row = self._get("/session/" + urllib.parse.quote(current_id, safe=""))
+            if not isinstance(row, dict) or row.get("id") != current_id:
+                raise ValueError("OpenCode returned a different conversation")
+            parent_id = row.get("parentID")
+            if parent_id is None or parent_id == "":
+                title = row.get("title")
+                return (Context(Harness.OPENCODE, context.profile, context.config_root,
+                                context.data_root, context.state_root, context.backend_id,
+                                current_id, context.backend_instance),
+                        title.strip() or None if isinstance(title, str) else None)
+            if not isinstance(parent_id, str):
+                raise ValueError("OpenCode conversation ancestry is malformed")
+            if depth == 32:
+                raise ValueError("OpenCode conversation ancestry exceeds 32 hops")
+            current_id = parent_id
+        raise ValueError("OpenCode conversation ancestry is invalid")
+
+    def _same_provider(self, context: Context) -> bool:
+        selected = self.context
+        return (context.harness == Harness.OPENCODE
+                and context.profile == selected.profile
+                and context.config_root.resolve() == selected.config_root.resolve()
+                and context.data_root.resolve() == selected.data_root.resolve()
+                and context.state_root.resolve() == selected.state_root.resolve()
+                and context.backend_id == selected.backend_id
+                and context.backend_instance == selected.backend_instance)
+
     @staticmethod
     def _status(value: Any) -> str | None:
         if not isinstance(value, dict):
