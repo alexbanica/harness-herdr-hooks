@@ -23,16 +23,15 @@ class HookTests(unittest.TestCase):
                           verified_backend_id="/tmp/backend.sock", verified_backend_instance="1:2:3")
 
     def test_child_identity_and_additional_fields_are_preserved_safely(self):
-        event = self.parse(hook(secret_message="ignored", future_field={"ignored": True}))
-        self.assertEqual(event.identity.session_id, "child-1")
-        self.assertEqual(event.agent_id, "child-1")
-        self.assertEqual(event.turn_id, "turn-1")
+        event = self.parse({"hook_event_name":"SessionStart", "session_id":"thread",
+                            "cwd":"/tmp", "transcript_path":None,
+                            "secret_message":"ignored", "future_field":{"ignored":True}})
+        self.assertEqual(event.identity.session_id, "thread")
         self.assertFalse(hasattr(event, "secret_message"))
 
     def test_stop_and_session_start_shapes(self):
-        stop = self.parse(hook("SubagentStop", stop_hook_active=True, last_assistant_message="ignored"))
-        self.assertEqual(stop.event_name, "SubagentStop")
-        self.assertTrue(stop.stop_hook_active)  # continuation hint, never terminal authority
+        with self.assertRaisesRegex(ValueError, "unsupported"):
+            self.parse(hook("SubagentStop", stop_hook_active=True, last_assistant_message="ignored"))
         start = self.parse({"hook_event_name": "SessionStart", "session_id": "parent",
                             "transcript_path": None, "cwd": "/tmp", "new_native_field": 1})
         self.assertEqual(start.identity.session_id, "parent")
@@ -48,6 +47,11 @@ class HookTests(unittest.TestCase):
             self.parse(hook("SubagentStart", agent_id="parent-session"))
         with self.assertRaises(ValueError):
             self.parse(hook("SubagentStop", stop_hook_active="false"))
+
+    def test_legacy_subagent_events_are_rejected(self):
+        for name in ("SubagentStart", "SubagentStop"):
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "unsupported"):
+                self.parse(hook(name, stop_hook_active=(name == "SubagentStop")))
 
     def test_initialize_accepts_known_future_unknown_and_missing_versions(self):
         for agent, expected in (
@@ -88,15 +92,6 @@ class HookTests(unittest.TestCase):
                                      "itemsView": "full", "items": [{"text": "private"}]}]}])
         with self.assertRaises(RuntimeError):
             list_turn_metadata(proxy, "child")
-
-    def test_ancestry_accepts_extra_metadata_but_requires_native_parent(self):
-        rows = {
-            "child": {"parentThreadId": "parent", "source": {"future": 1, "subAgent": {
-                "other": 2, "thread_spawn": {"parent_thread_id": "parent", "future": 3}}}},
-        }
-        self.assertEqual(CodexRuntimeAdapter._verified_chain("child", rows, "parent"), ("parent",))
-        rows["child"]["source"]["subAgent"]["thread_spawn"]["parent_thread_id"] = "other"
-        self.assertIsNone(CodexRuntimeAdapter._verified_chain("child", rows, "parent"))
 
 
 class FakeProxy:

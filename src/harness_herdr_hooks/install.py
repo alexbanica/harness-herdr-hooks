@@ -215,7 +215,7 @@ def _codex_install(root:Path,source_root:Path,manifest:dict[str,Any],manifest_pr
     handlers={}
     command=shlex.quote(str(source))+" codex-hook"
     handler={"type":"command","command":command,"timeout":5,"async":True}
-    for event in ("SessionStart","SubagentStart","SubagentStop"):
+    for event in ("SessionStart",):
         groups=_groups(data,event); owned=(entry or {}).get("handlers",{}).get(event)
         if entry:
             matches=_handler_locations(groups,owned) if isinstance(owned,dict) else []
@@ -226,6 +226,19 @@ def _codex_install(root:Path,source_root:Path,manifest:dict[str,Any],manifest_pr
                 if not groups[gi]["hooks"] and set(groups[gi])=={"hooks"}: groups.pop(gi)
         if any(_group_has_command(g,command) for g in groups): raise InstallError(f"unmanaged Codex handler conflicts for {event}")
         groups.append({"hooks":[handler]}); handlers[event]=handler
+    # Retire only legacy handlers recorded by our ownership manifest. A user
+    # entry that happens to invoke the same binary is independent configuration.
+    for event in ("SubagentStart", "SubagentStop"):
+        owned=(entry or {}).get("handlers",{}).get(event)
+        if owned is None:
+            continue
+        groups=_groups(data,event)
+        matches=_handler_locations(groups,owned) if isinstance(owned,dict) else []
+        if len(matches)!=1:
+            raise InstallError(f"managed Codex registration changed or is ambiguous for {event}; preserving it")
+        gi,hi=matches[0]; groups[gi]["hooks"].pop(hi)
+        if not groups[gi]["hooks"] and set(groups[gi])=={"hooks"}: groups.pop(gi)
+        if not groups: data["hooks"].pop(event, None)
     hooks_after=(json.dumps(data,indent=2,sort_keys=True)+"\n").encode()
     # Preflight the native config and PATH calculation without publishing it.
     try:
@@ -363,23 +376,7 @@ def install(harness:str,*,source_root:Path,config_dir:str|None=None)->dict[str,s
             source=source_root/"bin/harness-herdr-hooks"
             if not source.is_file(): raise InstallError(f"entrypoint is missing: {source}")
             return _codex_install(root,source_root,manifest,manifest_pre)
-        if harness!="opencode": raise InstallError("unsupported harness")
-        source=source_root/"integrations/opencode/plugin.js"
-        if not source.is_file(): raise InstallError(f"plugin source is missing: {source}")
-        destination=root/"plugins/harness-herdr-hooks.js"; old=manifest["entries"].get("opencode")
-        destination.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
-        if destination.is_symlink():
-            current=str(destination.resolve())
-            if old is None: raise InstallError(f"unmanaged plugin symlink conflict: {destination}")
-            if current!=old.get("source") or str(destination)!=old.get("destination"): raise InstallError(f"managed plugin changed; preserving: {destination}")
-            if current!=str(source):
-                tmp=destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
-                if tmp.exists() or tmp.is_symlink(): raise InstallError("temporary plugin link path already exists")
-                tmp.symlink_to(source); os.replace(tmp,destination)
-        elif destination.exists(): raise InstallError(f"unmanaged plugin path conflict: {destination}")
-        else: destination.symlink_to(source)
-        manifest["entries"]["opencode"]={"source":str(source),"destination":str(destination)}; _write_manifest(root,manifest)
-        return {"harness":harness,"config_root":str(root),"plugin":str(destination),"source":str(source),"action":"linked" if not old or old.get("source")!=str(source) else "already-linked"}
+        raise InstallError("OpenCode installation is retired; use the ownership-checked uninstall for an existing link")
 
 def status(harness:str,*,config_dir:str|None=None)->dict[str,str]:
     root=_root(config_dir,harness)

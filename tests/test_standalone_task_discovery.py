@@ -71,12 +71,10 @@ class StandaloneDiscoveryTests(unittest.TestCase):
             self.assertEqual(first_state['cursor']['offset'], parent_file.stat().st_size)
             self.assertEqual(len({item['item_id'] for item in first_state['pending']}), 128)
             self.assertEqual(first_state['outcomes'][-1]['child_id'], 'bounded-overflow')
-            from harness_herdr_hooks.cli import _runtime_status
-            task = _runtime_status(state_root, str(profile))['task_discovery']
-            self.assertEqual(task['reason'], 'pending_limit')
-            self.assertEqual(task['current_health'],
-                             {'state': 'deferred', 'reason': 'pending_limit'})
-            self.assertNotIn('content', json.dumps(task))
+            # The retained evidence is the bounded discovery cursor and outcome,
+            # not a user-facing runtime status projection.
+            self.assertEqual(first_state['outcomes'][-1]['status'], 'rejected')
+            self.assertNotIn('content', json.dumps(first_state))
 
             restarted = adapter()
             self.assertEqual(len(list(restarted.sessions(parent))), 128)
@@ -267,12 +265,9 @@ class StandaloneDiscoveryTests(unittest.TestCase):
                 if mode == "provider":
                     adapter._read_thread = lambda _ident: (_ for _ in ()).throw(OSError("private provider detail"))
                 list(adapter.sessions(parent))
-                from harness_herdr_hooks.cli import _runtime_status
-                task = _runtime_status(root / "state", str(profile))["task_discovery"]
-                self.assertEqual(task["recognition"], "unknown")
-                self.assertEqual(task["reason"], expected)
-                self.assertEqual(task["current_health"], {"state": "deferred", "reason": expected})
-                self.assertNotIn("private provider detail", json.dumps(task))
+                discovery = StateStore(root / "state", context.key()[:32]).task_discovery()
+                self.assertEqual(discovery["pending"], [])
+                self.assertEqual(discovery["outcomes"], [])
 
     def test_missing_native_cwd_defers_and_relative_native_cwd_rejects_candidate(self):
         for cwd in (None, 'relative/work'):
@@ -484,10 +479,6 @@ class StandaloneDiscoveryTests(unittest.TestCase):
             store = StateStore(root / 'state', context.key()[:32])
             self.assertEqual(store.task_discovery()['pending'], [])
             self.assertEqual(store.task_discovery()['outcomes'][-1]['status'], 'rejected')
-            from harness_herdr_hooks.cli import _runtime_status
-            task = _runtime_status(root / 'state', str(profile))['task_discovery']
-            self.assertEqual(task['current_health'], {'state': 'deferred', 'reason': 'retry_exhausted'})
-            self.assertEqual(task['verification'], 'rejected')
 
     def test_invalid_cwd_and_creation_cwd_mismatch_publish_fixed_reasons(self):
         for native_cwd, creation_cwd, expected in (('relative/work', None, 'invalid_cwd'),
@@ -510,35 +501,25 @@ class StandaloneDiscoveryTests(unittest.TestCase):
                         {'threadId': 'standalone', 'cwd': creation_cwd})
                 with parent_file.open('a') as out: out.write(json.dumps(record) + '\n')
                 self.assertEqual(list(adapter.sessions(parent)), [])
-                from harness_herdr_hooks.cli import _runtime_status
-                task = _runtime_status(root / 'state', str(profile))['task_discovery']
-                self.assertEqual(task['reason'], expected)
-                self.assertEqual(task['current_health'], {'state': 'deferred', 'reason': expected})
+                discovery = StateStore(root / 'state', context.key()[:32]).task_discovery()
+                self.assertEqual(discovery['pending'], [])
+                self.assertEqual(discovery['outcomes'][-1]['status'], 'rejected')
 
     def test_attached_replay_empty_poll_and_file_failure_preserve_history(self):
         with tempfile.TemporaryDirectory() as tmp:
-            context, parent, original, adapter, _proxy, _store, _runtime, _coordinator = \
+            context, parent, original, adapter, _proxy, store, _runtime, _coordinator = \
                 self._attached_replay_fixture(tmp)
-            from harness_herdr_hooks.cli import _runtime_status
-            adapter._standalone_status('recognized', 'verified', 'attached')
+            before = store.task_discovery()
             replay = list(adapter.sessions(parent))
             self.assertEqual(len(replay), 1)
             self.assertEqual(replay[0].context.session_id, original.context.session_id)
-            task = _runtime_status(adapter.task_store_root, context.profile)['task_discovery']
-            self.assertEqual((task['recognition'], task['verification'], task['attachment']),
-                             ('recognized', 'verified', 'attached'))
+            self.assertEqual(store.task_discovery(), before)
             adapter.proxy.rows['standalone']['status'] = {'type': 'completed'}
             self.assertEqual(list(adapter.sessions(parent)), [])
-            task = _runtime_status(adapter.task_store_root, context.profile)['task_discovery']
-            self.assertEqual((task['recognition'], task['verification'], task['attachment']),
-                             ('recognized', 'verified', 'attached'))
-            self.assertNotEqual(task.get('reason'), 'task_finished')
+            self.assertEqual(store.task_discovery(), before)
             parent.session_path.unlink()
             self.assertEqual(list(adapter.sessions(parent)), [])
-            task = _runtime_status(adapter.task_store_root, context.profile)['task_discovery']
-            self.assertEqual((task['recognition'], task['verification'], task['attachment']),
-                             ('recognized', 'verified', 'attached'))
-            self.assertEqual(task['current_health'], {'state': 'deferred', 'reason': 'parent_file_missing'})
+            self.assertEqual(store.task_discovery(), before)
 
     def test_established_candidate_deadline_ignores_later_wall_clock_jumps(self):
         for wall_delta in (10000, -500):

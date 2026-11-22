@@ -11,28 +11,6 @@
           }
         ]
       }
-    ],
-    "SubagentStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "@HARNESS_HERDR_HOOKS_ENTRYPOINT@ codex-hook",
-            "async": true
-          }
-        ]
-      }
-    ],
-    "SubagentStop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "@HARNESS_HERDR_HOOKS_ENTRYPOINT@ codex-hook",
-            "async": true
-          }
-        ]
-      }
     ]
   }
 }

@@ -2,14 +2,10 @@
 from __future__ import annotations
 import argparse, fcntl, hashlib, json, os, re, shutil, socket, stat, subprocess, sys, time
 import shlex
-import signal
-from dataclasses import replace
 from pathlib import Path
 from typing import Sequence
 from . import install as installer
 from .adapters.codex import parse_hook, CodexRuntimeAdapter
-from .adapters.opencode import OpenCodeAdapter, OpenCodeRuntimeAdapter
-from .attach import exec_binding
 from .coordinator import run_observer
 from .environment import child_environment
 from .herdr import HerdrClient, HerdrError, codex_backend_proof, codex_remote_socket
@@ -19,19 +15,6 @@ from .launch import LaunchStore, run_claimed_launch
 
 _RUNTIME_MAX_AGE=30*24*60*60
 _RUNTIME_MAX_BYTES=16384
-
-# This value belongs to the interpreter that imported this module.  A status
-# command compares it with the revision published by the long lived observer;
-# it never hashes source on disk and attributes that value to another process.
-try:
-    _PACKAGE_ROOT=Path(__file__).resolve(strict=True).parents[1]
-    _revision=hashlib.sha256()
-    for _source in sorted(_PACKAGE_ROOT.rglob("*.py")):
-        _revision.update(str(_source.relative_to(_PACKAGE_ROOT)).encode()+b"\0")
-        _revision.update(_source.read_bytes()+b"\0")
-    _LOADED_SOURCE_SHA256=_revision.hexdigest()
-except OSError:
-    _PACKAGE_ROOT=None; _LOADED_SOURCE_SHA256=None
 
 def _runtime_path(root:Path,profile:str)->Path:
     key=hashlib.sha256(str(Path(profile).resolve()).encode()).hexdigest()
@@ -63,7 +46,7 @@ def _runtime_write(root:Path,profile:str,mutate)->None:
         os.close(lockfd); raise ValueError("unsafe runtime state lock")
     fcntl.flock(lockfd,fcntl.LOCK_EX)
     try:
-        data=_runtime_read(path); data={k:v for k,v in data.items() if k in {"schema","updated","hook","observer","task_discovery","subagent_tab"}}
+        data=_runtime_read(path); data={k:v for k,v in data.items() if k in {"schema","updated","task_discovery"}}
         data.setdefault("schema",1); mutate(data); data["updated"]=time.time()
         raw=json.dumps(data,sort_keys=True,separators=(",",":" )).encode()
         if len(raw)>_RUNTIME_MAX_BYTES: raise ValueError("runtime evidence exceeds bound")
@@ -78,17 +61,8 @@ def _runtime_write(root:Path,profile:str,mutate)->None:
     finally:
         fcntl.flock(lockfd,fcntl.LOCK_UN); os.close(lockfd)
 
-def _record_hook(root:Path,parent:ParentBinding)->None:
-    def update(data):
-        data["hook"]={"observed":True,"backend":parent.context.harness.value,"backend_instance":parent.context.backend_instance,
-            "lifecycle_namespace":parent.context.key()[:32],
-            "context_key":parent.context.key(),
-            "server_id":parent.herdr_server_id,"pane_id":parent.pane_id,"tab_id":parent.tab_id,
-            "workspace_id":parent.workspace_id,"at":time.time()}
-    _runtime_write(root,str(parent.context.config_root),update)
-
 def _runtime_status(root:Path,profile:str)->dict:
-    data=_runtime_read(_runtime_path(root,profile)); hook=data.get("hook",{})
+    data=_runtime_read(_runtime_path(root,profile))
     task=data.get("task_discovery",{})
     if not isinstance(task,dict): task={}
     task_status={
@@ -107,119 +81,7 @@ def _runtime_status(root:Path,profile:str)->dict:
         current_health={"state":health["state"]}
         if health.get("reason") in reasons: current_health["reason"]=health["reason"]
         task_status["current_health"]=current_health
-    result={"native_hook_loading":"observed" if hook.get("observed") is True else "unknown",
-            "last_verified_binding":"unknown","observer":"unknown",
-            "task_discovery":task_status,
-            "subagent_tab":{"state":"unknown","identity":{},"reason":"context_unavailable"},
-            "attachment":{"known":False,"observed_counts":{}},
-            "cleanup":{"known":False,"outcomes":{}},"ownership":{"known":False,"counts":{}}}
-    if hook.get("observed") is True:
-        result["last_verified_binding"]={k:hook.get(k) for k in ("backend","backend_instance","server_id","pane_id","tab_id","workspace_id","at")}
-    # Read tab coordination evidence from its already existing root namespace.
-    # Status must not instantiate StateStore or resolve/create a workspace anchor.
-    context_key=hook.get("context_key"); server_id=hook.get("server_id"); workspace_id=hook.get("workspace_id")
-    if (isinstance(context_key,str) and re.fullmatch(r"[a-f0-9]{64}",context_key) and isinstance(server_id,str)
-            and server_id and len(server_id)<=512 and isinstance(workspace_id,str)
-            and workspace_id and len(workspace_id)<=512):
-        digest=hashlib.sha256(json.dumps([context_key,server_id,workspace_id],sort_keys=True,separators=(",", ":")).encode()).hexdigest()
-        tab_path=root/"harness-herdr-hooks"/f"tabs-root-{digest[:32]}"/"state.json"
-        tab_status={"state":"unknown","identity":{},"reason":"state_missing"}
-        try:
-            if tab_path.parent.is_symlink() or tab_path.is_symlink(): raise ValueError("unsafe_state")
-            fd=os.open(tab_path,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
-            try:
-                st=os.fstat(fd)
-                if (not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid()
-                        or stat.S_IMODE(st.st_mode)&0o077 or st.st_size>1_048_576): raise ValueError("unsafe_state")
-                raw=os.read(fd,1_048_577)
-                if len(raw)>1_048_576: raise ValueError("unsafe_state")
-            finally: os.close(fd)
-            saved=json.loads(raw)
-            if not isinstance(saved,dict) or saved.get("schema") not in {1,2}: raise ValueError("invalid_state")
-            tab=saved.get("subagent_tab")
-            if not isinstance(tab,dict): raise ValueError("state_missing")
-            state=tab.get("status")
-            if state not in {"intent","created","removed","unknown","failed"}: state="unknown"
-            identity={}
-            for key,limit in (("label",64),("generation",256),("tab_id",512),("initial_pane_id",512)):
-                value=tab.get(key)
-                if isinstance(value,str) and value and len(value)<=limit and not any(ord(c)<32 or ord(c)==127 for c in value): identity[key]=value
-            reason=tab.get("reason")
-            if reason not in {"removed","cleanup_pending","create_failed","verification_failed","state_corrupt"}: reason=None
-            tab_status={"state":state,"identity":identity}
-            if reason: tab_status["reason"]=reason
-        except FileNotFoundError: pass
-        except (OSError,ValueError,TypeError,json.JSONDecodeError) as exc:
-            reason=str(exc) if str(exc) in {"unsafe_state","invalid_state"} else "state_unavailable"
-            tab_status={"state":"unknown","identity":{},"reason":reason}
-        result["subagent_tab"]=tab_status
-    observer=data.get("observer",{})
-    if observer:
-        pid=observer.get("pid"); pin=observer.get("pin")
-        current=_process_pin(pid,expected=pin)
-        if observer.get("state")=="ended": result["observer"]="ended"
-        elif not current: result["observer"]="unknown" if _process_pin(pid) is None else "stale"
-        elif (observer.get("source_sha256")==_LOADED_SOURCE_SHA256
-              and observer.get("source_sha256") and observer.get("binding_id")
-              and _observer_command_matches(pid, observer)):
-            result["observer"]="running"
-        else: result["observer"]="stale"
-    binding_dir=root/"harness-herdr-hooks"/"bindings"
-    counts={}; ownership={}
-    try:
-        if binding_dir.is_symlink(): raise ValueError("unsafe")
-        import itertools
-        for p in itertools.islice(binding_dir.glob("*.json"),512):
-            if p.is_symlink() or p.stat().st_size>65536:continue
-            rec=load_existing_binding(root,p.stem); parent=parent_from_dict(rec["parent"])
-            if (str(parent.context.config_root)!=str(Path(profile).resolve()) or parent.context.harness!=Harness.CODEX
-                or parent.context.backend_instance!=hook.get("backend_instance")
-                or parent.herdr_server_id!=hook.get("server_id") or parent.pane_id!=hook.get("pane_id")):continue
-            outcome=rec.get("outcome",{}).get("status")
-            if outcome:counts[outcome]=counts.get(outcome,0)+1
-            owner=rec.get("ownership","unknown")
-            ownership[owner]=ownership.get(owner,0)+1
-    except (OSError,ValueError,KeyError,TypeError): pass
-    if counts:result["attachment"]={"known":True,"observed_counts":counts}
-    if ownership:result["ownership"]={"known":True,"counts":ownership}
-    # Lifecycle evidence is read-only here: status must not initialize a
-    # missing context store or rewrite its schema during inspection.
-    namespace=hook.get("lifecycle_namespace")
-    lifecycle_path=root/"harness-herdr-hooks"/namespace/"state.json" if isinstance(namespace,str) and re.fullmatch(r"[a-f0-9]{32}",namespace) else None
-    try:
-        if lifecycle_path is not None and not lifecycle_path.is_symlink():
-            st=lifecycle_path.lstat()
-            if (stat.S_ISREG(st.st_mode) and st.st_uid==os.getuid()
-                    and stat.S_IMODE(st.st_mode)&0o077==0 and st.st_size<=1_048_576):
-                lifecycle=json.loads(lifecycle_path.read_text(encoding="utf-8"))
-                if isinstance(lifecycle,dict) and lifecycle.get("schema") in {1,2}:
-                    outcomes={}
-                    for rec in lifecycle.get("records",{}).values():
-                        if not isinstance(rec,dict):continue
-                        cleanup=rec.get("cleanup")
-                        outcome=cleanup.get("outcome") if isinstance(cleanup,dict) else None
-                        if outcome in {"closed","unknown","failed","reused","retained-unverified","manual-close"}:
-                            outcomes[outcome]=outcomes.get(outcome,0)+1
-                    result["cleanup"]={"known":True,"outcomes":outcomes}
-    except (OSError,ValueError,TypeError):pass
-    return result
-
-def _publish_observer(root:Path,parent:ParentBinding,state:str,pin:dict|None)->None:
-    if not pin:return
-    def update(data):
-        old=data.get("observer",{})
-        if (old.get("pid"),old.get("pin"))!=(os.getpid(),pin):
-            # A running record may outlive a crashed observer. Replace it only
-            # when its kernel process identity is demonstrably gone; a live but
-            # unverifiable owner remains protected as ambiguous.
-            if state=="ended":return
-            if old.get("state")=="running" and _process_pin(old.get("pid"),expected=old.get("pin")) is not None:return
-        data["observer"]={"state":state,"pid":os.getpid(),"pin":pin,
-            "server_id":parent.herdr_server_id,"pane_id":parent.pane_id,"at":time.time()}
-        data["observer"].update(source_sha256=_LOADED_SOURCE_SHA256,
-            source_path=str(_PACKAGE_ROOT), source_root=str(_PACKAGE_ROOT), binding_id=parent.context.key()[:64],
-            context_key=parent.context.key())
-    _runtime_write(root,str(parent.context.config_root),update)
+    return {"task_discovery": task_status}
 
 def _native_codex_executable(config_root:Path)->Path:
     """Use only the adapter selected and owned by this private profile manifest."""
@@ -248,7 +110,7 @@ class _HerdrLaunchRouter:
         if profile!=self.meta["config_root"]: return False
         client=_herdr_client(); synthetic={"hook_event_name":"SessionStart","session_id":thread_id,
             "cwd":str(cwd),"transcript_path":None}
-        parent,_,parent_cwd,_=_parent_from_event("codex-hook",json.dumps(synthetic).encode(),client)
+        parent,parent_cwd=_ordinary_launch_parent(synthetic,client)
         if parent.context.config_root.resolve()!=Path(profile).resolve() or parent.context.session_id!=thread_id: return False
         self.parent,self.client,self.cwd=parent,client,parent_cwd
         return True
@@ -394,54 +256,6 @@ def _observer_command_matches(pid:int, observer:dict, *, proc_root:Path=Path("/p
         return _process_pin(pid,expected=pin,proc_root=proc_root)==pin and (module_form or script_form)
     except (OSError,KeyError,ValueError,RuntimeError):return False
 
-def _retire_observer(root:Path,profile:str,parent:ParentBinding,*,announced:bool,
-                     kill=os.kill)->str:
-    """Parent-invoked, fail-closed retirement for one precisely owned helper."""
-    if not announced:return "announcement-required"
-    data=_runtime_read(_runtime_path(root,profile)); observer=data.get("observer",{})
-    binding_id=parent.context.key()[:64]
-    legacy=not observer.get("binding_id") and not observer.get("context_key")
-    if ((not legacy and (observer.get("binding_id")!=binding_id or observer.get("context_key")!=parent.context.key()))
-            or observer.get("server_id")!=parent.herdr_server_id
-            or observer.get("pane_id")!=parent.pane_id):return "foreign-or-ambiguous"
-    try:
-        record=load_existing_binding(root,binding_id); recorded=parent_from_dict(record["parent"])
-        if (recorded.context.key()!=parent.context.key() or recorded.herdr_server_id!=parent.herdr_server_id
-                or recorded.pane_id!=parent.pane_id or recorded.tab_id!=parent.tab_id
-                or recorded.workspace_id!=parent.workspace_id):return "foreign-or-ambiguous"
-    except (OSError,ValueError,KeyError,TypeError):return "binding-unavailable"
-    pid=observer.get("pid"); pin=observer.get("pin")
-    if (not isinstance(pin,dict) or not isinstance(pin.get("start_ticks"),int)
-            or pin.get("uid")!=os.getuid() or not isinstance(pin.get("exe"),str)):
-        return "process-identity-unknown"
-    current=_process_pin(pid,expected=pin)
-    if not current:return "process-identity-unknown"
-    # Legacy helper records can be retired only if argv independently proves
-    # the private binding and source path recorded in its owned binding.
-    expected={**observer,"binding_id":binding_id,
-              "source_path":observer.get("source_path") or str(Path(record.get("entrypoint", "")).parent.parent/"src"),
-              "source_root":observer.get("source_root") or str(Path(record.get("entrypoint", "")).parent.parent/"src"),
-              "entrypoint":record.get("entrypoint")}
-    if not _observer_command_matches(pid,expected):return "command-identity-unknown"
-    try:kill(pid,signal.SIGTERM)
-    except OSError:return "signal-failed"
-    deadline=time.monotonic()+1.0
-    while time.monotonic()<deadline:
-        if _process_pin(pid,expected=current) is None:
-            try: os.kill(pid,0)
-            except ProcessLookupError:
-                def ended(data):
-                    old=data.get("observer",{})
-                    if old.get("pid")==pid and old.get("pin")==current:
-                        old["state"]="ended"; old["ended_at"]=time.time(); data["observer"]=old
-                _runtime_write(root,profile,ended)
-                return "ended"
-            except OSError:return "process-state-unknown"
-            # A live PID with a changed start time is reuse, not our helper.
-            if _process_pin(pid) is not None:return "ended"
-        time.sleep(.05)
-    return "still-running"
-
 def _proc_argv(pid:int,*,expected_cwd:Path,proc_root:Path=Path("/proc"))->list[str]|None:
     """Read bounded argv only when PID, cwd and executable remain pinned."""
     pin=_process_pin(pid,proc_root=proc_root)
@@ -459,7 +273,7 @@ def _parser() -> argparse.ArgumentParser:
     parser=argparse.ArgumentParser(prog="harness-herdr-hooks"); sub=parser.add_subparsers(dest="command",required=True)
     for name in ("install","status","uninstall"):
         p=sub.add_parser(name); p.add_argument("harness",choices=("codex","opencode")); p.add_argument("--config-dir")
-    for name in ("codex-hook","opencode-event","observe","attach","launch-run"):
+    for name in ("codex-hook","opencode-event","observe","observe-standalone","attach","launch-run"):
         p=sub.add_parser(name,help=argparse.SUPPRESS); p.add_argument("binding_id",nargs="?")
     return parser
 
@@ -475,96 +289,117 @@ def _herdr_client() -> HerdrClient:
     if not sock or not Path(sock).is_absolute(): raise ValueError("absolute Herdr socket marker required")
     return HerdrClient(sock,timeout=.3)
 
-def _parent_from_event(command:str, payload:bytes, client:HerdrClient):
-    snap=client.snapshot(); pane_id=os.environ["HERDR_PANE_ID"]
-    pane=next((p for p in snap.get("panes",[]) if isinstance(p,dict) and p.get("pane_id")==pane_id),None)
-    if not pane or pane.get("tab_id")!=os.environ["HERDR_TAB_ID"] or pane.get("workspace_id")!=os.environ["HERDR_WORKSPACE_ID"]:
+def _ordinary_launch_parent(raw: dict, client: HerdrClient) -> tuple[ParentBinding, Path]:
+    pane_id = os.environ["HERDR_PANE_ID"]
+    workspace_id = os.environ["HERDR_WORKSPACE_ID"]
+    tab_id = os.environ["HERDR_TAB_ID"]
+    pane = next((p for p in client.snapshot().get("panes", [])
+                 if isinstance(p, dict) and p.get("pane_id") == pane_id), None)
+    if not pane or pane.get("workspace_id") != workspace_id or pane.get("tab_id") != tab_id:
         raise ValueError("caller Herdr pane does not match current snapshot")
-    ref=pane.get("agent_session")
-    if not isinstance(ref,dict) or ref.get("kind") not in {"id","path"} or not isinstance(ref.get("value"),str) or not ref["value"]: raise ValueError("caller pane has no supported native session reference")
-    info=client.process_info(pane_id); procs=info.get("foreground_processes",[])
-    if command=="opencode-event":
-        event,_,roots=OpenCodeAdapter.parse_bridge(payload); envelope=json.loads(payload)
-        if ref["kind"]!="id": raise ValueError("OpenCode path references are not qualified")
-        pid=envelope["backend"]["pid"]; url=envelope["backend"]["server_url"].rstrip("/")
-        # In display mode the pane contains the attached CLI, while the
-        # envelope PID names the original server. The owned binding below
-        # proves that server against its root pane before any API query.
-        if os.environ.get("HARNESS_HERDR_DISPLAY")!="1" and not any(p.get("pid")==pid and "opencode" in (str(p.get("name",""))+" "+str(p.get("argv") or "")).lower() for p in procs if isinstance(p,dict)):
-            raise ValueError("OpenCode server PID is not the caller pane foreground process")
-        root_paths=[Path(roots[k]) for k in ("config_dir","data_dir","state_dir")]
-        if not all(path.is_absolute() for path in root_paths): raise ValueError("OpenCode roots must be absolute")
-        context=Context(Harness.OPENCODE,str(root_paths[0]),root_paths[0],root_paths[1],root_paths[2],url,ref["value"],f"pid:{pid}")
-        created_context=replace(event.context,backend_instance=f"pid:{pid}") if event.kind=="session.created" else None
-        backend_pid=pid
-    else:
-        # Herdr's PID/name/cwd evidence selects the default profile daemon even
-        # when argv is omitted. The backend helper pins process and socket.
-        codex_home=Path(os.environ.get("CODEX_HOME","~/.codex")).expanduser().resolve()
-        matches=[p for p in procs if isinstance(p,dict) and p.get("pid") is not None and
-                 "codex" in str(p.get("name","")).lower()]
-        if len(matches)!=1: raise ValueError("Codex foreground process is missing or ambiguous")
-        proof=codex_backend_proof(matches[0],codex_home)
-        sock=Path(proof["socket_target"]); backend_instance="{}:{}:{}".format(*proof["socket_identity"][:3])
-        event=parse_hook(payload,profile=str(codex_home),config_root=codex_home,data_root=codex_home,state_root=codex_home,
-                         verified_backend_id=str(sock),verified_backend_instance=backend_instance)
-        hook_transcript_path=json.loads(payload).get("transcript_path")
-        context=Context(Harness.CODEX,str(codex_home),codex_home,codex_home,codex_home,str(sock),event.identity.session_id,backend_instance)
-        provider=CodexRuntimeAdapter(context,executable=str(_native_codex_executable(codex_home)))
-        try:
-            root_id=_verified_pane_root(provider,ref)
-            if event.event_name=="SessionStart":
-                if root_id!=event.identity.session_id: raise ValueError("Codex hook root does not match pane thread")
-            else:
-                # Fetch the native source chain by following metadata one parent at a time.
-                rows={}; current=event.identity.session_id
-                for _ in range(32):
-                    row=provider._read_thread(current); rows[current]=row
-                    parent_id=row.get("parentThreadId")
-                    if not isinstance(parent_id,str) or not parent_id: break
-                    if parent_id==root_id: break
-                    current=parent_id
-                chain=provider._verified_chain(event.identity.session_id,rows,root_id)
-                if chain is None: raise ValueError("Codex child source chain does not reach pane root")
-            context=replace(context,session_id=root_id)
-            root_path=provider._read_thread(root_id).get("path")
-            if event.event_name=="SessionStart" and hook_transcript_path is not None:
-                if (not isinstance(root_path,str) or not Path(root_path).is_absolute()
-                        or not Path(hook_transcript_path).is_absolute()
-                        or Path(root_path).resolve(strict=False)!=Path(hook_transcript_path).resolve(strict=False)):
-                    raise ValueError("Codex hook transcript path does not match native pane root")
-            session_path=Path(root_path).resolve(strict=False) if isinstance(root_path,str) and Path(root_path).is_absolute() else None
-        finally: provider.close()
-        parent=ParentBinding(context,client.server_identity(),os.environ["HERDR_WORKSPACE_ID"],os.environ["HERDR_TAB_ID"],pane_id,
-                             session_path=session_path,backend_proof=proof)
-        if not client.verify_parent(parent): raise ValueError("parent/backend binding failed Herdr verification")
-        created_context=event if event.event_name in {"SubagentStart","SubagentStop"} else None
-        cwd=pane.get("cwd")
-        if not isinstance(cwd,str) or not Path(cwd).is_absolute(): raise ValueError("verified Herdr pane working directory unavailable")
-        normalized_cwd=Path(cwd)
-        if os.environ.get("HARNESS_HERDR_DISPLAY")=="1": parent,normalized_cwd=_normalize_display_parent(parent,client,pane,None)
-        return parent,None,normalized_cwd,created_context
-        backend_pid=None
-    parent=ParentBinding(context,client.server_identity(),os.environ["HERDR_WORKSPACE_ID"],os.environ["HERDR_TAB_ID"],pane_id,session_path=session_path if command!="opencode-event" else None)
-    display=os.environ.get("HARNESS_HERDR_DISPLAY")=="1"
-    # An attached OpenCode CLI may not be the server PID. The normalizer first
-    # selects an exact owned binding, verifies its original server PID against
-    # the root pane, and only then contacts that server.
-    if not (display and command=="opencode-event") and not client.verify_parent(parent,backend_pid): raise ValueError("parent/backend binding failed Herdr verification")
-    cwd=pane.get("cwd")
-    if not isinstance(cwd,str) or not Path(cwd).is_absolute(): raise ValueError("verified Herdr pane working directory unavailable")
-    normalized_cwd=Path(cwd)
-    if display:
-        parent,normalized_cwd=_normalize_display_parent(parent,client,pane,backend_pid)
-        if command=="opencode-event":
-            # The bridge PID is an attached plugin process hint. The owned
-            # root binding and root-pane foreground proof select the saved
-            # canonical server PID used for observation.
-            try: backend_pid=int(parent.context.backend_instance.removeprefix("pid:"))
-            except (ValueError,AttributeError): raise ValueError("canonical OpenCode server PID missing") from None
-            if isinstance(created_context,Context):
-                created_context=replace(created_context,backend_instance=parent.context.backend_instance)
-    return parent,backend_pid,normalized_cwd,created_context
+    ref = pane.get("agent_session")
+    if (not isinstance(ref, dict) or ref.get("kind") not in {"id", "path"}
+            or not isinstance(ref.get("value"), str) or not ref["value"]):
+        raise ValueError("caller pane has no supported native session reference")
+    home = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser().resolve()
+    processes = [proc for proc in client.process_info(pane_id).get("foreground_processes", [])
+                 if isinstance(proc, dict) and proc.get("pid") is not None
+                 and "codex" in str(proc.get("name", "")).lower()]
+    if len(processes) != 1:
+        raise ValueError("Codex foreground process is missing or ambiguous")
+    proof = codex_backend_proof(processes[0], home)
+    socket_target = str(proof["socket_target"])
+    instance = "{}:{}:{}".format(*proof["socket_identity"][:3])
+    event = parse_hook(raw, profile=str(home), config_root=home, data_root=home,
+                       state_root=home, verified_backend_id=socket_target,
+                       verified_backend_instance=instance)
+    context = event.identity.context()
+    provider = CodexRuntimeAdapter(context, executable=str(_native_codex_executable(home)))
+    try:
+        root_id = _verified_pane_root(provider, ref)
+        if root_id != context.session_id:
+            raise ValueError("Codex caller session does not match pane thread")
+        path = provider._read_thread(root_id).get("path")
+        session_path = Path(path).resolve(strict=False) if isinstance(path, str) and Path(path).is_absolute() else None
+    finally:
+        provider.close()
+    parent = ParentBinding(context, client.server_identity(), workspace_id, tab_id, pane_id,
+                           session_path=session_path, backend_proof=proof)
+    cwd = pane.get("cwd")
+    if not client.verify_parent(parent) or not isinstance(cwd, str) or not Path(cwd).is_absolute():
+        raise ValueError("ordinary launch caller binding is not verified")
+    return parent, Path(cwd)
+
+
+def _parent_from_event(command:str, payload:bytes, client:HerdrClient):
+    """Route only standalone SessionStart through identity-only verification."""
+    if command != "codex-hook":
+        return None, None, None, None
+    raw = json.loads(payload)
+    if not isinstance(raw, dict) or raw.get("hook_event_name") != "SessionStart":
+        return None, None, None, None
+    return _standalone_session_parent(raw, client)
+
+def _standalone_session_parent(raw:dict,client:HerdrClient):
+    """Bind a new standalone SessionStart through authenticated session identity only."""
+    from .codex_backend import select_endpoint
+    profile=Path(os.environ.get("CODEX_HOME","~/.codex")).expanduser().resolve()
+    pin=select_endpoint(profile)
+    instance=pin.instance
+    event=parse_hook(raw,profile=str(profile),config_root=profile,data_root=profile,state_root=profile,
+                     verified_backend_id=str(pin.target),verified_backend_instance=instance)
+    context=event.identity.context()
+    if os.environ.get("HARNESS_HERDR_DISPLAY") == "1":
+        return None, None, None, None
+    try:
+        claim = load_existing_binding(_state_root(), "display-" + context.key())
+    except FileNotFoundError:
+        claim = None
+    if claim and claim.get("kind") == "standalone" and claim.get("ownership") == "created":
+        owner = parent_from_dict(claim["parent"])
+        from .model import session_from_dict
+        child = session_from_dict(claim["child"])
+        if child.context == context and claim.get("server_socket") == str(client.socket_path):
+            snap = client.snapshot()
+            if client.server_identity() == owner.herdr_server_id and any(
+                    pane.get("pane_id") == claim.get("pane_id")
+                    and pane.get("workspace_id") == owner.workspace_id
+                    and pane.get("tab_id") == owner.tab_id
+                    for pane in snap.get("panes", []) if isinstance(pane, dict)):
+                return None, None, None, None
+    executable=_native_codex_executable(profile)
+    provider=CodexRuntimeAdapter(context,executable=str(executable),task_store_root=_state_root())
+    try:
+        from .adapters.codex import list_loaded_threads
+        if event.identity.session_id not in list_loaded_threads(provider.proxy):
+            raise ValueError("standalone SessionStart thread is not loaded on selected profile backend")
+        row=provider._read_thread(event.identity.session_id)
+        if row.get("id")!=event.identity.session_id:
+            raise ValueError("standalone SessionStart thread metadata identity mismatch")
+        path=row.get("path")
+        session_path=Path(path).resolve(strict=False) if isinstance(path,str) and Path(path).is_absolute() else None
+        transcript=raw.get("transcript_path")
+        if transcript is not None and (session_path is None or not Path(transcript).is_absolute()
+                                       or Path(transcript).resolve(strict=False)!=session_path):
+            raise ValueError("Codex hook transcript path does not match standalone thread")
+        cwd=row.get("cwd")
+        if not isinstance(cwd,str) or not Path(cwd).is_absolute():
+            raise ValueError("standalone thread working directory unavailable")
+        destination=client.session_destination(event.identity.session_id,session_path=session_path,harness="codex")
+        if destination is None:
+            raise ValueError("standalone thread has no unique authenticated Herdr destination")
+        if destination.get("server_id")!=client.server_identity():
+            raise ValueError("standalone destination belongs to a different Herdr server")
+        proof={"socket_alias":str(pin.alias),"socket_target":str(pin.target),
+               "socket_identity":list(pin.socket_identity),"alias_identity":list(pin.alias_identity),
+               "directory_identity":list(pin.directory_identity),"executable":str(executable)}
+        parent=ParentBinding(context,destination["server_id"],destination["workspace_id"],destination["tab_id"],
+                             destination["anchor_pane_id"],session_path=session_path,backend_proof=proof)
+        # The current authenticated session snapshot is the authority here. Do not
+        # consult pane markers, process_info, or PID based verify_parent checks.
+        return parent,None,Path(cwd),None
+    finally:
+        provider.close()
 
 def _verified_pane_root(provider:CodexRuntimeAdapter, ref:dict[str,str])->str:
     """Resolve the typed Herdr root reference against this exact daemon."""
@@ -602,163 +437,54 @@ def verified_codex_parent(context:Context, requesting_thread_id:str, executable:
     except BaseException:
         provider.close(); raise
 
-def _provider(parent:ParentBinding,pid:int|None,client:HerdrClient):
-    if parent.context.harness==Harness.CODEX:
-        proof=parent.backend_proof or {}; executable=proof.get("executable")
-        if not isinstance(executable,str) or not Path(executable).is_absolute(): raise ValueError("recorded native Codex executable proof missing")
-        return CodexRuntimeAdapter(parent.context,executable=executable,task_store_root=_state_root())
-    if pid is None: raise ValueError("OpenCode backend PID missing")
-    return OpenCodeRuntimeAdapter(parent.context,pid,herdr_client=client)
+def _provider(parent: ParentBinding) -> CodexRuntimeAdapter:
+    proof = parent.backend_proof or {}
+    executable = proof.get("executable")
+    if not isinstance(executable, str) or not Path(executable).is_absolute():
+        raise ValueError("recorded native Codex executable proof missing")
+    return CodexRuntimeAdapter(parent.context, executable=executable, task_store_root=_state_root())
 
-def _normalize_display_parent(parent:ParentBinding, client:HerdrClient, pane:dict, pid:int|None):
-    """Map a verified attached subagent pane to its already-owned main binding."""
-    # OpenCode event payloads identify the attached CLI process, which can
-    # differ from the original server. Do not contact that payload-selected
-    # endpoint until an owned binding has selected and verified its endpoint.
-    root_context=None
-    if parent.context.harness==Harness.OPENCODE:
-        display_root=True
-    else:
-        provider=_provider(parent,pid,client)
-        try: root_context,_=provider.main_metadata(parent)
-        finally: provider.close()
-        display_root=root_context.key()!=parent.context.key()
-    if not display_root:
-        # A provider-classified independent conversation is its own root.
-        if not client.verify_parent(parent,pid): raise ValueError("independent display parent/backend binding failed verification")
-        return parent,Path(pane["cwd"])
-    root=_state_root(); directory=root/"harness-herdr-hooks"/"bindings"
-    from .attach import binding_tab_id
-    import itertools
-    from .state import session_from_dict
-    from .herdr import process_matches_attachment
-    matches=[]
-    if directory.is_symlink(): raise ValueError("unsafe binding directory")
-    paths=list(itertools.islice(directory.glob("*.json"),513))
-    if len(paths)>512: raise ValueError("owned binding scan overflow")
-    for path in paths:
-        try:
-            if path.is_symlink() or path.stat().st_size>65536: continue
-            record=load_existing_binding(root,path.stem)
-            candidate=parent_from_dict(record["parent"])
-            child=session_from_dict(record["child"])
-            if (record.get("pane_id")!=pane.get("pane_id")
-                    or (child.context.key()!=parent.context.key() and not (
-                        parent.context.harness==Harness.OPENCODE
-                        and child.context.harness==parent.context.harness
-                        and child.context.session_id==parent.context.session_id
-                        and child.context.backend_id==parent.context.backend_id
-                        and child.context.profile==parent.context.profile
-                        and child.context.config_root==parent.context.config_root
-                        and child.context.data_root==parent.context.data_root
-                        and child.context.state_root==parent.context.state_root
-                        and candidate.context.backend_instance==child.context.backend_instance
-                    ))
-                    or record.get("kind","subagent")!="subagent"
-                    or record.get("ownership","unknown") not in {"created","reused"}
-                    or (root_context is not None and candidate.context.key()!=root_context.key())
-                    or candidate.herdr_server_id!=parent.herdr_server_id
-                    or candidate.context.backend_id!=parent.context.backend_id
-                    or (parent.context.harness!=Harness.OPENCODE and candidate.context.backend_instance!=parent.context.backend_instance)
-                    or candidate.context.config_root!=parent.context.config_root
-                    or candidate.context.data_root!=parent.context.data_root
-                    or candidate.context.state_root!=parent.context.state_root
-                    or candidate.context.profile!=parent.context.profile): continue
-            original_pid=record.get("backend_pid")
-            if parent.context.harness==Harness.OPENCODE and (original_pid is None or not str(original_pid).isdigit()
-                    or candidate.context.backend_instance!=f"pid:{original_pid}"
-                    or child.context.backend_instance!=candidate.context.backend_instance): continue
-            if not client.verify_parent(candidate,original_pid): continue
-            destination=binding_tab_id(root,record,candidate)
-            if "destination" in record and destination is None: continue
-            if (destination is None and candidate.tab_id!=pane.get("tab_id")) or (destination is not None and destination!=pane.get("tab_id")) or candidate.workspace_id!=pane.get("workspace_id"): continue
-            # Verify the exact attached pane against the current Herdr snapshot.
-            snap=client.snapshot()
-            current=next((p for p in snap.get("panes",[]) if isinstance(p,dict) and p.get("pane_id")==pane.get("pane_id")),None)
-            from .model import matches_agent_session_ref
-            if (not current or any(current.get(k)!=pane.get(k) for k in ("pane_id","tab_id","workspace_id"))
-                    or not matches_agent_session_ref(current.get("agent_session"),child.context.session_id,child.session_path)
-                    or not client.verify_parent(candidate,original_pid)): continue
-            child_provider=_provider(candidate if parent.context.harness==Harness.OPENCODE else parent,
-                                     original_pid if parent.context.harness==Harness.OPENCODE else pid,client)
-            try: expected=child_provider.attach_argv(child)
-            finally: child_provider.close()
-            processes=client.process_info(pane.get("pane_id")).get("foreground_processes",[])
-            if not any(isinstance(proc,dict) and process_matches_attachment(proc,expected,child.context) for proc in processes): continue
-            if parent.context.harness==Harness.OPENCODE:
-                root_provider=_provider(candidate,original_pid,client)
-                try:
-                    # Prove the persisted child chain against the original backend.
-                    # The event-selected context may be a different attached CLI PID.
-                    persisted_child_parent=replace(candidate,context=child.context)
-                    root_context,_=root_provider.main_metadata(persisted_child_parent)
-                finally: root_provider.close()
-                if root_context.key()!=candidate.context.key(): continue
-                main_processes=client.process_info(candidate.pane_id).get("foreground_processes",[])
-                if not any(isinstance(proc,dict) and proc.get("pid")==original_pid and "opencode" in (str(proc.get("name",""))+" "+str(proc.get("argv") or "")).lower() for proc in main_processes): continue
-            matches.append(candidate)
-        except (OSError,ValueError,KeyError,TypeError):
-            continue
-    if len(matches)!=1: raise ValueError("nested display has missing or ambiguous owned main binding")
-    original=matches[0]
-    snap=client.snapshot()
-    root_pane=next((p for p in snap.get("panes",[]) if isinstance(p,dict) and p.get("pane_id")==original.pane_id),None)
-    if not root_pane or not isinstance(root_pane.get("cwd"),str) or not Path(root_pane["cwd"]).is_absolute():
-        raise ValueError("owned main pane working directory unavailable")
-    return original,Path(root_pane["cwd"])
 
-def _start_observer(parent:ParentBinding,pid:int|None,client:HerdrClient,cwd:Path,created_context=None)->None:
-    root=_state_root(); binding=parent.context.key()[:64]
-    session=Session(parent.context,None,None,cwd,Lifecycle.UNKNOWN,False,time.time())
-    record={"parent":parent_to_dict(parent),"child":session_to_dict(session),"pane_id":parent.pane_id,
-            "backend_pid":pid,"server_socket":str(client.socket_path),"entrypoint":str(Path(__file__).resolve().parents[2]/"bin/harness-herdr-hooks"),"shell_pid":None}
-    save_binding(root,binding,record)
-    if isinstance(created_context,Context):
-        StateStore(root,parent.context.key()[:32]).note_creation(created_context.key())
-    elif created_context is not None:
-        store=StateStore(root,parent.context.key()[:32]); child_context=replace(parent.context,session_id=created_context.identity.session_id)
-        child_key=child_context.key()
-        if created_context.event_name=="SubagentStart":
-            store.note_creation(child_key)
-            # Hook delivery can lag a later turn. Only the backend's current
-            # native turn may replace generation, binding, or ownership state.
-            try:
-                provider=_provider(parent,pid,client)
-                try:
-                    from .adapters.codex import list_turn_metadata
-                    turns=list_turn_metadata(provider.proxy,created_context.identity.session_id)
-                    latest=turns[0] if turns else None
-                    if latest and latest.turn_id==created_context.turn_id:
-                        store.begin_generation(child_key,created_context.turn_id,turn_id=created_context.turn_id,
-                                               kind="subagent",parent_id=parent.context.session_id)
-                finally:
-                    provider.close()
-            except Exception:
-                # Keep pending creation eligibility, but never infer a turn.
-                pass
-        else:
-            current=store.generation(child_key)
-            if current and current.get("generation")==created_context.turn_id and current.get("turn_id")==created_context.turn_id:
-                store.note_stop_hint(child_key,created_context.turn_id,created_context.turn_id,
-                                     stop_hook_active=bool(created_context.stop_hook_active))
-    env=child_environment(parent.context,pane_markers={k:os.environ[k] for k in ("HERDR_ENV","HERDR_SOCKET_PATH","HERDR_PANE_ID","HERDR_TAB_ID","HERDR_WORKSPACE_ID")})
-    env["HARNESS_HERDR_STATE_ROOT"]=str(root); env["XDG_STATE_HOME"]=str(root)
-    entry=Path(record["entrypoint"])
-    subprocess.Popen([str(entry),"observe",binding],cwd=str(cwd),env=env,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
-                     close_fds=True,start_new_session=True)
+def _start_observer(parent: ParentBinding, client: HerdrClient, cwd: Path) -> None:
+    root = _state_root()
+    entrypoint = _entrypoint()
+    session = Session(parent.context, None, None, cwd, Lifecycle.UNKNOWN, False, time.time())
+    identity = [parent.context.key(), parent.herdr_server_id, parent.workspace_id, parent.tab_id]
+    binding = "standalone-" + hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+    save_binding(root, binding, {
+        "parent": parent_to_dict(parent), "child": session_to_dict(session),
+        "pane_id": parent.pane_id, "backend_pid": None, "shell_pid": None,
+        "server_socket": str(client.socket_path), "entrypoint": str(entrypoint),
+        "kind": "standalone",
+    })
+    env = child_environment(parent.context, pane_markers={
+        "HERDR_ENV": "1", "HERDR_SOCKET_PATH": str(client.socket_path),
+    })
+    env["HARNESS_HERDR_STATE_ROOT"] = str(root)
+    subprocess.Popen([str(entrypoint), "observe-standalone", binding],
+                     cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     close_fds=True, start_new_session=True)
 
-def _observe(binding:str)->None:
-    root=_state_root(); record=load_existing_binding(root,binding); parent=parent_from_dict(record["parent"])
-    if record.get("server_socket")!=os.environ.get("HERDR_SOCKET_PATH"): raise ValueError("observer Herdr socket differs from stored binding")
-    client=HerdrClient(record["server_socket"])
+
+def _observe(binding: str) -> None:
+    if not re.fullmatch(r"standalone-[0-9a-f]{64}", binding):
+        return
+    root = _state_root()
+    record = load_existing_binding(root, binding)
+    parent = parent_from_dict(record["parent"])
+    if (record.get("kind") != "standalone" or parent.context.harness != Harness.CODEX
+            or record.get("server_socket") != os.environ.get("HERDR_SOCKET_PATH")
+            or record.get("entrypoint") != str(_entrypoint())):
+        return
+    client = HerdrClient(record["server_socket"])
     client.snapshot()
-    if client.server_identity()!=parent.herdr_server_id: raise ValueError("observer Herdr server identity changed")
-    pid=record.get("backend_pid"); provider=_provider(parent,pid,client)
-    store=StateStore(_state_root(),parent.context.key()[:32])
-    pin=_process_pin(os.getpid())
-    run_observer(parent,store,provider,client,Path(record["entrypoint"]),root,pid,
-                 on_start=lambda:_publish_observer(root,parent,"running",pin),
-                 on_end=lambda:_publish_observer(root,parent,"ended",pin))
+    if client.server_identity() != parent.herdr_server_id:
+        return
+    provider = _provider(parent)
+    store = StateStore(root, parent.context.key()[:32])
+    run_observer(parent, store, provider, client, _entrypoint(), root)
+
 
 def main(argv:Sequence[str]|None=None)->int:
     args=_parser().parse_args(argv)
@@ -769,7 +495,8 @@ def main(argv:Sequence[str]|None=None)->int:
         if args.command=="install": result=installer.install(args.harness,source_root=Path(__file__).resolve().parents[2],config_dir=args.config_dir)
         elif args.command=="status":
             result=installer.status(args.harness,config_dir=args.config_dir)
-            if args.harness=="codex": result["runtime"]=_runtime_status(_state_root(),result["config_root"])
+            if args.harness == "codex":
+                result["runtime"] = _runtime_status(_state_root(), result["config_root"])
         elif args.command=="uninstall": result=installer.uninstall(args.harness,config_dir=args.config_dir)
         elif args.command=="launch-run":
             root=_state_root()/"harness-herdr-hooks"/"launches"
@@ -777,17 +504,29 @@ def main(argv:Sequence[str]|None=None)->int:
         else:
             # Outside Herdr, skip before consuming event input or touching private state.
             if os.environ.get("HERDR_ENV")!="1": return 0
-            if args.command in {"observe","attach"}:
-                if not args.binding_id or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}",args.binding_id): raise ValueError("invalid opaque binding ID")
-                if args.command=="attach": exec_binding(args.binding_id)
-                else: _observe(args.binding_id)
+            # These registered entrypoints are retained only for safe migration.
+            # Native child hooks and the retired OpenCode bridge are inert even
+            # when an old installation still invokes them.
+            if args.command in {"opencode-event","observe","attach"}: return 0
+            if args.command == "observe-standalone":
+                _observe(args.binding_id or "")
                 return 0
-            markers=("HERDR_SOCKET_PATH","HERDR_PANE_ID","HERDR_TAB_ID","HERDR_WORKSPACE_ID")
-            if not all(os.environ.get(k) for k in markers):return 0
+            if not os.environ.get("HERDR_SOCKET_PATH"):
+                return 0
             limit=1_048_576 if args.command=="codex-hook" else 262_144
             payload=sys.stdin.buffer.read(limit+1)
             if len(payload)>limit:raise ValueError("event JSON exceeds size limit")
             if not payload:raise ValueError("event JSON is empty")
+            if args.command=="codex-hook":
+                try:
+                    event_name=json.loads(payload).get("hook_event_name")
+                except (json.JSONDecodeError,AttributeError):
+                    event_name=None
+                if event_name in {"SubagentStart","SubagentStop"}: return 0
+                # SessionStart resolves solely through the selected profile and
+                # authenticated Herdr session snapshot; inherited pane markers
+                # cannot select the legacy process-bound route.
+                if event_name!="SessionStart": return 0
             client=_herdr_client()
             deadline=time.monotonic()+4.0
             for attempt in range(3):
@@ -797,8 +536,8 @@ def main(argv:Sequence[str]|None=None)->int:
                 except (HerdrError,ValueError):
                     if attempt==2 or time.monotonic()+1.3>=deadline: raise
                     time.sleep(.1)
-            _start_observer(parent,pid,client,cwd,created_context)
-            if args.command=="codex-hook": _record_hook(_state_root(),parent)
+            if parent is None:return 0
+            _start_observer(parent, client, cwd)
             return 0
         print(json.dumps(result,sort_keys=True));return 0
     except Exception as exc:

@@ -119,6 +119,8 @@ class StateStore:
                 # feature. Unknown predecessor fields remain untouched.
                 if "task_discovery" in data:
                     _validate_task_discovery(data["task_discovery"])
+                if "standalone_effects" in data:
+                    _validate_standalone_effects(data["standalone_effects"])
             else:
                 data = {"schema": 2, "baseline": [], "records": {}, "pending_created": []}
             yield data
@@ -287,11 +289,10 @@ class StateStore:
                               if item.get("event_key") == event_key and item.get("status") == "verified"), None)
             terminal = next((item for item in discovery.get("outcomes", [])
                              if item.get("event_key") == event_key and item.get("status") == "attached"), None)
-            current_association = (hashlib.sha256(json.dumps(
-                {"authority": authority, "candidate": candidate}, sort_keys=True,
-                separators=(",", ":")).encode()).hexdigest() if candidate is not None
-                else record.get("standalone_association_sha256") if terminal is not None and isinstance(record, dict)
-                else None)
+            current_association = (standalone_association_digest(authority, candidate)
+                                   if candidate is not None else
+                                   record.get("standalone_association_sha256")
+                                   if terminal is not None and isinstance(record, dict) else None)
             authority_hash = hashlib.sha256(json.dumps(
                 authority, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
             if (not isinstance(record, dict)
@@ -304,6 +305,81 @@ class StateStore:
                 return False
             record.update(fields)
             record["status"] = status
+            return True
+
+    def reserve_standalone_effect(self, event_key: str, stage: str, binding_id: str,
+                                 child_id: str, destination: dict[str, Any], *,
+                                 pane_id: str | None = None) -> bool:
+        """Durably reserve a one-shot split/start before any external side effect.
+
+        Returns true only for the process that first records the intent. Replays,
+        including after a crash or lost acknowledgement, are suppressed.
+        """
+        if (not all(isinstance(x, str) and x and len(x) <= 512
+                    for x in (event_key, binding_id, child_id))
+                or stage not in {"split", "start"}):
+            raise ValueError("invalid standalone effect identity")
+        _validate_safe_object(destination, "standalone destination", max_keys=8)
+        if set(destination) != {"server_id", "workspace_id", "tab_id", "anchor_pane_id"}:
+            raise ValueError("invalid standalone effect destination")
+        if not all(isinstance(destination[k], str) and destination[k]
+                   for k in destination):
+            raise ValueError("invalid standalone effect destination values")
+        with self.locked() as data:
+            effects = data.setdefault("standalone_effects", {})
+            _validate_standalone_effects(effects)
+            key = hashlib.sha256(json.dumps([event_key, stage], separators=(",", ":")).encode()).hexdigest()
+            old = effects.get(key)
+            if old is not None:
+                return False
+            if stage == "start":
+                split_key = hashlib.sha256(json.dumps([event_key, "split"], separators=(",", ":")).encode()).hexdigest()
+                split = effects.get(split_key)
+                if (not isinstance(split, dict) or split.get("binding_id") != binding_id
+                        or split.get("child_id") != child_id or split.get("destination") != destination
+                        or not split.get("pane_id") or pane_id != split.get("pane_id")):
+                    raise UnsafeState("standalone start requires the exact persisted split claim")
+            elif pane_id is not None:
+                raise ValueError("split intent cannot preclaim a pane")
+            effects[key] = {"event_key": event_key, "stage": stage,
+                            "binding_id": binding_id, "child_id": child_id,
+                            "destination": dict(destination), "pane_id": pane_id,
+                            "status": "intent"}
+            return True
+
+    def record_standalone_pane_claim(self, event_key: str, binding_id: str,
+                                     destination: dict[str, Any], pane_id: str) -> bool:
+        """Persist only the exact pane returned by the one-shot split call."""
+        if not isinstance(pane_id, str) or not pane_id or len(pane_id) > 512:
+            raise ValueError("invalid standalone pane acknowledgement")
+        key = hashlib.sha256(json.dumps([event_key, "split"], separators=(",", ":")).encode()).hexdigest()
+        with self.locked() as data:
+            effect = data.setdefault("standalone_effects", {}).get(key)
+            if (not isinstance(effect, dict) or effect.get("binding_id") != binding_id
+                    or effect.get("destination") != destination or effect.get("status") != "intent"):
+                return False
+            effect.update(pane_id=pane_id, status="claimed")
+            return True
+
+    def standalone_effect(self, event_key: str, stage: str = "split") -> dict[str, Any] | None:
+        key = hashlib.sha256(json.dumps([event_key, stage], separators=(",", ":")).encode()).hexdigest()
+        with self.locked() as data:
+            value = data.setdefault("standalone_effects", {}).get(key)
+            return json.loads(json.dumps(value)) if isinstance(value, dict) else None
+
+    def mark_standalone_effect(self, event_key: str, stage: str, binding_id: str,
+                               pane_id: str, status: str) -> bool:
+        """Record an acknowledgement only against the pinned one-shot intent."""
+        if stage not in {"split", "start"} or status not in {"claimed", "started", "attached"}:
+            raise ValueError("invalid standalone effect acknowledgement")
+        key = hashlib.sha256(json.dumps([event_key, stage], separators=(",", ":")).encode()).hexdigest()
+        with self.locked() as data:
+            effect = data.setdefault("standalone_effects", {}).get(key)
+            if (not isinstance(effect, dict) or effect.get("binding_id") != binding_id
+                    or not isinstance(pane_id, str) or not pane_id
+                    or (effect.get("pane_id") not in (None, pane_id))):
+                return False
+            effect.update(pane_id=pane_id, status=status)
             return True
 
     def task_discovery(self) -> dict[str, Any]:
@@ -600,6 +676,40 @@ def update_binding_outcome(root: Path, opaque_id: str, status: str, pid: int | N
 
 def _empty_task_discovery() -> dict[str, Any]:
     return {"cursor": None, "authority": None, "pending": [], "outcomes": []}
+
+
+def standalone_association_digest(authority: dict, candidate: dict) -> str:
+    identity = {key: candidate.get(key) for key in
+                ("event_key", "parent_id", "turn_id", "item_id", "child_id", "cwd_sha256", "context", "destination")}
+    return hashlib.sha256(json.dumps({"authority": authority, "candidate": identity},
+                                     sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _validate_standalone_effects(value: object) -> None:
+    if not isinstance(value, dict):
+        raise UnsafeState("invalid standalone effect ledger")
+    for key, effect in value.items():
+        if (not isinstance(key, str) or not re.fullmatch(r"[0-9a-f]{64}", key)
+                or not isinstance(effect, dict)
+                or set(effect) != {"event_key", "stage", "binding_id", "child_id",
+                                   "destination", "pane_id", "status"}
+                or effect.get("stage") not in {"split", "start"}
+                or effect.get("status") not in {"intent", "claimed", "started", "attached"}
+                or any(not isinstance(effect.get(field), str) or not effect[field]
+                       or len(effect[field]) > 512 for field in ("event_key", "binding_id", "child_id"))):
+            raise UnsafeState("invalid standalone effect record")
+        expected_key = hashlib.sha256(json.dumps(
+            [effect["event_key"], effect["stage"]], separators=(",", ":")).encode()).hexdigest()
+        if key != expected_key or (effect["stage"] == "start" and effect["pane_id"] is None):
+            raise UnsafeState("standalone effect key or pane pin is invalid")
+        if effect["pane_id"] is not None and (not isinstance(effect["pane_id"], str)
+                                                or not effect["pane_id"] or len(effect["pane_id"]) > 512):
+            raise UnsafeState("invalid standalone effect pane claim")
+        destination = effect.get("destination")
+        if (not isinstance(destination, dict)
+                or set(destination) != {"server_id", "workspace_id", "tab_id", "anchor_pane_id"}
+                or any(not isinstance(x, str) or not x for x in destination.values())):
+            raise UnsafeState("invalid standalone effect destination")
 
 
 def _validate_safe_object(value: object, name: str, *, max_keys: int) -> None:
