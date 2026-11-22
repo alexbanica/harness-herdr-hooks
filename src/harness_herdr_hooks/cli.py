@@ -63,7 +63,7 @@ def _runtime_write(root:Path,profile:str,mutate)->None:
         os.close(lockfd); raise ValueError("unsafe runtime state lock")
     fcntl.flock(lockfd,fcntl.LOCK_EX)
     try:
-        data=_runtime_read(path); data={k:v for k,v in data.items() if k in {"schema","updated","hook","observer","task_discovery"}}
+        data=_runtime_read(path); data={k:v for k,v in data.items() if k in {"schema","updated","hook","observer","task_discovery","subagent_tab"}}
         data.setdefault("schema",1); mutate(data); data["updated"]=time.time()
         raw=json.dumps(data,sort_keys=True,separators=(",",":" )).encode()
         if len(raw)>_RUNTIME_MAX_BYTES: raise ValueError("runtime evidence exceeds bound")
@@ -80,8 +80,9 @@ def _runtime_write(root:Path,profile:str,mutate)->None:
 
 def _record_hook(root:Path,parent:ParentBinding)->None:
     def update(data):
-        data["hook"]={"observed":True,"backend":"codex","backend_instance":parent.context.backend_instance,
+        data["hook"]={"observed":True,"backend":parent.context.harness.value,"backend_instance":parent.context.backend_instance,
             "lifecycle_namespace":parent.context.key()[:32],
+            "context_key":parent.context.key(),
             "server_id":parent.herdr_server_id,"pane_id":parent.pane_id,"tab_id":parent.tab_id,
             "workspace_id":parent.workspace_id,"at":time.time()}
     _runtime_write(root,str(parent.context.config_root),update)
@@ -109,10 +110,49 @@ def _runtime_status(root:Path,profile:str)->dict:
     result={"native_hook_loading":"observed" if hook.get("observed") is True else "unknown",
             "last_verified_binding":"unknown","observer":"unknown",
             "task_discovery":task_status,
+            "subagent_tab":{"state":"unknown","identity":{},"reason":"context_unavailable"},
             "attachment":{"known":False,"observed_counts":{}},
             "cleanup":{"known":False,"outcomes":{}},"ownership":{"known":False,"counts":{}}}
     if hook.get("observed") is True:
         result["last_verified_binding"]={k:hook.get(k) for k in ("backend","backend_instance","server_id","pane_id","tab_id","workspace_id","at")}
+    # Read tab coordination evidence from its already existing root namespace.
+    # Status must not instantiate StateStore or resolve/create a workspace anchor.
+    context_key=hook.get("context_key"); server_id=hook.get("server_id"); workspace_id=hook.get("workspace_id")
+    if (isinstance(context_key,str) and re.fullmatch(r"[a-f0-9]{64}",context_key) and isinstance(server_id,str)
+            and server_id and len(server_id)<=512 and isinstance(workspace_id,str)
+            and workspace_id and len(workspace_id)<=512):
+        digest=hashlib.sha256(json.dumps([context_key,server_id,workspace_id],sort_keys=True,separators=(",", ":")).encode()).hexdigest()
+        tab_path=root/"harness-herdr-hooks"/f"tabs-root-{digest[:32]}"/"state.json"
+        tab_status={"state":"unknown","identity":{},"reason":"state_missing"}
+        try:
+            if tab_path.parent.is_symlink() or tab_path.is_symlink(): raise ValueError("unsafe_state")
+            fd=os.open(tab_path,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+            try:
+                st=os.fstat(fd)
+                if (not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid()
+                        or stat.S_IMODE(st.st_mode)&0o077 or st.st_size>1_048_576): raise ValueError("unsafe_state")
+                raw=os.read(fd,1_048_577)
+                if len(raw)>1_048_576: raise ValueError("unsafe_state")
+            finally: os.close(fd)
+            saved=json.loads(raw)
+            if not isinstance(saved,dict) or saved.get("schema") not in {1,2}: raise ValueError("invalid_state")
+            tab=saved.get("subagent_tab")
+            if not isinstance(tab,dict): raise ValueError("state_missing")
+            state=tab.get("status")
+            if state not in {"intent","created","removed","unknown","failed"}: state="unknown"
+            identity={}
+            for key,limit in (("label",64),("generation",256),("tab_id",512),("initial_pane_id",512)):
+                value=tab.get(key)
+                if isinstance(value,str) and value and len(value)<=limit and not any(ord(c)<32 or ord(c)==127 for c in value): identity[key]=value
+            reason=tab.get("reason")
+            if reason not in {"removed","cleanup_pending","create_failed","verification_failed","state_corrupt"}: reason=None
+            tab_status={"state":state,"identity":identity}
+            if reason: tab_status["reason"]=reason
+        except FileNotFoundError: pass
+        except (OSError,ValueError,TypeError,json.JSONDecodeError) as exc:
+            reason=str(exc) if str(exc) in {"unsafe_state","invalid_state"} else "state_unavailable"
+            tab_status={"state":"unknown","identity":{},"reason":reason}
+        result["subagent_tab"]=tab_status
     observer=data.get("observer",{})
     if observer:
         pid=observer.get("pid"); pin=observer.get("pin")
@@ -447,7 +487,10 @@ def _parent_from_event(command:str, payload:bytes, client:HerdrClient):
         event,_,roots=OpenCodeAdapter.parse_bridge(payload); envelope=json.loads(payload)
         if ref["kind"]!="id": raise ValueError("OpenCode path references are not qualified")
         pid=envelope["backend"]["pid"]; url=envelope["backend"]["server_url"].rstrip("/")
-        if not any(p.get("pid")==pid and "opencode" in (str(p.get("name",""))+" "+str(p.get("argv") or "")).lower() for p in procs if isinstance(p,dict)):
+        # In display mode the pane contains the attached CLI, while the
+        # envelope PID names the original server. The owned binding below
+        # proves that server against its root pane before any API query.
+        if os.environ.get("HARNESS_HERDR_DISPLAY")!="1" and not any(p.get("pid")==pid and "opencode" in (str(p.get("name",""))+" "+str(p.get("argv") or "")).lower() for p in procs if isinstance(p,dict)):
             raise ValueError("OpenCode server PID is not the caller pane foreground process")
         root_paths=[Path(roots[k]) for k in ("config_dir","data_dir","state_dir")]
         if not all(path.is_absolute() for path in root_paths): raise ValueError("OpenCode roots must be absolute")
@@ -498,13 +541,30 @@ def _parent_from_event(command:str, payload:bytes, client:HerdrClient):
         created_context=event if event.event_name in {"SubagentStart","SubagentStop"} else None
         cwd=pane.get("cwd")
         if not isinstance(cwd,str) or not Path(cwd).is_absolute(): raise ValueError("verified Herdr pane working directory unavailable")
-        return parent,None,Path(cwd),created_context
+        normalized_cwd=Path(cwd)
+        if os.environ.get("HARNESS_HERDR_DISPLAY")=="1": parent,normalized_cwd=_normalize_display_parent(parent,client,pane,None)
+        return parent,None,normalized_cwd,created_context
         backend_pid=None
     parent=ParentBinding(context,client.server_identity(),os.environ["HERDR_WORKSPACE_ID"],os.environ["HERDR_TAB_ID"],pane_id,session_path=session_path if command!="opencode-event" else None)
-    if not client.verify_parent(parent,backend_pid): raise ValueError("parent/backend binding failed Herdr verification")
+    display=os.environ.get("HARNESS_HERDR_DISPLAY")=="1"
+    # An attached OpenCode CLI may not be the server PID. The normalizer first
+    # selects an exact owned binding, verifies its original server PID against
+    # the root pane, and only then contacts that server.
+    if not (display and command=="opencode-event") and not client.verify_parent(parent,backend_pid): raise ValueError("parent/backend binding failed Herdr verification")
     cwd=pane.get("cwd")
     if not isinstance(cwd,str) or not Path(cwd).is_absolute(): raise ValueError("verified Herdr pane working directory unavailable")
-    return parent,backend_pid,Path(cwd),created_context
+    normalized_cwd=Path(cwd)
+    if display:
+        parent,normalized_cwd=_normalize_display_parent(parent,client,pane,backend_pid)
+        if command=="opencode-event":
+            # The bridge PID is an attached plugin process hint. The owned
+            # root binding and root-pane foreground proof select the saved
+            # canonical server PID used for observation.
+            try: backend_pid=int(parent.context.backend_instance.removeprefix("pid:"))
+            except (ValueError,AttributeError): raise ValueError("canonical OpenCode server PID missing") from None
+            if isinstance(created_context,Context):
+                created_context=replace(created_context,backend_instance=parent.context.backend_instance)
+    return parent,backend_pid,normalized_cwd,created_context
 
 def _verified_pane_root(provider:CodexRuntimeAdapter, ref:dict[str,str])->str:
     """Resolve the typed Herdr root reference against this exact daemon."""
@@ -549,6 +609,103 @@ def _provider(parent:ParentBinding,pid:int|None,client:HerdrClient):
         return CodexRuntimeAdapter(parent.context,executable=executable,task_store_root=_state_root())
     if pid is None: raise ValueError("OpenCode backend PID missing")
     return OpenCodeRuntimeAdapter(parent.context,pid,herdr_client=client)
+
+def _normalize_display_parent(parent:ParentBinding, client:HerdrClient, pane:dict, pid:int|None):
+    """Map a verified attached subagent pane to its already-owned main binding."""
+    # OpenCode event payloads identify the attached CLI process, which can
+    # differ from the original server. Do not contact that payload-selected
+    # endpoint until an owned binding has selected and verified its endpoint.
+    root_context=None
+    if parent.context.harness==Harness.OPENCODE:
+        display_root=True
+    else:
+        provider=_provider(parent,pid,client)
+        try: root_context,_=provider.main_metadata(parent)
+        finally: provider.close()
+        display_root=root_context.key()!=parent.context.key()
+    if not display_root:
+        # A provider-classified independent conversation is its own root.
+        if not client.verify_parent(parent,pid): raise ValueError("independent display parent/backend binding failed verification")
+        return parent,Path(pane["cwd"])
+    root=_state_root(); directory=root/"harness-herdr-hooks"/"bindings"
+    from .attach import binding_tab_id
+    import itertools
+    from .state import session_from_dict
+    from .herdr import process_matches_attachment
+    matches=[]
+    if directory.is_symlink(): raise ValueError("unsafe binding directory")
+    paths=list(itertools.islice(directory.glob("*.json"),513))
+    if len(paths)>512: raise ValueError("owned binding scan overflow")
+    for path in paths:
+        try:
+            if path.is_symlink() or path.stat().st_size>65536: continue
+            record=load_existing_binding(root,path.stem)
+            candidate=parent_from_dict(record["parent"])
+            child=session_from_dict(record["child"])
+            if (record.get("pane_id")!=pane.get("pane_id")
+                    or (child.context.key()!=parent.context.key() and not (
+                        parent.context.harness==Harness.OPENCODE
+                        and child.context.harness==parent.context.harness
+                        and child.context.session_id==parent.context.session_id
+                        and child.context.backend_id==parent.context.backend_id
+                        and child.context.profile==parent.context.profile
+                        and child.context.config_root==parent.context.config_root
+                        and child.context.data_root==parent.context.data_root
+                        and child.context.state_root==parent.context.state_root
+                        and candidate.context.backend_instance==child.context.backend_instance
+                    ))
+                    or record.get("kind","subagent")!="subagent"
+                    or record.get("ownership","unknown") not in {"created","reused"}
+                    or (root_context is not None and candidate.context.key()!=root_context.key())
+                    or candidate.herdr_server_id!=parent.herdr_server_id
+                    or candidate.context.backend_id!=parent.context.backend_id
+                    or (parent.context.harness!=Harness.OPENCODE and candidate.context.backend_instance!=parent.context.backend_instance)
+                    or candidate.context.config_root!=parent.context.config_root
+                    or candidate.context.data_root!=parent.context.data_root
+                    or candidate.context.state_root!=parent.context.state_root
+                    or candidate.context.profile!=parent.context.profile): continue
+            original_pid=record.get("backend_pid")
+            if parent.context.harness==Harness.OPENCODE and (original_pid is None or not str(original_pid).isdigit()
+                    or candidate.context.backend_instance!=f"pid:{original_pid}"
+                    or child.context.backend_instance!=candidate.context.backend_instance): continue
+            if not client.verify_parent(candidate,original_pid): continue
+            destination=binding_tab_id(root,record,candidate)
+            if "destination" in record and destination is None: continue
+            if (destination is None and candidate.tab_id!=pane.get("tab_id")) or (destination is not None and destination!=pane.get("tab_id")) or candidate.workspace_id!=pane.get("workspace_id"): continue
+            # Verify the exact attached pane against the current Herdr snapshot.
+            snap=client.snapshot()
+            current=next((p for p in snap.get("panes",[]) if isinstance(p,dict) and p.get("pane_id")==pane.get("pane_id")),None)
+            from .model import matches_agent_session_ref
+            if (not current or any(current.get(k)!=pane.get(k) for k in ("pane_id","tab_id","workspace_id"))
+                    or not matches_agent_session_ref(current.get("agent_session"),child.context.session_id,child.session_path)
+                    or not client.verify_parent(candidate,original_pid)): continue
+            child_provider=_provider(candidate if parent.context.harness==Harness.OPENCODE else parent,
+                                     original_pid if parent.context.harness==Harness.OPENCODE else pid,client)
+            try: expected=child_provider.attach_argv(child)
+            finally: child_provider.close()
+            processes=client.process_info(pane.get("pane_id")).get("foreground_processes",[])
+            if not any(isinstance(proc,dict) and process_matches_attachment(proc,expected,child.context) for proc in processes): continue
+            if parent.context.harness==Harness.OPENCODE:
+                root_provider=_provider(candidate,original_pid,client)
+                try:
+                    # Prove the persisted child chain against the original backend.
+                    # The event-selected context may be a different attached CLI PID.
+                    persisted_child_parent=replace(candidate,context=child.context)
+                    root_context,_=root_provider.main_metadata(persisted_child_parent)
+                finally: root_provider.close()
+                if root_context.key()!=candidate.context.key(): continue
+                main_processes=client.process_info(candidate.pane_id).get("foreground_processes",[])
+                if not any(isinstance(proc,dict) and proc.get("pid")==original_pid and "opencode" in (str(proc.get("name",""))+" "+str(proc.get("argv") or "")).lower() for proc in main_processes): continue
+            matches.append(candidate)
+        except (OSError,ValueError,KeyError,TypeError):
+            continue
+    if len(matches)!=1: raise ValueError("nested display has missing or ambiguous owned main binding")
+    original=matches[0]
+    snap=client.snapshot()
+    root_pane=next((p for p in snap.get("panes",[]) if isinstance(p,dict) and p.get("pane_id")==original.pane_id),None)
+    if not root_pane or not isinstance(root_pane.get("cwd"),str) or not Path(root_pane["cwd"]).is_absolute():
+        raise ValueError("owned main pane working directory unavailable")
+    return original,Path(root_pane["cwd"])
 
 def _start_observer(parent:ParentBinding,pid:int|None,client:HerdrClient,cwd:Path,created_context=None)->None:
     root=_state_root(); binding=parent.context.key()[:64]
@@ -618,9 +775,8 @@ def main(argv:Sequence[str]|None=None)->int:
             root=_state_root()/"harness-herdr-hooks"/"launches"
             return run_claimed_launch(args.binding_id,store=LaunchStore(root),verify_destination=_verify_launch_destination,environ=os.environ)
         else:
-            # Outside Herdr, or when launched as the attachment display client,
-            # skip before consuming event input or touching private state.
-            if os.environ.get("HERDR_ENV")!="1" or os.environ.get("HARNESS_HERDR_DISPLAY")=="1": return 0
+            # Outside Herdr, skip before consuming event input or touching private state.
+            if os.environ.get("HERDR_ENV")!="1": return 0
             if args.command in {"observe","attach"}:
                 if not args.binding_id or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}",args.binding_id): raise ValueError("invalid opaque binding ID")
                 if args.command=="attach": exec_binding(args.binding_id)

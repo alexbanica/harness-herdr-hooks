@@ -5,10 +5,11 @@ verified parent session in a Herdr pane. For qualified Codex app/TUI local
 rollouts, it also recognizes a successful `codex_tui.create_thread` result
 from that exact parent and verifies the returned task independently. When a
 running task can be attached through its existing native backend, it opens
-that same session in an unfocused pane in the parent's Herdr tab. It never
-sends a prompt or starts replacement work for that attached task. A supported
+that same session in an unfocused pane in the main session's dedicated
+subagent tab. It never sends a prompt or starts replacement work for that attached task. A supported
 ordinary interactive Codex command is routed with its requested prompt once and
-leaves a usable shell after the client exits. Session titles flow one way to Herdr pane names. Finished or
+leaves a usable shell after the client exits. Session titles flow one way to
+Herdr pane names. Finished or
 unverified children are skipped; activity outside Herdr is a silent no-op.
 
 **Status: DRAFT / experimental.** Source and isolated operator/API checks pass
@@ -68,9 +69,34 @@ see [validation](docs/validation.md) and [contracts](docs/contracts.md).
 
 The integration links Codex hooks or the OpenCode plugin only in the selected
 user configuration root. It preserves unmanaged entries and refuses conflicts.
-Runtime metadata is stored under
+Profile-specific runtime metadata is stored under
 `$XDG_STATE_HOME/harness-herdr-hooks` (default `~/.local/state/harness-herdr-hooks`)
-with private directory/file permissions. State records are retained after
-uninstall for recovery; revoking the registration stops this integration's own
-helper and leaves panes and agents alone. See [isolation](docs/isolation.md)
+with private directory/file permissions. Cross-profile tab coordination uses a
+canonical per-UID workspace anchor under the account home `.local/state`; it
+rejects unsafe paths instead of falling back to a profile-specific registry.
+State records are retained after uninstall for recovery; revoking the
+registration stops this integration's own helper and leaves panes and agents alone. See [isolation](docs/isolation.md)
 and [troubleshooting](docs/troubleshooting.md).
+
+## Subagent tabs
+
+Newly eligible native subagents for each verified main session share one
+integration-managed Herdr tab, created lazily for the first attachable child.
+Nested subagents join that same tab; independent main sessions get separate
+tabs. The root's title names the tab as `Subagents: <session title> [short ID]`;
+late title changes update it, while child titles name only their panes. Routing
+and cleanup do not intentionally change focus. Existing panes are not migrated.
+
+An empty managed tab is removed after its last pane disappears. Occupied tabs,
+retained OpenCode children, and user-added panes are preserved. Codex keeps its
+owned completion cleanup; OpenCode child panes remain under OpenCode's prior
+post-attachment retention behavior. See [contracts](docs/contracts.md),
+[isolation](docs/isolation.md), and [troubleshooting](docs/troubleshooting.md).
+
+The HHH-005 implementation and isolated checks are complete, but the overall
+release remains **DRAFT**: source assurance is not native harness qualification.
+Herdr 0.9.5 / protocol 22 tab operations were observed on Nov 19, but required
+Codex and OpenCode native subagent attachment/grouping qualification is
+outstanding. Existing predecessor native gaps also remain.
+The current Codex profile still needs the user's normal hook trust/reload step;
+OpenCode qualification was unavailable. See [validation](docs/validation.md).

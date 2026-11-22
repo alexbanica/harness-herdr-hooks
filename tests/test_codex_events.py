@@ -1,3 +1,4 @@
+import json
 import unittest
 from pathlib import Path
 
@@ -48,21 +49,39 @@ class HookTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.parse(hook("SubagentStop", stop_hook_active="false"))
 
-    def test_initialize_qualifies_native_server_version_fail_closed(self):
-        self.assertEqual(AppServerProxy._qualified_version(
-            {"userAgent": "codex-tui/0.170.0 (Ubuntu 24.4.0; x86_64) herdr/0.9.5 (harness-herdr-hooks; 0.1.0)",
-             "codexHome": "/tmp"}), "0.170.0")
-        for response in (
-            {"codexHome": "/tmp"},
-            {"userAgent": "codex-tui/0.169.0 (Ubuntu 24.4.0; x86_64)", "codexHome": "/tmp"},
-            {"userAgent": {"version": "0.170.0"}, "codexHome": "/tmp"},
-            {"userAgent": "codex-tui/not-a-version (Ubuntu 24.4.0; x86_64)", "codexHome": "/tmp"},
-            {"userAgent": "codex-tui/0.170.0oops (Ubuntu 24.4.0; x86_64)", "codexHome": "/tmp"},
-            {"userAgent": "codex-tui/0.170.0 (Ubuntu 24.4.0; x86_64) ignored", "codexHome": "/tmp"},
-            [],
+    def test_initialize_accepts_known_future_unknown_and_missing_versions(self):
+        for agent, expected in (
+            ("codex-tui/0.170.0 (Ubuntu 24.4.0; x86_64)", "0.170.0"),
+            ("codex-tui/0.171.0 (Ubuntu 24.4.0; x86_64)", "0.171.0"),
+            ("codex-tui/9.99.0 (Ubuntu 24.4.0; x86_64)", "9.99.0"),
+            ("codex-tui/not-a-version (Ubuntu 24.4.0; x86_64)", None),
+            (None, None),
         ):
-            with self.subTest(response=response), self.assertRaises(ValueError):
-                AppServerProxy._qualified_version(response)
+            response = {"codexHome": "/tmp"}
+            if agent is not None:
+                response["userAgent"] = agent
+            with self.subTest(agent=agent):
+                self.assertEqual(AppServerProxy._reported_version(response), expected)
+
+    def test_request_failure_names_method_and_version_without_echoing_payload(self):
+        proxy = object.__new__(AppServerProxy)
+        proxy.server_version = "0.171.0"
+        proxy._proc = type("Proc", (), {"stdin": object(), "stdout": object(), "poll": lambda _self: None})()
+        proxy._verify_socket = lambda: None
+        proxy._next_id = 0
+        proxy.timeout = 1
+        proxy._in_startup = False
+        proxy._send_frame = lambda *_args: None
+        message = "SECRET TRANSCRIPT " + "a" * 10000
+        payload = json.dumps({"jsonrpc": "2.0", "id": 1, "error": {"message": message}}).encode()
+        proxy._recv_message = lambda *_args: (1, payload)
+        with self.assertRaisesRegex(RuntimeError, "thread/read.*0.171.0") as caught:
+            proxy.request("thread/read", {"token": "SECRET"})
+        diagnostic = str(caught.exception)
+        self.assertNotIn("SECRET", diagnostic)
+        self.assertNotIn("TRANSCRIPT", diagnostic)
+        self.assertNotIn(message, diagnostic)
+        self.assertLess(len(diagnostic), 160)
 
     def test_turn_contents_are_rejected_even_if_server_ignores_not_loaded(self):
         proxy = FakeProxy([{"data": [{"id": "turn-1", "status": "completed",

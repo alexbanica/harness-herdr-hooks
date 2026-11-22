@@ -146,3 +146,46 @@ The project remains DRAFT and Definition of Done is unmet because A5 live
 qualification remains outstanding. Existing predecessor OpenCode/macOS and
 other native qualification gaps remain independent. No result here establishes
 full native compatibility.
+
+## Codex adapter compatibility
+
+The approved Codex adapter compatibility change was checked with 23 focused
+tests and 275 full-suite tests. Both suites and `git diff --check` passed.
+The fixtures exercised Codex 0.170.0, 0.171.0, and future or unknown release metadata.
+
+The parent performed a read-only host-access probe using the isolated real
+adapter with the existing installed manifest and socket. It verified app-server
+0.171.0 initialization, `thread/loaded/list`, and a metadata-only
+`thread/read` whose returned thread ID matched the selected loaded ID. The default sandbox denied access to the endpoint, so the probe used host
+access. It reported the daemon release and ID match without emitting thread
+contents. The earlier Codex 0.170.0 runtime observations are recorded above.
+
+Live pane attachment remains unverified. The earlier shared-daemon investigation
+found missing pane markers and missing native pane session references.
+
+## HHH-005 named subagent tabs
+
+This evidence applies to the integrated HHH-005 implementation under approved
+SPEC SHA-256
+`379efe75181c91d8a8349c31986223fb55519a4c54464ebc45214bdb3b14a8b4` and
+effective PLAN SHA-256
+`13d541d4c1988aba8e8588812f2c65ad7406aad7ac2ad3e96df2188944409889`. PLAN
+amendments A1/A2 refine the canonical workspace coordination anchor and its
+safe path admission; the original approved artifact text and status remain
+preserved.
+
+| Area | Evidence obtained | Qualification limit |
+| --- | --- | --- |
+| Deterministic source QA | Final QA passed 271 tests on Python 3.12.3 and 3.11.14. | This does not prove native harness attachment or live lifecycle behavior. |
+| Timing-sensitive overflow case | An initial Python 3.12 run expected 128 sessions and observed 118. The focused check and full suite passed on rerun; no repeat cycle reproduced it. | The discrepancy remains a low, timing-sensitive concern, not an established regression. |
+| Static checks | `compileall`, shell syntax, Node syntax, JSON parsing and structural checks passed on the final source. | Static checks do not establish runtime loading or native behavior. |
+| Isolated operator checks | Isolated public install/status/uninstall checks passed for both harnesses. An additional preservation sentinel passed install/status/uninstall for both: unrelated config bytes/prefix and `0640` modes were preserved; Codex uninstall restored unrelated original bytes while retaining its existing empty `shell_environment_policy.set` table. No real profile was written. | These checks do not establish active user-profile registration, native trust, or native attachment. |
+| Herdr protocol observation | On Nov 19, targeted Herdr 0.9.5 / protocol 22 operations `tab.create`, `pane.split`, `tab.rename` and last-pane closure were observed without focus change. | This is protocol-operation evidence only. It is not Codex or OpenCode native harness qualification. |
+| Codex runtime | Current user-owned profile trust/reload remains pending. | No native Codex subagent attachment, nested grouping, no-added-turn, title synchronization, or complete lifecycle qualification is claimed. The parent may relink the profile after this documentation stage; this record does not assert it is already installed. |
+| OpenCode runtime | Native qualification was unavailable, as confirmed by the user. | Native plugin loading, child attachment, nested grouping, no-added-turn, title synchronization, and lifecycle qualification remain unverified. |
+
+Independent code and contract reviews completed, and eight findings were
+corrected before final QA. These assurance results do not substitute for native
+acceptance. HHH-005 native acceptance remains DRAFT pending Codex and
+OpenCode qualification; existing predecessor gaps also remain. This status does
+not claim that source implementation or isolated checks failed.

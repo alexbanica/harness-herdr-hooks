@@ -55,6 +55,22 @@ class StateStore:
             finally: os.close(fd)
 
     @contextmanager
+    def operation(self, name: str) -> Iterator[None]:
+        """Acquire a distinct nonblocking operation lock for tab coordination."""
+        if not name or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_." for c in name):
+            raise ValueError("invalid operation lock name")
+        fd = self._open_private_lock(name + ".operation.lock")
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise
+            yield
+        finally:
+            try: fcntl.flock(fd, fcntl.LOCK_UN)
+            finally: os.close(fd)
+
+    @contextmanager
     def task_observing(self) -> Iterator[None]:
         """Serialize local rollout snapshot/read/commit without provider calls."""
         fd = self._open_private_lock("task-observer.lock")
@@ -463,11 +479,16 @@ def _binding_path(root: Path, opaque_id: str, *, create: bool) -> Path:
 
 def save_binding(root: Path, opaque_id: str, record: dict[str, Any]) -> None:
     allowed = {"parent", "child", "pane_id", "backend_pid", "server_socket", "entrypoint", "shell_pid"}
-    optional = {"outcome", "ownership", "kind", "generation", "turn_id", "stop_hints", "close_suppressed"}
+    optional = {"outcome", "ownership", "kind", "generation", "turn_id", "stop_hints", "close_suppressed", "destination"}
     if not allowed <= set(record) or set(record) - allowed - optional: raise ValueError("binding fields do not match schema")
     if not isinstance(record["parent"], dict) or not isinstance(record["child"], dict): raise ValueError("binding identity missing")
-    from .model import parent_from_dict, session_from_dict
-    parent_from_dict(record["parent"]); session_from_dict(record["child"])
+    from .model import (parent_from_dict, session_from_dict, destination_from_dict,
+                        validate_binding_destination)
+    parent = parent_from_dict(record["parent"]); child = session_from_dict(record["child"])
+    if "destination" in record:
+        destination = destination_from_dict(record["destination"])
+        validate_binding_destination(destination, parent, child, kind=record.get("kind", "subagent"),
+                                     generation=record.get("generation"), pane_id=record.get("pane_id"))
     for key in ("pane_id", "server_socket", "entrypoint"):
         value = record[key]
         if value is not None and not isinstance(value, str): raise ValueError("invalid binding field")
@@ -524,7 +545,7 @@ def load_existing_binding(root: Path, opaque_id: str) -> dict[str, Any]:
     path = _binding_path(root, opaque_id, create=False)
     data = json.loads(path.read_text(encoding="utf-8"))
     required = {"schema", "parent", "child", "pane_id", "backend_pid", "server_socket", "entrypoint", "shell_pid"}
-    allowed = required | {"outcome", "ownership", "kind", "generation", "turn_id", "stop_hints", "close_suppressed"}
+    allowed = required | {"outcome", "ownership", "kind", "generation", "turn_id", "stop_hints", "close_suppressed", "destination"}
     if not isinstance(data, dict) or data.get("schema") not in {1, 2} or not required <= set(data) or set(data) - allowed:
         raise UnsafeState("invalid binding record schema")
     if data["schema"] == 1:
@@ -533,6 +554,16 @@ def load_existing_binding(root: Path, opaque_id: str) -> dict[str, Any]:
     if data.get("ownership") not in {"created", "reused", "unknown"} or data.get("kind") not in {"subagent", "independent", "standalone"}:
         raise UnsafeState("invalid binding ownership metadata")
     if "outcome" in data: _validate_outcome(data["outcome"])
+    if "destination" in data:
+        from .model import (destination_from_dict, parent_from_dict, session_from_dict,
+                            validate_binding_destination)
+        try:
+            validate_binding_destination(destination_from_dict(data["destination"]),
+                                         parent_from_dict(data["parent"]), session_from_dict(data["child"]),
+                                         kind=data.get("kind", "subagent"), generation=data.get("generation"),
+                                         pane_id=data.get("pane_id"))
+        except ValueError as exc:
+            raise UnsafeState("invalid binding destination association") from exc
     return data
 
 

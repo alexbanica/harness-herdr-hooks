@@ -12,10 +12,13 @@ reading event input or touching integration state.
 ## Harness boundaries
 
 - **Codex:** Only bounded Codex hook metadata and native app-server interfaces
-  are used. Codex 0.170.0 supports the verified selected-profile shared default
-  daemon and explicit Unix `--remote` endpoints; `--no-daemon` and unknown
-  launch modes are refused. The socket alias/target, user ownership, private
-  directory, process identity, and backend incarnation are pinned. Optional
+  are used. Eligibility requires successful transport and initialization,
+  expected profile identity, and valid methods and response fields for the operation. Release metadata is diagnostic
+  only, including when absent or unfamiliar. Codex 0.170.0 was observed in
+  earlier validation. Codex 0.171.0 passed fixtures and a read-only daemon probe.
+  Supported launch modes use the verified selected-profile shared default daemon
+  or a verified explicit Unix `--remote` endpoint. The socket alias/target, user ownership,
+  private directory, process identity, and backend incarnation are pinned. Optional
   Herdr foreground argv is not required. `CODEX_HOME` (or `~/.codex`) selects
   the profile; it does not prove that the backend is private. Codex's owned
   command adapter is added only to that profile's literal shell PATH setting.
@@ -66,6 +69,11 @@ cleanup, ordinary launch routing, and all race/concurrency paths remain
 unqualified. macOS runtime is a separate outstanding predecessor gap. These
 remain acceptance work; no complete support claim is made.
 
+App-server compatibility errors are bounded to the failed stage and method,
+with the daemon release when known; they omit credentials, transcript text, and
+raw responses. Shared-daemon pane attachment requires independent verification
+of pane markers and native session references.
+
 ## Standalone Codex task records
 
 Codex standalone discovery reads only newly appended qualified creation records
@@ -78,3 +86,32 @@ optional normalized cwd, context/destination pins, and retry/outcome metadata;
 it excludes prompts, raw tool results, transcript text and partial record
 bytes. This local-record association is not cryptographic ancestry proof and
 does not establish native subagent lineage.
+
+## HHH-005 subagent-tab state
+
+Tab identity is rooted in the full verified main-session context, harness,
+profile/backend incarnation, Herdr server and workspace. Titles, cwd, inherited
+environment and displayed short IDs are not ancestry or ownership proof.
+Siblings and verified nested children share the root association; independent
+sessions do not. Existing panes are not migrated, and a stale or invalidated
+association cannot authorize adoption or movement to another tab.
+
+Root-specific tab claims, child bindings and lifecycle records remain in the
+selected integration state root. To coordinate label reservations and tab
+operations across profiles and both harnesses, the implementation uses one
+canonical private workspace anchor beneath the current OS UID's account home
+(`.local/state`), resolved from the account database rather than inherited
+`HOME`, XDG, or profile variables. It admits path components through no-follow
+directory checks, rejects symlinks, non-directories, unsafe ownership or
+permissions, and does not fall back to profile-local coordination. Missing
+`.local/state` components may be created only below an admitted owner-controlled
+parent with private mode. Existing safe modes are preserved. This anchor is
+initialized only after verified Herdr runtime binding; it is not a public
+configuration override. Diagnostics identify rejected anchor components
+without weakening isolation.
+
+Cleanup revalidates ownership and contents and coordinates against new
+attachments. Empty managed tabs may close; retained children and user work are
+never closed to manufacture emptiness. Source tests of the anchor and protocol
+fixtures are not evidence of native harness qualification; see
+[validation](validation.md).

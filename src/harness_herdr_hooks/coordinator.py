@@ -5,6 +5,7 @@ import hashlib
 import os
 import secrets
 import time
+import uuid
 from dataclasses import replace
 from pathlib import Path
 from typing import Iterable, Protocol
@@ -13,6 +14,8 @@ from .model import (Context, Decision, Lifecycle, Outcome, ParentBinding, Sessio
                     matches_agent_session_ref)
 from .state import (StateStore, binding_is_close_owned, load_existing_binding,
                     save_binding, update_binding_outcome)
+from .model import destination_to_dict
+from .tabs import SubagentTabManager, OperationBusy
 
 MAX_RETRIES = 3
 
@@ -238,54 +241,90 @@ class Coordinator:
             if key in state.get("baseline", ()):
                 return Outcome(Decision.SKIP, "pre-existing session")
             if rec.get("status") == "suppressed": return Outcome(Decision.SKIP, "pane was manually closed")
-            if rec.get("status") == "attached":
-                pane_state = self.runtime.owned_pane_state(parent, child, rec["binding_id"])
-                if pane_state == "closed":
-                    rec.update(status="suppressed", reason="verified pane closure",
-                               cleanup={"outcome": "manual-close", "generation": generation})
-                    state["records"][key] = rec
-                    return Outcome(Decision.SKIP, "pane was manually closed", rec.get("binding_id"))
-                if pane_state != "live":
-                    return Outcome(Decision.WAIT, "owned pane state is unknown", rec.get("binding_id"))
-                if child.title and rec.get("title") != child.title:
-                    self.runtime.update_title(rec["binding_id"], child.title)
-                    rec["title"] = child.title
-                return Outcome(Decision.ATTACHED, binding_id=rec.get("binding_id"))
-            if rec.get("status") == "claimed":
-                binding_id = rec.get("binding_id")
-                pane_state = self.runtime.owned_pane_state(parent, child, binding_id) if binding_id else "unknown"
-                if pane_state == "live":
-                    rec.update(status="attached", title=child.title)
-                    state["records"][key] = rec
-                    return Outcome(Decision.ATTACHED, "reconciled owned pane", binding_id, rec.get("attempts", 0))
-                if pane_state == "closed":
-                    rec.update(status="suppressed", reason="verified pane closure",
-                               cleanup={"outcome": "manual-close", "generation": generation})
-                    state["records"][key] = rec
-                    return Outcome(Decision.SKIP, "pane was manually closed", binding_id)
-                return Outcome(Decision.WAIT, "stale claim ownership is unknown; fail closed", binding_id, rec.get("attempts", 0))
-            if rec.get("status") == "failed" and int(rec.get("attempts", 0)) >= MAX_RETRIES:
-                return Outcome(Decision.FAILED, "retry budget exhausted", rec.get("binding_id"), MAX_RETRIES)
-            if child.lifecycle == Lifecycle.UNKNOWN: return Outcome(Decision.SKIP, "child liveness unknown")
+            if rec.get("status") in {"attached", "claimed"}:
+                prior_status = rec.get("status")
+                binding = rec.get("binding_id")
+                attempts = int(rec.get("attempts", 0))
+                prior_generation = rec.get("generation")
+                snapshot = dict(rec)
+                reconcile = True
+            else:
+                reconcile = False
+                if rec.get("status") == "failed" and int(rec.get("attempts", 0)) >= MAX_RETRIES:
+                    return Outcome(Decision.FAILED, "retry budget exhausted", rec.get("binding_id"), MAX_RETRIES)
+                if child.lifecycle == Lifecycle.UNKNOWN: return Outcome(Decision.SKIP, "child liveness unknown")
+                attempts = int(rec.get("attempts", 0))
+                binding = hashlib.sha256(f"{key}:{generation or 'legacy'}".encode()).hexdigest()[:24]
+                state["records"][key] = {**rec, "status": "claimed", "binding_id": binding,
+                                          "attempts": attempts, "generation": generation,
+                                          "turn_id": child.turn_id or generation,
+                                          "kind": child.kind,
+                                          "ownership": "created"}
+                claim_generation = generation
+        if reconcile:
+            # Runtime callbacks may reenter StateStore, so only immutable
+            # claim data crosses the lock boundary.
+            pane_state = "unknown"
+            if binding:
+                try: pane_state = self.runtime.owned_pane_state(parent, child, binding)
+                except Exception: pass
+            if pane_state == "closed":
+                with self.store.locked() as state:
+                    current = state["records"].get(key, {})
+                    if (current.get("status") == prior_status and current.get("binding_id") == binding
+                            and current.get("generation") == prior_generation):
+                        current.update(status="suppressed", reason="verified pane closure",
+                                       cleanup={"outcome": "manual-close", "generation": generation})
+                        state["records"][key] = current
+                        return Outcome(Decision.SKIP, "pane was manually closed", binding)
+                return Outcome(Decision.WAIT, "claim changed during pane inspection", binding, attempts)
+            if pane_state != "live":
+                return Outcome(Decision.WAIT, "owned pane state is unknown", binding, attempts)
+            if prior_status == "attached" and child.title and snapshot.get("title") != child.title:
+                try: self.runtime.update_title(binding, child.title)
+                except Exception: pass
+            with self.store.locked() as state:
+                current = state["records"].get(key, {})
+                if (current.get("status") == prior_status and current.get("binding_id") == binding
+                        and current.get("generation") == prior_generation):
+                    current.update(status="attached", title=child.title)
+                    state["records"][key] = current
+                    return Outcome(Decision.ATTACHED,
+                                   "reconciled owned pane" if prior_status == "claimed" else None,
+                                   binding, attempts)
+            return Outcome(Decision.WAIT, "claim changed during pane inspection", binding, attempts)
+        # Pane discovery is an external runtime operation, outside StateStore.
+        try:
             existing = self.runtime.find_existing_pane(parent, child)
-            binding = existing or hashlib.sha256(f"{key}:{generation or 'legacy'}".encode()).hexdigest()[:24]
-            attempts = int(rec.get("attempts", 0))
-            state["records"][key] = {**rec, "status": "claimed", "binding_id": binding,
-                                      "attempts": attempts, "generation": generation,
-                                      "turn_id": child.turn_id or generation,
-                                      "kind": child.kind,
-                                      "ownership": "reused" if existing else "created"}
+        except OperationBusy:
+            self._defer_claim(key, binding, claim_generation, attempts)
+            return Outcome(Decision.WAIT, "tab operation busy; deferred", binding, attempts)
+        except Exception:
+            existing = None
+        if existing:
+            with self.store.locked() as state:
+                current = state["records"].get(key, {})
+                if (current.get("status") == "claimed" and current.get("binding_id") == binding
+                        and current.get("generation") == claim_generation):
+                    binding = existing
+                    current.update(binding_id=binding, ownership="reused")
+                    state["records"][key] = current
+                else:
+                    return Outcome(Decision.WAIT, "claim changed during pane discovery", existing, attempts)
         # Claim lock is released for the bounded external operation. Claim prevents duplicate callers.
         try:
             live = child.lifecycle == Lifecycle.RUNNING and child.attachable and self.runtime.can_attach_now(parent, child)
         except Exception:
             live = False
         if not live:
-            self._retry(key, binding, attempts + 1)
+            self._retry(key, binding, claim_generation, attempts + 1)
             return Outcome(Decision.WAIT if attempts + 1 < MAX_RETRIES else Decision.FAILED,
                            "child not yet attachable", binding, attempts + 1)
         try:
             ok = bool(existing) or self.runtime.open_and_attach(parent, child, binding)
+        except OperationBusy:
+            self._defer_claim(key, binding, claim_generation, attempts)
+            return Outcome(Decision.WAIT, "tab operation busy; deferred", binding, attempts)
         except Exception:
             ok = False
         capture = getattr(self.runtime, "capture_owned_process", None)
@@ -297,6 +336,9 @@ class Coordinator:
                 process_pin = None
         with self.store.locked() as state:
             rec = state["records"].get(key, {})
+            if (rec.get("status") != "claimed" or rec.get("binding_id") != binding
+                    or rec.get("generation") != claim_generation):
+                return Outcome(Decision.WAIT, "claim changed during attachment", binding, attempts)
             if ok:
                 rec.update(status="attached", title=child.title,
                            ownership="reused" if existing else "created")
@@ -309,6 +351,15 @@ class Coordinator:
             state["records"][key] = rec
         return Outcome(Decision.FAILED if next_attempt >= MAX_RETRIES else Decision.WAIT,
                        "attach failed", binding, next_attempt)
+
+    def _defer_claim(self, key: str, binding: str, generation: str | None, attempts: int) -> None:
+        """Return a transiently busy claim to pending without consuming a retry."""
+        with self.store.locked() as state:
+            current = state["records"].get(key, {})
+            if (current.get("status") == "claimed" and current.get("binding_id") == binding
+                    and current.get("generation") == generation):
+                current.update(status="pending", attempts=attempts)
+                state["records"][key] = current
 
     def _handle_terminal(self, parent: ParentBinding, child: Session, key: str,
                          generation: str, terminal_status: str | None) -> Outcome:
@@ -416,11 +467,13 @@ class Coordinator:
             return True  # malformed/legacy claim: fail closed
         return cls._process_start_ticks(pid) == started
 
-    def _retry(self, key: str, binding: str, attempts: int) -> None:
+    def _retry(self, key: str, binding: str, generation: str | None, attempts: int) -> None:
         with self.store.locked() as state:
             rec = state["records"].get(key, {})
-            rec.update(status="failed" if attempts >= MAX_RETRIES else "pending", binding_id=binding, attempts=attempts)
-            state["records"][key] = rec
+            if (rec.get("status") == "claimed" and rec.get("binding_id") == binding
+                    and rec.get("generation") == generation):
+                rec.update(status="failed" if attempts >= MAX_RETRIES else "pending", attempts=attempts)
+                state["records"][key] = rec
 
     def _confirmed_terminal(self, child: Session, generation: str) -> str | None:
         """Require the exact latest persisted terminal turn and a known safe thread state."""
@@ -464,6 +517,27 @@ class NativeRuntime:
         self.store, self.provider, self.herdr = store, provider, herdr
         self.entrypoint, self.backend_pid = entrypoint, backend_pid
         self.state_root = state_root or store.root.parent.parent
+        self._tab_manager = None
+
+    def _tabs(self, parent: ParentBinding):
+        metadata = getattr(self.provider, "main_metadata", None)
+        if not callable(metadata):
+            return None
+        root, title = metadata(parent)
+        # Nested clients are routed only after CLI normalization establishes
+        # the original main context as the native root.
+        if root != parent.context:
+            return None
+        identity = (root.key(), parent.herdr_server_id, parent.workspace_id)
+        if getattr(self, "_tab_identity", None) != identity:
+            self._tab_manager = SubagentTabManager(self.store, root, parent.herdr_server_id,
+                                                    parent.workspace_id)
+            self._tab_identity = identity
+        # Refresh metadata on every observer/operation entry. Missing later
+        # titles are retained by sync_title rather than replacing the label.
+        if isinstance(title, str) and title.strip():
+            self._root_title = title
+        return self._tab_manager
 
     def verify_parent(self, parent: ParentBinding) -> bool:
         try:
@@ -576,10 +650,32 @@ class NativeRuntime:
 
     def find_existing_pane(self, parent: ParentBinding, child: Session) -> str | None:
         if not self.verify_parent(parent) or not self.can_attach_now(parent, child): return None
+        managed = self._tabs(parent) if child.kind == "subagent" else None
+        if managed is not None:
+            try:
+                with managed.operations() as token:
+                    managed.reconcile(token, self.herdr)
+                    destination = managed.destination(token)
+                    return self._find_existing_pane_at(parent, child, destination, token, managed)
+            except OperationBusy:
+                raise
+            except Exception:
+                return None
+        return self._find_existing_pane_at(parent, child, None, None, None)
+
+    def _find_existing_pane_at(self, parent: ParentBinding, child: Session, destination,
+                               token, manager) -> str | None:
+        tab_id = destination.tab_id if destination is not None else parent.tab_id
         try: snap = self.herdr.snapshot()
         except Exception: return None
+        if destination is not None:
+            try:
+                if self.herdr.server_identity() != destination.herdr_server_id:
+                    return None
+            except Exception:
+                return None
         for pane in snap.get("panes", []):
-            if not isinstance(pane, dict) or pane.get("workspace_id") != parent.workspace_id or pane.get("tab_id") != parent.tab_id: continue
+            if not isinstance(pane, dict) or pane.get("workspace_id") != parent.workspace_id or pane.get("tab_id") != tab_id: continue
             ref = pane.get("agent_session")
             if not matches_agent_session_ref(ref, child.context.session_id, child.session_path): continue
             if child.context.harness.value not in (str(ref.get("agent", "")) + " " + str(ref.get("source", ""))).lower(): continue
@@ -589,13 +685,23 @@ class NativeRuntime:
             if (len(procs) == 1 and isinstance(procs[0], dict)
                     and self._process_matches(procs[0], child)):
                 binding = self._opaque_id(child)
-                save_binding(self.state_root, binding, {"parent": parent_to_dict(parent),
+                binding_record = {"parent": parent_to_dict(parent),
                     "child": session_to_dict(child), "pane_id": pane.get("pane_id"),
                     "backend_pid": self.backend_pid, "server_socket": str(self.herdr.socket_path),
                     "entrypoint": str(self.entrypoint), "shell_pid": None,
                     "ownership": "reused", "kind": child.kind,
                     "generation": child.generation or child.turn_id,
-                    "turn_id": child.turn_id or child.generation})
+                    "turn_id": child.turn_id or child.generation}
+                if destination is not None:
+                    # The current exact root-owned tab is the fallback search
+                    # scope. A matching live native session there can be
+                    # adopted into the claim even when older state did not
+                    # record that pane ID.
+                    destination = manager.bind_child(token, destination,
+                        child_pane_id=pane.get("pane_id"))
+                    binding_record["destination"] = destination_to_dict(
+                        replace(destination, child_pane_id=pane.get("pane_id")))
+                save_binding(self.state_root, binding, binding_record)
                 self.herdr.rename(pane["pane_id"], self.herdr.safe_label(child.title, child.context.harness.value, child.context.session_id))
                 return binding
         return None
@@ -623,8 +729,16 @@ class NativeRuntime:
             if not record.get("pane_id"): return "unknown"
             snap = self.herdr.snapshot()
             pane = next((p for p in snap.get("panes", []) if isinstance(p, dict) and p.get("pane_id") == record.get("pane_id")), None)
+            # A previously persisted managed-pane binding may outlive its tab
+            # claim after a confirmed manual tab removal. Absence is safe
+            # suppression evidence; a present pane still needs a live exact
+            # destination association before it can be considered owned.
             if pane is None: return "closed"
-            if pane.get("workspace_id") != parent.workspace_id or pane.get("tab_id") != parent.tab_id: return "unknown"
+            from .attach import binding_tab_id
+            destination_tab = binding_tab_id(self.state_root, record, parent)
+            if record.get("destination") is not None and destination_tab is None: return "unknown"
+            expected_tab = destination_tab or parent.tab_id
+            if pane.get("workspace_id") != parent.workspace_id or pane.get("tab_id") != expected_tab: return "unknown"
             ref = pane.get("agent_session")
             if not matches_agent_session_ref(ref, child.context.session_id, child.session_path): return "unknown"
             info = self.herdr.process_info(record["pane_id"])
@@ -706,9 +820,37 @@ class NativeRuntime:
     def close_owned_pane(self, parent: ParentBinding, child: Session, binding_id: str,
                          generation: str, terminal_status: str,
                          process_pin: dict[str, object] | None) -> bool:
+        """Serialize managed-pane close with create/attach/title reconciliation."""
+        try:
+            record = load_existing_binding(self.state_root, binding_id)
+            if record.get("destination") is None:
+                return self._close_owned_pane_unlocked(parent, child, binding_id, generation,
+                                                       terminal_status, process_pin)
+            manager = self._tabs(parent)
+            if manager is None:
+                return False
+            with manager.operations() as token:
+                status = manager.reconcile(token, self.herdr)
+                if status == "removed":
+                    return False
+                result = self._close_owned_pane_unlocked(parent, child, binding_id, generation,
+                                                          terminal_status, process_pin)
+                if result:
+                    manager.reconcile(token, self.herdr)
+                return result
+        except Exception:
+            return False
+
+    def _close_owned_pane_unlocked(self, parent: ParentBinding, child: Session, binding_id: str,
+                         generation: str, terminal_status: str,
+                         process_pin: dict[str, object] | None) -> bool:
         """Close only the integration-created pane for the confirmed generation."""
         try:
             record = load_existing_binding(self.state_root, binding_id)
+            from .attach import binding_tab_id
+            destination_tab = binding_tab_id(self.state_root, record, parent)
+            if record.get("destination") is not None and destination_tab is None: return False
+            expected_tab = destination_tab or parent.tab_id
             if (not binding_is_close_owned(record) or record.get("generation") != generation
                     or record.get("turn_id") != (child.turn_id or generation)
                     or record.get("kind") != "subagent"
@@ -760,8 +902,12 @@ class NativeRuntime:
             latest = self.herdr.snapshot()
             pane = next((p for p in latest.get("panes", [])
                          if isinstance(p, dict) and p.get("pane_id") == record["pane_id"]), None)
+            from .attach import binding_tab_id
+            destination_tab = binding_tab_id(self.state_root, record, parent)
+            if record.get("destination") is not None and destination_tab is None: return False
+            expected_tab = destination_tab or parent.tab_id
             if (not pane or pane.get("workspace_id") != parent.workspace_id
-                    or pane.get("tab_id") != parent.tab_id
+                    or pane.get("tab_id") != expected_tab
                     or not matches_agent_session_ref(pane.get("agent_session"),
                                                      child.context.session_id, child.session_path)):
                 return False
@@ -813,36 +959,168 @@ class NativeRuntime:
     def open_and_attach(self, parent: ParentBinding, child: Session, binding_id: str) -> bool:
         if not self.can_attach_now(parent, child): return False
         try:
-            # A prior split/launch may have raced with a crash. Never overwrite
-            # its evidence or create another pane when its outcome is unknown.
             load_existing_binding(self.state_root, binding_id)
             return False
         except FileNotFoundError:
             pass
+        manager = self._tabs(parent) if child.kind == "subagent" else None
+        if child.kind == "subagent" and manager is None:
+            return False
+        token = None
+        created_destination = False
+        try:
+            if manager is not None:
+                token_context = manager.operations()
+                token = token_context.__enter__()
+                if not self.verify_parent(parent) or not self.can_attach_now(parent, child):
+                    token_context.__exit__(None, None, None); token = None
+                    return False
+                manager.reconcile(token, self.herdr)
+                destination = manager.destination(token)
+                if destination is None:
+                    destination = manager.select_create(token, self.herdr, child.cwd, getattr(self, "_root_title", None),
+                                                        parent.context.session_id,
+                                                        uuid.uuid4().hex,
+                                                        env={"HARNESS_HERDR_STATE_ROOT": str(self.state_root)})
+                    created_destination = True
+                    initial_pane_id = destination.initial_pane_id
+                    # The acknowledged initial pane is part of our owned
+                    # destination before the wrapper's preflight validates it.
+                    manager.bind_child(token, destination, child_pane_id=initial_pane_id)
+                    target_pane_id = None
+                else:
+                    initial_pane_id = destination.initial_pane_id
+                    snap = self.herdr.snapshot()
+                    rows = snap.get("panes", []) if isinstance(snap, dict) else []
+                    owned = {initial_pane_id}
+                    with token.root_store.locked() as tab_state:
+                        raw = tab_state.get("subagent_tab", {}).get("pane_ids", [])
+                        if isinstance(raw, list): owned.update(x for x in raw if isinstance(x, str))
+                    target_pane_id = next((p.get("pane_id") for p in rows if isinstance(p, dict)
+                                           and p.get("tab_id") == destination.tab_id
+                                           and p.get("workspace_id") == destination.workspace_id
+                                           and p.get("pane_id") in owned), None)
+                    if target_pane_id is None:
+                        # The exact current root claim and pinned destination
+                        # authorize a split from a user pane in this tab. The
+                        # pane is only an anchor; it is never bound or closed.
+                        target_pane_id = next((p.get("pane_id") for p in rows if isinstance(p, dict)
+                                               and p.get("tab_id") == destination.tab_id
+                                               and p.get("workspace_id") == destination.workspace_id
+                                               and isinstance(p.get("pane_id"), str)), None)
+                        if target_pane_id is None:
+                            token_context.__exit__(None, None, None); token = None
+                            return False
+            else:
+                destination = None
+                initial_pane_id = target_pane_id = None
+        except BaseException:
+            if token is not None:
+                token_context.__exit__(None, None, None); token = None
+            raise
         record = {"parent": parent_to_dict(parent), "child": session_to_dict(child),
                   "pane_id": None, "backend_pid": self.backend_pid,
                   "server_socket": str(self.herdr.socket_path), "entrypoint": str(self.entrypoint),
                   "shell_pid": None, "ownership": "created", "kind": child.kind,
                   "generation": child.generation or child.turn_id,
                   "turn_id": child.turn_id or child.generation}
-        save_binding(self.state_root, binding_id, record)
+        if destination is not None:
+            record["destination"] = destination_to_dict(destination)
+        cleanup_capture_proven = False
+        if created_destination:
+            # Record the acknowledged bootstrap pane and shell before
+            # attach_in_new_pane performs its second child-liveness preflight.
+            # This lets recovery distinguish this integration-created shell
+            # from a user's pane without guessing from a later snapshot.
+            try:
+                bootstrap = self.herdr.process_info(initial_pane_id)
+                record["pane_id"] = initial_pane_id
+                shell_pid = bootstrap.get("shell_pid")
+                record["shell_pid"] = shell_pid if isinstance(shell_pid, int) else None
+                snap = self.herdr.snapshot()
+                rows = snap.get("panes") if isinstance(snap, dict) else None
+                pane = next((p for p in rows or [] if isinstance(p, dict)
+                             and p.get("pane_id") == initial_pane_id), None)
+                fg = bootstrap.get("foreground_processes")
+                from .attach import shell_is_ready
+                cleanup_capture_proven = bool(
+                    pane and pane.get("workspace_id") == destination.workspace_id
+                    and pane.get("tab_id") == destination.tab_id
+                    and pane.get("cwd") == str(child.cwd.resolve())
+                    and pane.get("agent_session") is None
+                    and isinstance(shell_pid, int)
+                    and isinstance(fg, list) and len(fg) == 1
+                    and isinstance(fg[0], dict) and fg[0].get("pid") == shell_pid
+                    and fg[0].get("cwd") == str(child.cwd.resolve())
+                    and shell_is_ready(bootstrap))
+            except Exception:
+                # Missing process evidence is retained as unknown; do not
+                # treat the shell as cleanup-safe.
+                record["shell_pid"] = None
+        try:
+            save_binding(self.state_root, binding_id, record)
+        except Exception:
+            if token is not None:
+                token_context.__exit__(None, None, None); token = None
+            return False
         from .attach import attach_in_new_pane
-        def created(pane_id: str, process_info: dict) -> None:
+        attachment_state = {"callback": False}
+        def created(pane_id: str, process_info: dict, _destination=None) -> None:
+            attachment_state["callback"] = True
             record["pane_id"] = pane_id
             shell_pid = process_info.get("shell_pid")
             record["shell_pid"] = shell_pid if isinstance(shell_pid, int) else None
+            if destination is not None:
+                bound = manager.bind_child(token, destination, child_pane_id=pane_id)
+                record["destination"] = destination_to_dict(bound)
             save_binding(self.state_root, binding_id, record)
         try:
             pane_id = attach_in_new_pane(self.herdr, self, parent, child, self.entrypoint,
                                          binding_id, self.state_root, self.backend_pid,
                                          on_pane_created=created,
-                                         preserve_shell=child.kind == "standalone")
+                                         preserve_shell=child.kind == "standalone",
+                                         destination=destination, initial_pane_id=initial_pane_id,
+                                         target_pane_id=target_pane_id)
             attached = bool(pane_id and record.get("pane_id") == pane_id and self.owned_pane_state(parent, child, binding_id) == "live")
             if attached:
                 update_binding_outcome(self.state_root, binding_id, "attached", record.get("shell_pid"))
                 self.herdr.rename(pane_id, self.herdr.safe_label(child.title, child.context.harness.value, child.context.session_id))
             return attached
-        except Exception: return False
+        except Exception:
+            # Only a newly created destination's untouched initial shell can
+            # be removed after preflight rejects the child. This proof is
+            # local to this call and never survives as invented state.
+            if (created_destination and cleanup_capture_proven
+                    and not attachment_state["callback"]):
+                try:
+                    if self.verify_parent(parent) and self.herdr.server_identity() == parent.herdr_server_id:
+                        managed_now = manager.destination(token)
+                        if (managed_now is not None and destination is not None
+                                and managed_now == destination):
+                            snap = self.herdr.snapshot()
+                            pane = next((p for p in snap.get("panes", []) if isinstance(p, dict)
+                                         and p.get("pane_id") == initial_pane_id), None)
+                            info = self.herdr.process_info(initial_pane_id)
+                            from .attach import shell_is_ready
+                            fg = info.get("foreground_processes")
+                            sole_shell = (isinstance(fg, list) and len(fg) == 1
+                                and isinstance(fg[0], dict)
+                                and fg[0].get("pid") == record.get("shell_pid")
+                                and fg[0].get("cwd") == str(child.cwd.resolve()))
+                            if (pane and pane.get("workspace_id") == destination.workspace_id
+                                    and pane.get("tab_id") == destination.tab_id
+                                    and pane.get("agent_session") is None
+                                    and pane.get("cwd") == str(child.cwd.resolve())
+                                    and info.get("shell_pid") == record.get("shell_pid")
+                                    and shell_is_ready(info) and sole_shell):
+                                self.herdr.close(initial_pane_id)
+                                manager.reconcile(token, self.herdr)
+                except Exception:
+                    pass
+            return False
+        finally:
+            if token is not None:
+                token_context.__exit__(None, None, None)
 
 
 def run_observer(parent: ParentBinding, store: StateStore, provider: object,
@@ -864,6 +1142,16 @@ def run_observer(parent: ParentBinding, store: StateStore, provider: object,
         started = True
         while runtime.verify_parent(parent):
             try:
+                manager = runtime._tabs(parent)
+                if manager is not None:
+                    try:
+                        with manager.operations() as token:
+                            manager.reconcile(token, herdr)
+                            root, root_title = provider.main_metadata(parent)
+                            if root == parent.context:
+                                manager.sync_title(token, herdr, root_title, parent.context.session_id)
+                    except OperationBusy:
+                        pass
                 for child in runtime.sessions(parent):
                     outcome = coordinator.handle(parent, child)
                     proof = child.creation_proof
