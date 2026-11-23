@@ -204,6 +204,110 @@ class HerdrClient:
         snap=r.get('snapshot')
         if not isinstance(snap,dict) or snap.get('protocol')!=22: raise HerdrError('protocol 22 snapshot unavailable')
         return snap
+
+    @staticmethod
+    def _session_ref_matches(ref:Any,session_id:str,session_path:Path|str|None,harness:str)->bool:
+        if not isinstance(ref,dict): return False
+        if ref.get('agent') != harness or not isinstance(ref.get('source'),str): return False
+        path=Path(session_path) if session_path is not None else None
+        return matches_agent_session_ref(ref,session_id,path)
+
+    def session_destination(self,session_id:str,*,session_path:Path|str|None=None,
+                            harness:str='codex')->dict[str,str]|None:
+        """Resolve one authenticated session's unique Herdr tab without process metadata.
+
+        Multiple panes for the same native session are allowed in one tab; the
+        lexically first pane ID is the deterministic split anchor. References
+        spanning workspaces or tabs are ambiguous and produce no destination.
+        """
+        if not isinstance(session_id,str) or not session_id or harness not in {'codex','opencode'}:
+            return None
+        try:
+            snap=self.snapshot()
+            if self.peer_identity is None or self.peer_identity[0]!=os.getuid(): return None
+            server_id=self.server_identity()
+            panes=snap.get('panes')
+            if not isinstance(panes,list): return None
+            matches=[]
+            for pane in panes:
+                if (not isinstance(pane,dict) or not isinstance(pane.get('pane_id'),str)
+                        or not pane['pane_id'] or not isinstance(pane.get('workspace_id'),str)
+                        or not pane['workspace_id'] or not isinstance(pane.get('tab_id'),str)
+                        or not pane['tab_id']): continue
+                if self._session_ref_matches(pane.get('agent_session'),session_id,session_path,harness):
+                    matches.append(pane)
+            destinations={(pane['workspace_id'],pane['tab_id']) for pane in matches}
+            if len(destinations)!=1: return None
+            workspace_id,tab_id=next(iter(destinations))
+            anchor=min(pane['pane_id'] for pane in matches)
+            return {'server_id':server_id,'workspace_id':workspace_id,'tab_id':tab_id,
+                    'anchor_pane_id':anchor}
+        except (HerdrError,OSError,TypeError,ValueError,RuntimeError):
+            return None
+
+    def pane_has_session(self,pane_id:str,session_id:str,*,session_path:Path|str|None=None,
+                         harness:str='codex',workspace_id:str|None=None,
+                         tab_id:str|None=None)->bool:
+        """Check an exact native session reference on one pane in a fresh snapshot."""
+        if not all((isinstance(pane_id,str),pane_id,isinstance(session_id,str),session_id)):
+            return False
+        if harness not in {'codex','opencode'}: return False
+        try:
+            if self.peer_identity is None or self.peer_identity[0]!=os.getuid(): return False
+            snap=self.snapshot(); panes=snap.get('panes')
+            if not isinstance(panes,list): return False
+            found=[p for p in panes if isinstance(p,dict) and p.get('pane_id')==pane_id]
+            if len(found)!=1: return False
+            pane=found[0]
+            if workspace_id is not None and pane.get('workspace_id')!=workspace_id: return False
+            if tab_id is not None and pane.get('tab_id')!=tab_id: return False
+            return self._session_ref_matches(pane.get('agent_session'),session_id,session_path,harness)
+        except (HerdrError,OSError,TypeError,ValueError,RuntimeError): return False
+
+    def start_agent(self,pane_id:str,binding_id:str,args:list[str])->str:
+        """Start an exact Codex session through Herdr's typed managed-agent API.
+
+        The opaque launch name is stable for a binding and claimed pane, so a
+        retry cannot create a second logical name for the same start intent.
+        """
+        import hashlib, re
+        if (not isinstance(pane_id,str) or not pane_id or len(pane_id)>512
+                or not isinstance(binding_id,str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,256}',binding_id)
+                or not isinstance(args,list) or len(args)!=4
+                or args[0:2]!=['resume','--remote'] or not all(isinstance(x,str) and x for x in args)):
+            raise HerdrError('invalid managed Codex start request')
+        uri=args[2]
+        if not uri.startswith('unix:///') or not args[3] or not Path(uri[len('unix://'):]).is_absolute():
+            raise HerdrError('managed Codex start requires an absolute verified Unix socket URI and thread ID')
+        name='hc-'+hashlib.sha256(json.dumps([pane_id,binding_id],separators=(',',':')).encode()).hexdigest()[:32]
+        result=self.request('agent.start',{'kind':'codex','pane_id':pane_id,'name':name,
+            'args':list(args),'timeout_ms':4000})
+        agent=result.get('agent')
+        argv=result.get('argv')
+        if (result.get('type')!='agent_started' or not isinstance(agent,dict)
+                or agent.get('pane_id')!=pane_id or not isinstance(argv,list)
+                or not argv or not all(isinstance(value,str) for value in argv)):
+            raise HerdrError('managed agent start acknowledgement failed exact pane checks')
+        return pane_id
+    def split_standalone(self, workspace_id: str, anchor_pane_id: str, cwd: Path,
+                         *, env: dict[str, str]) -> dict[str, Any]:
+        if (not workspace_id or not anchor_pane_id or not cwd.is_absolute()
+                or set(env)!={'CODEX_HOME','HARNESS_HERDR_DISPLAY','HARNESS_HERDR_STATE_ROOT'}
+                or env['HARNESS_HERDR_DISPLAY']!='1'
+                or not all(Path(env[key]).is_absolute()
+                           for key in ('CODEX_HOME','HARNESS_HERDR_STATE_ROOT'))):
+            raise HerdrError('invalid standalone split destination or environment')
+        result=self.request('pane.split',{'direction':'right','target_pane_id':anchor_pane_id,
+            'workspace_id':workspace_id,'cwd':str(cwd.resolve()),'focus':False,'env':dict(env)})
+        pane=result.get('pane')
+        if (result.get('type')!='pane_info' or not isinstance(pane,dict)
+                or not isinstance(pane.get('pane_id'),str) or not pane['pane_id']
+                or pane['pane_id']==anchor_pane_id or pane.get('workspace_id')!=workspace_id
+                or not isinstance(pane.get('tab_id'),str) or not pane['tab_id']
+                or pane.get('focused') is not False):
+            raise HerdrError('standalone split acknowledgement failed destination checks')
+        return pane
+
     def split(self,parent:Any,cwd:Path,env:dict[str,str]|None=None)->str:
         params={'direction':'right','target_pane_id':parent.pane_id,'workspace_id':parent.workspace_id,'cwd':str(cwd.resolve()),'focus':False}
         if env is not None:
@@ -215,58 +319,6 @@ class HerdrClient:
         pane=pane_info.get('pane_id') if pane_info else None
         if not isinstance(pane,str) or not pane or pane_info.get('workspace_id')!=parent.workspace_id or pane_info.get('tab_id')!=parent.tab_id or pane_info.get('focused') is not False: raise HerdrError('split did not acknowledge pane ID')
         return pane
-    def create_subagent_tab(self, workspace_id: str, cwd: Path, label: str,
-                            env: dict[str, str] | None = None) -> tuple[str, str]:
-        """Create an unfocused protocol-22 tab and return its acknowledged tab/root pane IDs."""
-        if not workspace_id or not label or len(label) > 64 or not cwd.is_absolute():
-            raise HerdrError('invalid subagent tab creation request')
-        expected_cwd = str(cwd.resolve())
-        params = {'workspace_id': workspace_id, 'cwd': expected_cwd,
-                  'label': label, 'focus': False}
-        if env is not None:
-            if set(env) != {'HARNESS_HERDR_STATE_ROOT'} or not Path(env['HARNESS_HERDR_STATE_ROOT']).is_absolute():
-                raise HerdrError('tab creation accepts only the absolute integration state hint')
-            params['env'] = dict(env)
-        r = self.request('tab.create', params)
-        tab, pane = r.get('tab'), r.get('root_pane')
-        if (r.get('type') != 'tab_created' or not isinstance(tab, dict) or not isinstance(pane, dict)
-                or not all(isinstance(x, str) and x for x in (tab.get('tab_id'), pane.get('pane_id')))
-                or tab.get('workspace_id') != workspace_id or pane.get('workspace_id') != workspace_id
-                or pane.get('tab_id') != tab.get('tab_id') or tab.get('focused') is not False
-                or tab.get('label') != label or pane.get('focused') is not False or pane.get('cwd') != expected_cwd):
-            raise HerdrError('tab creation acknowledgement failed strict identity checks')
-        return tab['tab_id'], pane['pane_id']
-
-    def split_subagent_tab(self, target_pane_id: str, workspace_id: str, tab_id: str,
-                           cwd: Path, env: dict[str, str] | None = None) -> str:
-        if not all((target_pane_id, workspace_id, tab_id)) or not cwd.is_absolute():
-            raise HerdrError('invalid subagent split request')
-        params = {'direction': 'right', 'target_pane_id': target_pane_id,
-                  'workspace_id': workspace_id, 'cwd': str(cwd.resolve()), 'focus': False}
-        if env is not None:
-            if set(env) != {'HARNESS_HERDR_STATE_ROOT'} or not Path(env['HARNESS_HERDR_STATE_ROOT']).is_absolute():
-                raise HerdrError('split accepts only the absolute integration state hint')
-            params['env'] = dict(env)
-        r = self.request('pane.split', params)
-        pane = r.get('pane')
-        if (r.get('type') != 'pane_info' or not isinstance(pane, dict)
-                or not isinstance(pane.get('pane_id'), str) or not pane.get('pane_id')
-                or pane.get('workspace_id') != workspace_id or pane.get('tab_id') != tab_id
-                or pane.get('pane_id') == target_pane_id or pane.get('focused') is not False
-                or pane.get('cwd') != str(cwd.resolve())):
-            raise HerdrError('split acknowledgement failed strict destination checks')
-        return pane['pane_id']
-
-    def rename_subagent_tab(self, tab_id: str, workspace_id: str, label: str) -> None:
-        if not tab_id or not workspace_id or not label or len(label) > 64:
-            raise HerdrError('invalid tab rename request')
-        r = self.request('tab.rename', {'tab_id': tab_id, 'label': label})
-        tab = r.get('tab')
-        if (r.get('type') != 'tab_info' or not isinstance(tab, dict)
-                or tab.get('tab_id') != tab_id or tab.get('workspace_id') != workspace_id
-                or tab.get('label') != label or not isinstance(tab.get('focused'), bool)):
-            raise HerdrError('tab rename acknowledgement failed strict identity checks')
-
     @staticmethod
     def safe_label(title:str|None,harness:str,session_id:str,limit:int=64)->str:
         raw=title or f'{harness} {session_id[:8]}'

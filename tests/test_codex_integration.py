@@ -55,240 +55,29 @@ class BootstrapIntegrationTests(unittest.TestCase):
                 _verified_pane_root(provider, {"kind": "path", "value": "/runs/foreign.jsonl"})
 
 
-class NativeHookBootstrapTests(unittest.TestCase):
-    """Exercise the real event boundary with only native/Herdr transports mocked."""
-
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name)
-        self.env = {"HERDR_ENV": "1", "HERDR_SOCKET_PATH": "/herdr.sock",
-                    "HERDR_PANE_ID": "pane-root", "HERDR_TAB_ID": "tab-root",
-                    "HERDR_WORKSPACE_ID": "workspace-root", "CODEX_HOME": str(self.root / "codex")}
-        (self.root / "codex").mkdir()
-        self.rows = [
-            {"id": "root-thread", "path": "/runs/root.jsonl"},
-            {"id": "child-thread", "path": "/runs/child.jsonl", "parentThreadId": "root-thread",
-             "source": {"subAgent": {"thread_spawn": {"parent_thread_id": "root-thread"}}}},
-        ]
-
-    def tearDown(self):
-        self.tmp.cleanup()
-
-    def _run_parent_event(self, ref, *, event=None, rows=None):
-        from harness_herdr_hooks.cli import _parent_from_event
-
-        class Provider(FakeProvider):
-            closed = False
-            def close(provider_self):
-                provider_self.closed = True
-            _verified_chain = staticmethod(CodexRuntimeAdapter._verified_chain)
-
-        provider = Provider(self.rows if rows is None else rows)
-        pane = {"pane_id": "pane-root", "tab_id": "tab-root", "workspace_id": "workspace-root",
-                "agent_session": ref, "cwd": str(self.root)}
-        client = Mock()
-        client.snapshot.return_value = {"panes": [pane]}
-        client.server_identity.return_value = "server-root"
-        client.process_info.return_value = {"foreground_processes": [{"pid": 71, "name": "codex"}]}
-        event = event or {"hook_event_name": "SubagentStart", "session_id": "child-thread",
-                          "agent_id": "child-thread", "agent_type": "explorer", "turn_id": "turn-1",
-                          "cwd": str(self.root), "transcript_path": None, "extra_native_field": "ignored"}
-        proof = {"socket_target": "/tmp/codex.sock", "socket_identity": [1, 2, 3],
-                 "executable": "/usr/bin/codex", "pid": 71, "uid": os.getuid(), "start_ticks": 2}
-        with patch.dict(os.environ, self.env, clear=False), \
-             patch("harness_herdr_hooks.cli.codex_backend_proof", return_value=proof), \
-             patch("harness_herdr_hooks.cli._native_codex_executable", return_value="/usr/bin/codex"), \
-             patch("harness_herdr_hooks.cli.CodexRuntimeAdapter", return_value=provider), \
-             patch("harness_herdr_hooks.cli._verified_pane_root", side_effect=lambda p, r: _verified_pane_root(p, r)):
-            result = _parent_from_event("codex-hook", json.dumps(event).encode(), client)
-        return result, client, provider
-
-    def test_default_daemon_child_event_accepts_missing_argv_and_id_or_path_root(self):
-        for ref in ({"kind": "id", "value": "root-thread"},
-                    {"kind": "path", "value": "/runs/root.jsonl"}):
-            with self.subTest(ref=ref):
-                (result, client, provider) = self._run_parent_event(ref)
-                parent, pid, cwd, created = result
-                self.assertEqual(parent.context.session_id, "root-thread")
-                self.assertEqual(parent.context.backend_id, "/tmp/codex.sock")
-                self.assertEqual(parent.session_path, Path("/runs/root.jsonl"))
-                self.assertIsNone(pid)
-                self.assertEqual(cwd, self.root)
-                self.assertEqual(created.identity.session_id, "child-thread")
-                self.assertNotEqual(created.identity.session_id, parent.context.session_id)
-                self.assertTrue(provider.closed)
-                self.assertEqual(client.verify_parent.call_count, 1)
-
-    def test_session_start_crosschecks_supplied_transcript_with_native_root_path(self):
-        base_event = {"hook_event_name": "SessionStart", "session_id": "root-thread",
-                      "cwd": str(self.root)}
-        cases = (
-            ("matching", "/runs/root.jsonl", self.rows, True),
-            ("mismatch", "/runs/other.jsonl", self.rows, False),
-            ("relative", "runs/root.jsonl", self.rows, False),
-            ("missing-native-path", "/runs/root.jsonl", [{"id": "root-thread"}, self.rows[1]], False),
-            ("null-hook-path", None, [{"id": "root-thread"}, self.rows[1]], True),
-        )
-        for label, hook_path, rows, succeeds in cases:
-            with self.subTest(label=label):
-                event = {**base_event, "transcript_path": hook_path}
-                if succeeds:
-                    parent, _, _, _ = self._run_parent_event(
-                        {"kind": "id", "value": "root-thread"}, event=event, rows=rows)[0]
-                    self.assertEqual(parent.session_path, Path("/runs/root.jsonl") if label == "matching" else None)
-                else:
-                    with self.assertRaisesRegex(ValueError, "transcript path"):
-                        self._run_parent_event({"kind": "id", "value": "root-thread"}, event=event, rows=rows)
-
-    def test_subagent_transcript_path_remains_child_scoped(self):
-        event = {"hook_event_name": "SubagentStart", "session_id": "child-thread",
-                 "agent_id": "child-thread", "agent_type": "explorer", "turn_id": "turn-1",
-                 "cwd": str(self.root), "transcript_path": "/runs/child.jsonl"}
-        parent, _, _, created = self._run_parent_event(
-            {"kind": "id", "value": "root-thread"}, event=event)[0]
-        self.assertEqual(parent.context.session_id, "root-thread")
-        self.assertEqual(parent.session_path, Path("/runs/root.jsonl"))
-        self.assertEqual(created.identity.session_id, "child-thread")
-
-    def test_missing_loaded_root_and_mismatched_child_ancestry_fail_before_parent_verification(self):
-        from harness_herdr_hooks.cli import _parent_from_event
-        for mutate in ("unloaded", "bad-ancestry"):
-            with self.subTest(mutate=mutate):
-                rows = [dict(row) for row in self.rows]
-                if mutate == "unloaded": rows = [rows[1]]
-                else:
-                    rows[1] = {**rows[1], "parentThreadId": "other-thread",
-                               "source": {"subAgent": {"thread_spawn": {"parent_thread_id": "other-thread"}}}}
-                    rows.append({"id": "other-thread", "path": "/runs/other.jsonl"})
-                class Provider(FakeProvider):
-                    def close(self): pass
-                    _verified_chain = staticmethod(CodexRuntimeAdapter._verified_chain)
-                provider = Provider(rows)
-                pane = {"pane_id": "pane-root", "tab_id": "tab-root", "workspace_id": "workspace-root",
-                        "agent_session": {"kind": "id", "value": "root-thread"}, "cwd": str(self.root)}
-                client = Mock()
-                client.snapshot.return_value = {"panes": [pane]}
-                client.process_info.return_value = {"foreground_processes": [{"pid": 71, "name": "codex"}]}
-                proof = {"socket_target": "/tmp/codex.sock", "socket_identity": [1, 2, 3],
-                         "executable": "/usr/bin/codex", "pid": 71, "uid": os.getuid(), "start_ticks": 2}
-                event = {"hook_event_name": "SubagentStart", "session_id": "child-thread", "agent_id": "child-thread",
-                         "agent_type": "explorer", "turn_id": "turn-1", "cwd": str(self.root), "transcript_path": None}
-                with patch.dict(os.environ, self.env, clear=False), \
-                     patch("harness_herdr_hooks.cli.codex_backend_proof", return_value=proof), \
-                     patch("harness_herdr_hooks.cli._native_codex_executable", return_value="/usr/bin/codex"), \
-                     patch("harness_herdr_hooks.cli.CodexRuntimeAdapter", return_value=provider):
-                    with self.assertRaises(ValueError):
-                        _parent_from_event("codex-hook", json.dumps(event).encode(), client)
-                client.verify_parent.assert_not_called()
-
-
-class ObserverBootstrapTests(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name)
-        self.context = Context(Harness.CODEX, "/profile", Path("/profile"), Path("/profile"),
-                               Path("/profile"), "/socket", "root", "backend")
-        self.parent = ParentBinding(self.context, "server", "ws", "tab", "pane")
-        self.client = Mock(socket_path=Path("/herdr.sock"))
-        self.cwd = self.root
-
-    def tearDown(self):
-        self.tmp.cleanup()
-
-    def test_child_creation_and_generation_are_durable_before_observer_spawn(self):
-        from harness_herdr_hooks.adapters.codex import parse_hook
-        from harness_herdr_hooks.cli import _start_observer
-        child = parse_hook({"hook_event_name": "SubagentStart", "session_id": "child", "agent_id": "child",
-                            "agent_type": "explorer", "turn_id": "turn-7", "cwd": str(self.root),
-                            "transcript_path": None}, profile="/profile", config_root=Path("/profile"),
-                           data_root=Path("/profile"), state_root=Path("/profile"),
-                           verified_backend_id="/socket", verified_backend_instance="backend")
-        key = Context(Harness.CODEX, "/profile", Path("/profile"), Path("/profile"),
-                      Path("/profile"), "/socket", "child", "backend").key()
-        def spawn(argv, **kwargs):
-            store = StateStore(self.root, self.context.key()[:32])
-            record = store.generation(key)
-            self.assertIsNotNone(record)
-            self.assertEqual(record["generation"], "turn-7")
-            self.assertEqual(record["turn_id"], "turn-7")
-            self.assertEqual(record["kind"], "subagent")
-            self.assertEqual(record["parent_id"], "root")
-            self.assertIn("observe", argv)
-            self.assertNotIn("turn", argv)
-            return Mock()
-        with patch("harness_herdr_hooks.cli._state_root", return_value=self.root), \
-             patch("harness_herdr_hooks.cli._provider", return_value=Mock(proxy=Mock(), close=Mock())), \
-             patch("harness_herdr_hooks.adapters.codex.list_turn_metadata", return_value=(Mock(turn_id="turn-7"),)), \
-             patch("harness_herdr_hooks.cli.subprocess.Popen", side_effect=spawn):
-            _start_observer(self.parent, None, self.client, self.cwd, child)
-
-    def test_matching_stop_hint_is_persisted_without_attachment_or_session_launch(self):
-        from harness_herdr_hooks.adapters.codex import parse_hook
-        from harness_herdr_hooks.cli import _start_observer
-        key = Context(Harness.CODEX, "/profile", Path("/profile"), Path("/profile"),
-                      Path("/profile"), "/socket", "child", "backend").key()
-        store = StateStore(self.root, self.context.key()[:32])
-        store.note_creation(key)
-        store.begin_generation(key, "turn-7", turn_id="turn-7", parent_id="root")
-        child = parse_hook({"hook_event_name": "SubagentStop", "session_id": "child", "agent_id": "child",
-                            "agent_type": "explorer", "turn_id": "turn-7", "cwd": str(self.root),
-                            "transcript_path": None, "stop_hook_active": True}, profile="/profile",
-                           config_root=Path("/profile"), data_root=Path("/profile"), state_root=Path("/profile"),
-                           verified_backend_id="/socket", verified_backend_instance="backend")
-        calls = []
-        with patch("harness_herdr_hooks.cli._state_root", return_value=self.root), \
-             patch("harness_herdr_hooks.cli.subprocess.Popen", side_effect=lambda argv, **kwargs: calls.append(argv)):
-            _start_observer(self.parent, None, self.client, self.cwd, child)
-        record = store.generation(key)
-        self.assertEqual(record["stop_hints"], [{"generation": "turn-7", "turn_id": "turn-7", "stop_hook_active": True}])
-        self.assertFalse(record.get("status") == "finished")
-        self.assertEqual(len(calls), 1)
-        self.assertIn("observe", calls[0])
-        self.assertNotIn("attach", calls[0])
-        self.assertNotIn("codex", calls[0])
-
-    def test_opencode_creation_context_keeps_legacy_pending_creation_semantics(self):
-        from harness_herdr_hooks.cli import _start_observer
-        child_context = Context(Harness.OPENCODE, "/oc", Path("/oc"), Path("/oc-data"),
-                                Path("/oc-state"), "http://127.0.0.1:1", "session", "pid:3")
-        store = StateStore(self.root, self.context.key()[:32])
-        with patch("harness_herdr_hooks.cli._state_root", return_value=self.root), \
-             patch("harness_herdr_hooks.cli.subprocess.Popen") as popen:
-            _start_observer(self.parent, 3, self.client, self.cwd, child_context)
-        self.assertIn(child_context.key(), (store.root / "state.json").read_text())
-        popen.assert_called_once()
-
-    def test_delayed_start_hook_cannot_rewind_attached_later_generation(self):
-        from harness_herdr_hooks.adapters.codex import parse_hook
-        from harness_herdr_hooks.cli import _start_observer
-        key = Context(Harness.CODEX, "/profile", Path("/profile"), Path("/profile"),
-                      Path("/profile"), "/socket", "child", "backend").key()
-        store = StateStore(self.root, self.context.key()[:32])
-        store.note_creation(key)
-        store.begin_generation(key, "turn-2", turn_id="turn-2", parent_id="root")
-        with store.locked() as data:
-            data["records"][key].update(binding_id="attached-binding", ownership="owned")
-        before = store.generation(key)
-        child = parse_hook({"hook_event_name": "SubagentStart", "session_id": "child", "agent_id": "child",
-                            "agent_type": "explorer", "turn_id": "turn-1", "cwd": str(self.root),
-                            "transcript_path": None}, profile="/profile", config_root=Path("/profile"),
-                           data_root=Path("/profile"), state_root=Path("/profile"),
-                           verified_backend_id="/socket", verified_backend_instance="backend")
-        provider = Mock(proxy=Mock(), close=Mock())
-        with patch("harness_herdr_hooks.cli._state_root", return_value=self.root), \
-             patch("harness_herdr_hooks.cli._provider", return_value=provider), \
-             patch("harness_herdr_hooks.adapters.codex.list_turn_metadata", return_value=(Mock(turn_id="turn-2"),)), \
-             patch("harness_herdr_hooks.cli.subprocess.Popen"):
-            _start_observer(self.parent, None, self.client, self.cwd, child)
-        after = store.generation(key)
-        self.assertEqual(after["generation"], "turn-2")
-        self.assertEqual(after["binding_id"], "attached-binding")
-        self.assertEqual(after["ownership"], "owned")
-        self.assertEqual(after["prior_generations"], before["prior_generations"])
-        provider.close.assert_called_once()
-
-
 class LaunchRouterProofTests(unittest.TestCase):
+    def test_router_verifies_exact_inherited_origin_and_explicit_endpoint(self):
+        pane = {"pane_id": "source", "tab_id": "tab", "workspace_id": "ws", "cwd": str(self.root),
+                "agent_session": {"kind": "id", "value": "thread"}}
+        client = Mock(spec=["snapshot", "process_info", "verify_parent", "server_identity"])
+        client.snapshot.return_value = {"panes": [{**pane, "pane_id": "aaa"}, pane]}
+        client.process_info.return_value = {"foreground_processes": [{"pid": 42, "name": "codex"}]}
+        client.verify_parent.return_value = True
+        client.server_identity.return_value = "server"
+        proof = {"socket_target": "/explicit-codex.sock", "socket_identity": [1, 2, 3, 0, 0]}
+        provider = FakeProvider([{"id": "thread", "path": "/runs/parent.jsonl"}])
+        provider.close = lambda: None
+        router = _HerdrLaunchRouter({"config_root": str(self.root)})
+        with patch.dict(os.environ, {**self.markers, "CODEX_HOME": str(self.root)}, clear=True), \
+             patch("harness_herdr_hooks.cli._herdr_client", return_value=client), \
+             patch("harness_herdr_hooks.cli.codex_backend_proof", return_value=proof), \
+             patch("harness_herdr_hooks.cli._native_codex_executable", return_value=Path("/bin/codex")), \
+             patch("harness_herdr_hooks.cli.CodexRuntimeAdapter", return_value=provider):
+            self.assertTrue(router.verify_parent("thread", str(self.root), self.root))
+        client.process_info.assert_called_once_with("source")
+        self.assertEqual(router.parent.pane_id, "source")
+        self.assertEqual(router.parent.context.backend_id, "/explicit-codex.sock")
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)

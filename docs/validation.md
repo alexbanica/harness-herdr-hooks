@@ -1,70 +1,52 @@
 # Validation and support status
 
-**Delivery status: DRAFT / experimental; Definition of Done is not met.** This
-table separates isolated source/operator and native-API evidence from unmet
-native acceptance. Passing the former does not establish full support.
+**Current delivery status: DRAFT / experimental; current Definition of Done is not met.** The current scope retains standalone Codex session panes and the separate ordinary fresh interactive command route. Native subagent discovery/attachment, OpenCode event handling, and automated tab creation/naming/retirement were removed. Results below the historical-record heading refer to predecessor behavior and are not evidence for this current scope.
 
-The first table and the following source/profile paragraphs record earlier
-HHH-002 predecessor observations, including native API and pane evidence. They
-do not establish HHH-004 A5 live qualification.
+## Standalone session panes only — current revision
+
+This record applies to approved SPEC `SPEC-standalone-session-panes-only.md`
+(SHA-256 `cd5f54056039a7736e5ececa290c8261f8b14cd80e37fedb45740ed0b75b4687`)
+and PLAN `PLAN-standalone-session-panes-only.md`
+(SHA-256 `01288d3cf8bad95701792933b2cb28a7c12156577a713d9256704da7596e1fe1`),
+including the approved same-tab/no-PID amendment.
 
 | Area | Evidence obtained | Qualification limit |
 | --- | --- | --- |
-| Source/static | Earlier HHH-002 final QA passed 131 tests on Python 3.11.14 and 3.12.3; see the HHH-004 combined-tree evidence below for the final integrated suite and checks. | Static/controlled checks do not prove native attachment, cleanup, or launch routing. |
-| Operator install | Earlier HHH-002 isolated fake-native profiles passed native `features list`, shim `--version`, fresh install/reinstall/uninstall, inherited-adapter PATH, moved-source, and shim cases. See the HHH-004 combined-tree evidence below for the final isolated public-profile checks. | Isolated profiles are not user-profile reload or native trust evidence. |
-| Herdr API and controlled lifecycle fixtures | The isolated Herdr 0.9.5 server returned protocol-22 snapshots and process metadata; a sole foreground Bash PID passed the shell-readiness check. Separate controlled fixtures covered parent/title/fallback handling, sanitization, revocation, startup baselines, pending creation, and pane retention/cleanup. | The lifecycle fixtures used controlled Herdr metadata. They do not establish native child placement, concurrency, manual-close, profile/server races, or platform acceptance. |
-| OpenCode native API | Isolated OpenCode 1.19.5 loopback API check created a synthetic parent/child metadata relation without prompts. Provider ancestor normalization and idle-skip behavior passed against a controlled Herdr stub. | No authorized real native child, added-turn comparison, complete profile/backend matrix, or full concurrency evidence. Fixture API evidence is not native child-attachment acceptance. |
-| Codex native API | Parent verified isolated native `--version`/features and relink/uninstall, then active profile's genuine Codex executable (`0.170.0`) and features. Live Herdr bootstrap verified exact root, pane, backend `0.170.0`, and Herdr `0.9.5p22`. A bare no-prompt `codex` launch was acknowledged once in pane `w9:pY` in parent tab `w9:t1`, without focus; its launch payload was removed. | This proves only the observed launch acknowledgement and placement. It does not prove same-thread attachment, no-added-turn behavior, subagent completion/cancellation, client exit, or restart/isolation. The launch pane remained at its confirmation UI; no confirmation was answered. |
-| Native pane observation | Adapter metadata records the selected profile's genuine Codex executable. The legacy exact-owned observer was retired and ended before the active profile was relinked. The active source now points to this checkout; the older clean detached checkout was preserved. | Source registration does not prove the running runtime loaded this revision: the observed legacy runtime had ended and had no current-revision helper. User-owned profile reload and any native trust prompt remain prerequisites. Unknown, unowned, multiple foreground, and null-session panes were retained; known-unloaded cleanup requires successful native status plus exact terminal-turn evidence. No live evidence establishes automatic closure for these cases. |
-| Credentials/accounts | The OpenCode fixture had no model configured. The isolated Codex account query, without token refresh, returned no account and required OpenAI authentication. | No real credentials were copied or used. User-authorized native child creation/attachment and provider acceptance remain outstanding. |
+| Focused source QA | Independent final QA reported 69 focused tests and 150 full-suite tests passed; `git diff --check` passed. | These checks do not establish live event capture or native attachment. The commands ran from the isolated checkout. |
+| Live attempt | The parent installed the current source into a clean disposable profile. Herdr 0.9.5 / protocol 22 named server launched native Codex in pane `w2:p1`, tab `w2:t1`. Startup showed sign-in; the Herdr snapshot reported `agent_session` null. The named server was stopped and the disposable hooks were uninstalled. | No native task creation was attempted because the parent session was not established. Same-tab attachment, exact session acknowledgement, no-added-turn behavior, and post-exit usable shell remain unverified. |
+| Scope and effects | The live attempt used a disposable profile and named Herdr server. | No production profile, production panes, or Git state were changed by the live attempt. No current live result establishes that current hooks were loaded by a user-owned authenticated parent. |
+| Migration and legacy events | The independent source suite covered the integrated source per its report. | Runtime behavior of an already-loaded predecessor process is not changed by registration migration; user-controlled reload remains necessary. No live OpenCode or legacy callback exercise was performed. |
 
-The operator results above came from isolated private profiles. This
-documentation-only synchronization did not touch the active Codex profile or
-re-run installer effects; links and obsolete source-branch directions were
-checked in the documentation tree.
+Final QA used these commands in the isolated checkout:
 
-At the earlier HHH-002 observation, the active owned source reference pointed
-to `/tmp/agent-worktrees/harness-herdr-hooks/codex-session-cleanup`; the prior
-clean detached checkout was preserved. This source registration is distinct
-from runtime load evidence; the observed legacy runtime ended and did not expose
-a helper for that revision.
+```sh
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src:tests /usr/bin/python3 -m unittest -q test_codex_install test_standalone_task_discovery test_standalone_shell test_standalone_task_state test_interactive_launch test_runtime_status
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src /usr/bin/python3 -m unittest discover -s tests -q
+git diff --check
+```
 
-## Required acceptance still unmet
+Standalone placement now resolves the originating session through current Herdr
+bindings and requires one existing destination tab; no foreground PID/process
+check is a prerequisite for standalone discovery or attachment. The separate
+fresh interactive command route retains its own existing verification. Split
+and managed-start effects use durable one-shot intents; uncertain outcomes are
+retained and are not blindly replayed. Native subagent/tab results below are
+historical only.
 
-- Load/reload the changed selected Codex profile in a user-owned parent session
-  and follow native trust prompts for changed handlers. Do not bypass trust or
-  force a restart.
-- Demonstrate a real Codex subagent attaching once to its existing backend,
-  without an added model turn, then closing its integration-owned pane only
-  after metadata-confirmed terminal completion. Exercise continuation/re-entry,
-  cancellation/failure, restart, duplicate/delayed events, reused turns, manual
-  closure, and attachment/completion races. The bare CLI acknowledgement above
-  does not establish these behaviors or client exit to shell.
-- The existing OpenCode native attachment/trust and no-added-turn acceptance
-  remains outstanding independently of HHH-002.
-- Complete real profile/backend isolation, cross-harness and same-harness
-  collision cases, full concurrency/restart/manual-close and attachment race
-  coverage.
-- Run equivalent runtime evidence on macOS. No macOS host was available.
+The remaining live acceptance is to use a correctly bound authenticated Herdr
+parent, trigger one supported standalone creation, verify the exact returned
+session in one unfocused pane in the existing parent tab, establish that attach
+added no turn, and verify that client exit leaves a usable shell. Current
+runtime loading/trust and any platform-specific qualification not evidenced by
+the source report remain separate limitations. Until then, the project remains
+DRAFT.
 
-No user instruction excluded these criteria. They remain required before
-acceptance. Source implementation and isolated checks do not change this DRAFT
-status. Native Codex qualification needs a user-owned parent that loads the
-changed profile and renews hook trust if prompted; no trust bypass, session
-restart, or daemon restart is authorized. OpenCode and predecessor macOS gaps
-remain distinct.
+## Historical validation records
 
-Independent integrated code and contract reviews completed in two waves.
-Supported corrections covered version guarding, stale turn generations,
-observer health and cleanup outcomes, Herdr process metadata without argv,
-Python 3.13, expiry and state roots, config absence/symlink identity, final-close
-race handling, suppression after manual closure, and helper revision/path/
-retirement/restart behavior. QA also found and repaired an initial native-adapter
-installation defect. Review also corrected
-the interpretation of `stop_hook_active`: [version-matched Codex hook source](https://github.com/openai/codex/blob/rust-v0.170.0/codex-rs/core/src/hook_runtime.rs)
-shows it indicates re-entry after a same-turn continuation, so it is not
-evidence that the current stop request is terminal.
-
+The following sections preserve earlier evidence for predecessor scopes. Their
+claims about native subagents, OpenCode event handling, process checks for
+child attachment, and managed subagent tabs are archival. They do not describe
+or qualify the current implementation.
 
 ## HHH-002 cleanup-lock correction evidence
 

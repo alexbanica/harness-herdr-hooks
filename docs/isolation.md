@@ -1,117 +1,72 @@
 # Isolation boundaries
 
-The integration acts only when the parent is proven to be in a Herdr pane and
-the selected harness event agrees with that pane's native session and backend.
-Herdr server, workspace, tab, pane, harness kind, profile/config/data/state
-roots, backend instance, and session identity are checked as applicable. A
-matching title, working directory, session ID, inherited marker, or config path
-alone is not authority. If identity or ancestry is incomplete or ambiguous, the
-event is skipped or fails closed. Outside Herdr, the helper returns before
-reading event input or touching integration state.
+The retained standalone flow requires the selected Codex profile/backend, the
+exact originating parent session, and its current Herdr session binding. The
+creation record nominates a candidate; it does not establish identity. The
+backend must return the exact child session, and the current authenticated
+Herdr server must map the parent to one existing destination tab. A title,
+working directory, inherited environment marker, config path, or guessed
+process relation is not authority. Standalone placement does not depend on a
+foreground PID or process tree.
 
-## Harness boundaries
+## Codex and Herdr boundaries
 
-- **Codex:** Only bounded Codex hook metadata and native app-server interfaces
-  are used. Eligibility requires successful transport and initialization,
-  expected profile identity, and valid methods and response fields for the operation. Release metadata is diagnostic
-  only, including when absent or unfamiliar. Codex 0.170.0 was observed in
-  earlier validation. Codex 0.171.0 passed fixtures and a read-only daemon probe.
-  Supported launch modes use the verified selected-profile shared default daemon
-  or a verified explicit Unix `--remote` endpoint. The socket alias/target, user ownership,
-  private directory, process identity, and backend incarnation are pinned. Optional
-  Herdr foreground argv is not required. `CODEX_HOME` (or `~/.codex`) selects
-  the profile; it does not prove that the backend is private. Codex's owned
-  command adapter is added only to that profile's literal shell PATH setting.
-- **OpenCode:** Only OpenCode plugin/API identity is used. The runtime is bound
-  to the parent foreground server PID and loopback unauthenticated API. The
-  plugin disables itself if `OPENCODE_CONFIG`, `OPENCODE_CONFIG_CONTENT`, or
-  `OPENCODE_DB` is set. `OPENCODE_CONFIG_DIR` or XDG config selection chooses
-  registration only; config, data, state, server, account, and provider are
-  separate resources. A config override does not create private backend or
-  account isolation.
+Codex uses bounded local rollout metadata and the app-server interfaces needed
+to verify the selected profile and exact session. An explicit endpoint is
+accepted only when it is already associated with a verified standalone
+session on that profile and passes the same ownership, incarnation, and
+thread checks. Arbitrary sockets are not searched. `CODEX_HOME` (or its
+existing default) selects the profile; it does not prove that the backend is
+private.
 
-The adapters do not copy credentials, provider configuration, arbitrary
-environment maps, conversation text, or transcripts into integration state.
-Ordinary interactive Codex launch arguments are carried in a private bounded
-payload for at most 120 seconds, deleted after acknowledgment or expiry, and
-not retained as metadata. Child attach
-clients receive a bounded allowlist of environment values, not the full parent
-environment. No provider or account is created by installation. The OpenCode
-loopback API itself is unauthenticated, so the current binding is not evidence
-of independent account isolation.
+The parent-to-Herder mapping comes from current session bindings on the
+authenticated server, not pane/tab/workspace environment markers. Matching
+panes are deduplicated by workspace and tab. A unique tab is required; no
+match or mappings across multiple tabs produce no pane effect. The lexical
+first pane ID in a unique destination is the split anchor. The destination is
+rechecked before the split.
 
-## State and cleanup
+The standalone effect environment is bounded to the verified Codex profile,
+display marker, and existing absolute integration state root hint. Credentials,
+provider configuration, arbitrary environment maps, conversation text,
+prompts, raw results, and transcript content are not copied into integration
+state or the display environment. The attachment resumes the exact session
+through Herdr's managed Codex route and submits no prompt or new turn.
 
-By default, private runtime metadata is stored below
-`$XDG_STATE_HOME/harness-herdr-hooks` or `~/.local/state/harness-herdr-hooks`.
-`HARNESS_HERDR_STATE_ROOT` can select an absolute integration state root.
-Directories/files are created with private permissions. Records contain
-identity/binding, observer, and pane lifecycle metadata needed for recovery and
-duplicate suppression; uninstall retains these records. Uninstall revokes the
-registration and stops this integration's own helper. It does not terminate
-agents, close panes, remove providers, or claim that retained records were
-deleted.
+The separate fresh interactive command route retains its own process,
+backend, and launch checks. Its process verification does not apply to
+standalone session discovery or attachment. Outside a verified Herdr parent,
+the integration performs no pane automation.
 
-Only a verified eligible child can be attached or renamed. Pane labels are
-one-way from the native title, with controls removed and display limits applied;
-titles are never identity. Manual close suppression and existing pane reuse are
-scoped to verified context. The implementation uses a context-scoped startup
-baseline, pending verified-creation exceptions, and persisted owned records;
-it does not expose a public revision or generation API.
+## Durable effects and retained state
+
+Runtime metadata is stored under `$XDG_STATE_HOME/harness-herdr-hooks` or
+`~/.local/state/harness-herdr-hooks`, unless the existing absolute
+`HARNESS_HERDR_STATE_ROOT` is configured. Private files contain bounded IDs,
+context and destination bindings, rollout cursor/file identity, hashes, and
+effect intents/outcomes needed for deduplication and recovery. They exclude
+prompt and transcript contents.
+
+Before splitting, the integration persists a one-shot intent tied to the exact
+creation association and destination. Only an exact Herdr acknowledgement
+allows a pane claim. Before managed start, it persists an intent tied to that
+pane and exact child. If an acknowledgement is missing, a crash occurs, or
+the returned session cannot be confirmed, the outcome stays bounded and
+uncertain. Replay does not split again, repeat managed start, infer ownership
+from an unrelated pane, or close the existing pane. Manual closure is
+respected and suppresses reopening that display.
+
+Existing tabs and panes are never moved, renamed as tabs, or retired by this
+integration. No code path for this feature creates, renames, or closes Herdr
+tabs; legacy native subagent events and bindings produce no pane/tab effects.
+Uninstall revokes owned registrations but retains state, sessions, panes,
+tabs, and agents for operator recovery.
 
 ## Qualification boundary
 
-Source/operator and controlled API checks cover bounded parsing, context
-verification, synthetic event behavior, and cleanup cases recorded in
-[validation](validation.md). Native Codex selected-profile loading/trust,
-cross-profile/backend isolation, authorized real child display and completion
-cleanup, ordinary launch routing, and all race/concurrency paths remain
-unqualified. macOS runtime is a separate outstanding predecessor gap. These
-remain acceptance work; no complete support claim is made.
-
-App-server compatibility errors are bounded to the failed stage and method,
-with the daemon release when known; they omit credentials, transcript text, and
-raw responses. Shared-daemon pane attachment requires independent verification
-of pane markers and native session references.
-
-## Standalone Codex task records
-
-Codex standalone discovery reads only newly appended qualified creation records
-from the exact verified parent's owner-controlled rollout file inside the
-selected profile's sessions directory. The typed event nominates a child;
-native metadata from that same backend independently establishes task identity,
-cwd and attachability. No other profile/backend is searched to make a candidate
-fit. Persistent state contains bounded IDs, cursor/file identity, hashes for an
-optional normalized cwd, context/destination pins, and retry/outcome metadata;
-it excludes prompts, raw tool results, transcript text and partial record
-bytes. This local-record association is not cryptographic ancestry proof and
-does not establish native subagent lineage.
-
-## HHH-005 subagent-tab state
-
-Tab identity is rooted in the full verified main-session context, harness,
-profile/backend incarnation, Herdr server and workspace. Titles, cwd, inherited
-environment and displayed short IDs are not ancestry or ownership proof.
-Siblings and verified nested children share the root association; independent
-sessions do not. Existing panes are not migrated, and a stale or invalidated
-association cannot authorize adoption or movement to another tab.
-
-Root-specific tab claims, child bindings and lifecycle records remain in the
-selected integration state root. To coordinate label reservations and tab
-operations across profiles and both harnesses, the implementation uses one
-canonical private workspace anchor beneath the current OS UID's account home
-(`.local/state`), resolved from the account database rather than inherited
-`HOME`, XDG, or profile variables. It admits path components through no-follow
-directory checks, rejects symlinks, non-directories, unsafe ownership or
-permissions, and does not fall back to profile-local coordination. Missing
-`.local/state` components may be created only below an admitted owner-controlled
-parent with private mode. Existing safe modes are preserved. This anchor is
-initialized only after verified Herdr runtime binding; it is not a public
-configuration override. Diagnostics identify rejected anchor components
-without weakening isolation.
-
-Cleanup revalidates ownership and contents and coordinates against new
-attachments. Empty managed tabs may close; retained children and user work are
-never closed to manufacture emptiness. Source tests of the anchor and protocol
-fixtures are not evidence of native harness qualification; see
-[validation](validation.md).
+Source tests cover identity checks and bounded effect sequencing, but they do
+not prove a live standalone creation, same-tab attachment, no-added-turn
+behavior, shell usability after client exit, or current-revision runtime
+loading. The latest parent-observed live attempt and its exact limits are in
+[validation](validation.md). Earlier native subagent and tab observations are
+historical evidence and do not qualify this contract.

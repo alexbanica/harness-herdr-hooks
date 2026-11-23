@@ -33,6 +33,36 @@ class StandaloneTaskStateTests(unittest.TestCase):
         bad = session_to_dict(session); bad["creation_proof"]["child_id"] = "foreign"
         with self.assertRaises(ValueError): session_from_dict(bad)
 
+    def test_standalone_effect_intents_survive_restart_and_never_reissue(self):
+        destination = {"server_id": "s", "workspace_id": "w", "tab_id": "t",
+                       "anchor_pane_id": "parent-pane"}
+        self.assertTrue(self.store.reserve_standalone_effect(
+            "event-1", "split", "binding-1", "child-1", destination))
+        self.assertFalse(StateStore(Path(self.tmp.name), "standalone-test").reserve_standalone_effect(
+            "event-1", "split", "binding-1", "child-1", destination))
+        self.assertTrue(self.store.record_standalone_pane_claim("event-1", "binding-1",
+                                                                destination, "child-pane"))
+        self.assertFalse(self.store.record_standalone_pane_claim("event-1", "binding-1",
+                                                                 destination, "other-pane"))
+        claimed = StateStore(Path(self.tmp.name), "standalone-test").standalone_effect("event-1")
+        self.assertEqual(claimed["pane_id"], "child-pane")
+        self.assertTrue(self.store.reserve_standalone_effect(
+            "event-1", "start", "binding-1", "child-1", destination, pane_id="child-pane"))
+        self.assertFalse(self.store.reserve_standalone_effect(
+            "event-1", "start", "binding-1", "child-1", destination, pane_id="child-pane"))
+        self.assertFalse(self.store.reserve_standalone_effect(
+            "event-1", "start", "binding-1", "different-child", destination, pane_id="child-pane"))
+
+    def test_standalone_split_intent_without_acknowledgement_stays_unresolved(self):
+        destination = {"server_id": "s", "workspace_id": "w", "tab_id": "t",
+                       "anchor_pane_id": "parent-pane"}
+        self.assertTrue(self.store.reserve_standalone_effect(
+            "event-2", "split", "binding-2", "child-2", destination))
+        restarted = StateStore(Path(self.tmp.name), "standalone-test")
+        self.assertFalse(restarted.reserve_standalone_effect(
+            "event-2", "split", "binding-2", "child-2", destination))
+        self.assertIsNone(restarted.standalone_effect("event-2")["pane_id"])
+
     def test_cursor_and_candidates_commit_atomically_deduplicate_and_restart(self):
         event = SimpleNamespace(parent_id="parent", turn_id="turn", item_id="item",
                                 child_id="child", cwd_sha256=None)

@@ -1,20 +1,12 @@
 # Codex installation
 
-The selected Codex configuration root is `CODEX_HOME`, or `~/.codex` when it is
-unset. Install adds owned `SessionStart`, `SubagentStart`, and `SubagentStop`
-handlers to that root's `hooks.json`. It also installs a private `codex`
-command adapter and prepends its directory to that profile's concrete
-`shell_environment_policy.set.PATH`, preserving the original PATH tail and
-other settings. Private integration files use restricted permissions; install
-does not change Codex daemon settings, socket permissions, or hook trust.
-Python 3.11+, POSIX `sh`, and a repository checkout are required; OpenCode is
-not.
-
-Native executable discovery skips candidates that already resolve through a
-managed adapter. Reinstall reuses the owned concrete adapter entry and its PATH
-tail/native settings rather than selecting the adapter itself or adding another
-prefix. The adapter does not search another profile or delegate across profile
-boundaries.
+The selected profile is `CODEX_HOME`, or `~/.codex` when unset. Install
+registers the managed `SessionStart` hook and installs a private `codex`
+command adapter in that profile. The adapter directory is prepended to the
+profile's concrete `shell_environment_policy.set.PATH`, preserving its
+existing tail and unrelated settings. Install does not change Codex daemon or
+socket settings and does not bypass hook trust. Python 3.11+, POSIX `sh`, and
+a repository checkout are required.
 
 ## Install and inspect
 
@@ -25,7 +17,7 @@ bin/harness-herdr-hooks install codex
 bin/harness-herdr-hooks status codex
 ```
 
-To target another Codex profile, use the same explicit path for every command:
+For another profile, use the same explicit config directory for each command:
 
 ```sh
 bin/harness-herdr-hooks install codex --config-dir /path/to/codex-profile
@@ -34,80 +26,54 @@ bin/harness-herdr-hooks status codex --config-dir /path/to/codex-profile
 
 The installer preserves unrelated hooks/settings and refuses conflicting,
 ambiguous, changed, symlinked, or unowned destinations. Reinstall from a moved
-checkout to update the same profile; inspect `status` afterward. Do not delete
-or replace a conflicting path by guesswork.
+checkout against the same profile and inspect `status`. Do not delete or
+replace a conflicting path by guesswork.
 
-## Runtime prerequisites and limits
+## Upgrade from subagent/tab integration
 
-Codex eligibility is based on the verified app-server interface required by
-each operation. The adapter requires a successful
-WebSocket handshake and initialization, the expected selected-profile identity,
-and valid required methods and response fields. Extra response fields are
-allowed. Missing or unfamiliar release metadata is diagnostic only when the
-required interface and identity checks pass. Codex 0.170.0 is an earlier
-observed release. Codex 0.171.0 passed current fixture and read-only daemon checks. Herdr 0.9.5 / protocol 22,
-Python 3.11+, POSIX `sh`, and the selected Codex executable in `PATH` remain
-prerequisites. Codex may use its verified selected-profile shared
-default daemon or an explicit foreground Unix endpoint such as
-`codex --remote unix:///absolute/path/to/codex.sock` (also
-`--remote=unix:///absolute/path/to/codex.sock`). Explicit `--remote unix://`
-selects that profile's native control socket. The exact process, socket alias
-and target, owner, private directory, backend incarnation, profile, and Herdr
-parent binding are checked. Missing Herdr argv is supported by independent
-process evidence. `--no-daemon` and unknown launch modes are refused.
+An upgrade retires only unchanged managed `SubagentStart` and `SubagentStop`
+entries and installs the retained `SessionStart` hook. Independently changed
+or unmanaged entries are preserved. Old sessions, panes, tabs, history, and
+state records are not migrated or removed. A running Codex process that has
+already loaded older hook code is not stopped by install; use the normal
+user-controlled profile reload/restart process before relying on the new
+registration. If Codex requests trust for changed hooks, use its native trust
+flow. Do not bypass trust or restart a shared daemon automatically.
 
-The installer writes a concrete PATH value because Codex's shell environment
-configuration does not expand a literal `$PATH`. The selected profile must
-load the changed configuration before future shell commands see the adapter;
-reload/restart it through normal user controls. An already-running parent does
-not acquire the change automatically. If Codex requests trust for changed
-hooks, use its native trust flow. Installation does not bypass trust, restart an
-active session, or alter daemon settings.
+## Runtime behavior and limits
 
-`status` reports registration and adapter configuration separately from
-observed native trust/loading, loaded helper revision, backend binding,
-observer health, and pane outcomes. Observer states distinguish `running`,
-`stale`, `unknown`, and `ended`; a registered source path does not prove that
-a running parent loaded that revision. Native thread `notLoaded` or missing
-items alone is not terminal evidence. A successful native status read reporting
-`notLoaded` can participate in cleanup only with exact matching terminal-turn
-metadata and no newer running work. Isolated operator checks passed. A live bare `codex` invocation was
-acknowledged once and placed in an unfocused pane in the selected tab; the
-confirmation UI remained open and no confirmation was answered. Native
-same-thread/subagent attachment, no-added-turn behavior, terminal cleanup,
-client exit to a usable shell, and current-revision runtime loading remain
-unverified. See
-[validation](validation.md) and [troubleshooting](troubleshooting.md).
+For standalone tasks, the local Codex app/TUI rollout record must report a
+successful `codex_tui.create_thread` result associated with the verified
+parent. The exact returned session is checked against the selected Codex
+backend. Its origin must resolve through current Herdr session bindings to one
+existing tab. Multiple matching panes in that same tab are acceptable; a
+missing or cross-tab-ambiguous destination is skipped. This path does not use
+foreground PID, process arguments, or process-tree membership to select the
+parent or attach the session. It does require the verified Codex profile,
+backend/session identity, and current Herdr parent binding.
 
-When an app-server transport, required method, or required response contract
-fails, the adapter reports a concise stage and method reason and includes the
-daemon release when available. These diagnostics exclude credentials,
-transcript content, and raw response dumps. Shared-daemon pane attachment
-requires a valid pane marker and native session reference.
+The standalone path opens or reuses one pane in that existing tab. It attaches
+the exact session without sending a prompt or adding a turn, retains the pane
+through idle, completion, cancellation, and client exit, and leaves a usable
+shell after exit. Pane split and managed start each have durable one-shot
+intents. Missing acknowledgements or crashes leave a bounded unresolved
+outcome; the helper does not blindly repeat an effect or close the pane.
 
-The adapter routes supported ordinary interactive `codex` shell commands from
-a verified Herdr parent. It starts the native CLI once in an unfocused pane in
-the same tab, preserving profile, cwd, arguments, and requested prompt; after
-client exit it leaves a usable shell. Informational commands, tooling
-subcommands, `exec`, existing-session resume, absolute executable paths,
-deliberate PATH bypasses, remote hosted backends, and `--no-daemon` embedded
-sessions are outside this routing qualification and retain native behavior.
-Outside Herdr, the adapter delegates normally. The adapter's bounded launch
-payload expires after 120 seconds if not claimed; it does not persist prompts
-as retained metadata.
+The separate ordinary interactive route applies its existing process and
+launch checks to supported fresh Codex shell commands. It starts once in a pane
+in the caller's existing tab, carrying the requested prompt and arguments, and
+leaves a usable shell after exit. Resume/fork and other excluded commands keep
+native routing. Unsupported or uncertain launch modes are not retried by the
+adapter.
 
-The observed native launch above established acknowledgement and pane placement
-only; it did not reach confirmation, client exit, or shell retention. A missing
-child from discovery or a missing/unloaded helper is never proof of terminal
-completion. Codex cleanup requires positive terminal metadata for the matching
-turn/task generation, absence of newer running work, and revalidation of the
-integration-owned pane/process. Manually closed children are suppressed from
-reopening. Unknown or ambiguous ownership is retained. The adapter preserves
-the selected profile's existing PATH tail and unrelated native configuration.
+`status` separates registration/configuration from observed runtime and pane
+outcomes. A registered hook or source path does not prove that a running
+profile loaded the current code. Current source assurance and the latest
+native attempt are summarized in [validation](validation.md); live capture,
+exact same-tab attachment, no-added-turn evidence, usable shell after exit,
+and current-revision runtime loading remain unverified.
 
 ## Uninstall
-
-Use the same profile selection as installation:
 
 ```sh
 bin/harness-herdr-hooks uninstall codex
@@ -115,37 +81,15 @@ bin/harness-herdr-hooks uninstall codex --config-dir /path/to/codex-profile
 ```
 
 Uninstall removes only unchanged owned handlers, adapter files, and PATH edit.
-It preserves changed/conflicting entries and does not change other profiles,
-terminate agents, or close panes.
+It preserves changed or conflicting entries and does not change other
+profiles, terminate agents, close panes/tabs, or erase retained state.
 
-## Standalone task discovery
+## Standalone discovery limits
 
-The qualified capture input is the local Codex app/TUI rollout record for a
-successful `codex_tui.create_thread` completion. Recognition requires the exact
-typed `event_msg` / `item_completed` association and a returned child ID; the
-verified parent pins the backend authority; independently verified native
-task metadata supplies the task cwd. This is not
-`PostToolUse` delivery, parsed `exec` JavaScript, or native Codex delegation
-ancestry. A standalone task remains a separate session, and its pane is retained
-after completion or client exit. No prompt is added. See
-[contracts](contracts.md) for bounds and exclusions.
-
-Task status retains meaningful recognition, verification and attachment outcomes
-separately from `current_health`; see [contracts](contracts.md).
-
-## Subagent tab placement
-
-New eligible native subagents share one lazy, unfocused managed Herdr tab per
-verified main session; nested children join that tab. Its label follows the
-main session title and short ID, while child titles continue to name their
-panes. Existing panes are not migrated. Root-specific records remain in the
-selected integration state root; workspace tab-operation and label coordination
-uses the canonical per-UID account-home `.local/state` anchor described in
-[isolation](isolation.md). Unsafe or symlinked anchor paths fail closed rather
-than falling back to profile-local coordination.
-
-Implementation and isolated validation are complete, but native subagent
-attachment and grouping have not been qualified. The current Codex profile
-still needs the user's normal hook trust/reload step. A targeted Herdr 0.9.5 /
-protocol 22 tab-operation observation is not native Codex attachment evidence;
-see [validation](validation.md).
+Only newly appended, typed successful creation records are considered. The
+exact record must correlate the parent, turn, item, and returned child ID;
+the selected backend independently verifies the session. Historical tasks are
+not backfilled. Native `PostToolUse` delivery, parsed `exec` JavaScript,
+delegation ancestry, and title/cwd/time inference are not used. The pane is
+retained after task completion and client exit. See the detailed
+[contracts](contracts.md) and [isolation boundaries](isolation.md).

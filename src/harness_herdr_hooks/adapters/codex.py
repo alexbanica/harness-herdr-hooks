@@ -32,17 +32,6 @@ _HOOK_FIELDS = {
         "strings": {"cwd", "hook_event_name", "session_id"},
         "enums": {"hook_event_name": {"SessionStart"}},
     },
-    "SubagentStart": {
-        "required": {"agent_id", "agent_type", "cwd", "hook_event_name", "session_id", "transcript_path", "turn_id"},
-        "strings": {"agent_id", "agent_type", "cwd", "hook_event_name", "session_id", "turn_id"},
-        "enums": {"hook_event_name": {"SubagentStart"}},
-    },
-    "SubagentStop": {
-        "required": {"agent_id", "agent_type", "cwd", "hook_event_name", "session_id", "stop_hook_active", "transcript_path", "turn_id"},
-        "strings": {"agent_id", "agent_type", "cwd", "hook_event_name", "session_id", "turn_id"},
-        "enums": {"hook_event_name": {"SubagentStop"}},
-        "booleans": {"stop_hook_active"},
-    },
 }
 
 
@@ -104,8 +93,6 @@ def parse_hook(payload: str | bytes | Mapping[str, Any], *, profile: str,
         raise ValueError("unsupported Codex hook enum value")
     if any(not isinstance(obj[k], bool) for k in schema.get("booleans", ())):
         raise ValueError("invalid Codex hook boolean field")
-    if name in {"SubagentStart", "SubagentStop"} and obj["session_id"] != obj["agent_id"]:
-        raise ValueError("Codex subagent hook identity does not match child session")
     if obj["transcript_path"] is not None and (not isinstance(obj["transcript_path"], str) or not obj["transcript_path"]):
         raise ValueError("invalid transcript path field")
     if not isinstance(obj["transcript_path"], (str, type(None))):
@@ -526,91 +513,17 @@ class CodexRuntimeAdapter:
             raise ValueError("Codex parent context does not match selected backend")
 
     @staticmethod
-    def _is_native_child(thread: Mapping[str, Any], parent_id: str) -> bool:
-        source = thread.get("source")
-        if not isinstance(source, dict) or "subAgent" not in source:
-            return False
-        sub = source["subAgent"]
-        if not isinstance(sub, dict) or "thread_spawn" not in sub:
-            return False
-        spawn = sub["thread_spawn"]
-        return isinstance(spawn, dict) and spawn.get("parent_thread_id") == parent_id
-
-    @staticmethod
     def _active_status(status: object) -> bool:
         return (isinstance(status, dict) and status.get("type") == "active"
                 and isinstance(status.get("activeFlags"), list)
                 and all(isinstance(flag, str) and flag in {"waitingOnApproval", "waitingOnUserInput"}
                         for flag in status["activeFlags"]))
 
-    def _session(self, thread: Mapping[str, Any], ancestry: tuple[str, ...], loaded: set[str]) -> Session:
-        ident = thread.get("id")
-        if not isinstance(ident, str) or not ident:
-            raise RuntimeError("Codex thread metadata has no identity")
-        status = thread.get("status")
-        active = self._active_status(status)
-        # canAcceptDirectInput governs turn input; it is not evidence about the
-        # separate UI attach path. Require native spawn ownership + active load.
-        attachable = ident in loaded and active and bool(ancestry)
-        state, allowed = lifecycle(status, loaded=ident in loaded, attachable=attachable)
-        cwd = thread.get("cwd")
-        if not isinstance(cwd, str) or not Path(cwd).is_absolute():
-            raise RuntimeError("Codex thread metadata has invalid working directory")
-        child_context = Context(Harness.CODEX, self.context.profile, self.context.config_root,
-                                self.context.data_root, self.context.state_root,
-                                self.context.backend_id, ident, self.context.backend_instance)
-        direct_parent = thread.get("parentThreadId")
-        session_path = None
-        raw_path = thread.get("path")
-        if isinstance(raw_path, str) and raw_path and Path(raw_path).is_absolute():
-            try:
-                canonical_path = Path(raw_path).resolve(strict=False)
-                if canonical_path.is_absolute():
-                    session_path = canonical_path
-            except (OSError, RuntimeError):
-                session_path = None
-        return Session(child_context, direct_parent if isinstance(direct_parent, str) else None,
-                       thread.get("name") if isinstance(thread.get("name"), str) else None,
-                       Path(cwd), state, allowed, time.time(), ancestry, session_path)
-
-    @staticmethod
-    def _verified_chain(thread_id: str, rows: Mapping[str, Mapping[str, Any]],
-                        root_id: str, *, max_depth: int = 32) -> tuple[str, ...] | None:
-        chain: list[str] = []
-        seen = {thread_id}
-        current_id = thread_id
-        for _ in range(max_depth):
-            current = rows.get(current_id)
-            if current is None:
-                return None
-            parent_id = current.get("parentThreadId")
-            if not isinstance(parent_id, str) or not parent_id:
-                return None
-            if not CodexRuntimeAdapter._is_native_child(current, parent_id):
-                return None
-            chain.append(parent_id)
-            if parent_id == root_id:
-                return tuple(chain)
-            if parent_id in seen:
-                return None
-            seen.add(parent_id)
-            current_id = parent_id
-        return None
-
     def sessions(self, parent: ParentBinding) -> Iterator[Session]:
         self._check_parent(parent)
-        loaded = list_loaded_threads(self.proxy)
-        rows = {item.get("id"): item for item in list_threads(self.proxy, ancestor_id=parent.context.session_id)
-                if isinstance(item.get("id"), str)}
-        for ident, thread in rows.items():
-            chain = self._verified_chain(ident, rows, parent.context.session_id)
-            if chain is not None:
-                yield self._session(thread, chain, loaded)
         try:
             yield from self._standalone_sessions(parent)
         except Exception:
-            # Malformed or unavailable rollout files disable only this
-            # optional discovery path; native ancestry discovery stays live.
             self._standalone_status("deferred", "deferred", "unknown", "metadata_unavailable")
 
     def _standalone_status(self, recognition: str, verification: str,
@@ -911,56 +824,6 @@ class CodexRuntimeAdapter:
             raise RuntimeError(_backend_failure(self.proxy, "response", "thread/read", "required thread object missing"))
         return thread
 
-    def main_metadata(self, parent: ParentBinding) -> tuple[Context, str | None]:
-        """Resolve the provider-native main conversation and its current title.
-
-        A Codex parent link is ancestry only when the child is independently
-        marked as a native subagent. This deliberately stops at standalone or
-        other independent conversations even when they carry parent metadata.
-        """
-        self._check_parent(parent)
-        current_id = parent.context.session_id
-        seen: set[str] = set()
-        for depth in range(33):
-            if current_id in seen:
-                raise ValueError("Codex conversation ancestry contains a cycle")
-            seen.add(current_id)
-            row = self._read_thread(current_id)
-            if row.get("id") != current_id:
-                raise ValueError(_backend_failure(self.proxy, "response", "thread/read", "returned a different conversation"))
-            parent_id = row.get("parentThreadId")
-            source = row.get("source")
-            subagent = source.get("subAgent") if isinstance(source, dict) else None
-            if parent_id is not None and not (
-                    isinstance(source, str) and source in {"cli", "exec"}):
-                if not isinstance(source, dict) or "subAgent" not in source:
-                    raise ValueError(_backend_failure(self.proxy, "response", "thread/read", "conversation source classification is unknown or malformed"))
-            if isinstance(source, dict) and "subAgent" in source:
-                if (set(source) != {"subAgent"} or not isinstance(subagent, dict)
-                        or set(subagent) != {"thread_spawn"}):
-                    raise ValueError(_backend_failure(self.proxy, "response", "thread/read", "native subagent classification is malformed"))
-            spawn_marker = isinstance(subagent, dict) and "thread_spawn" in subagent
-            if spawn_marker:
-                spawn = subagent.get("thread_spawn")
-                if (not isinstance(spawn, dict)
-                        or not isinstance(spawn.get("parent_thread_id"), str)
-                        or not spawn.get("parent_thread_id")
-                        or not isinstance(parent_id, str)
-                        or spawn["parent_thread_id"] != parent_id):
-                    raise ValueError(_backend_failure(self.proxy, "response", "thread/read", "native subagent ancestry is malformed"))
-            if parent_id is not None and not isinstance(parent_id, str):
-                raise ValueError(_backend_failure(self.proxy, "response", "thread/read", "conversation ancestry is malformed"))
-            if not parent_id or not self._is_native_child(row, parent_id):
-                title = row.get("name")
-                return (Context(Harness.CODEX, self.context.profile, self.context.config_root,
-                                self.context.data_root, self.context.state_root,
-                                self.context.backend_id, current_id, self.context.backend_instance),
-                        title.strip() or None if isinstance(title, str) else None)
-            if depth == 32:
-                raise ValueError("Codex conversation ancestry exceeds 32 hops")
-            current_id = parent_id
-        raise ValueError("Codex conversation ancestry is invalid")
-
     def can_attach_now(self, parent: ParentBinding, child: Session) -> bool:
         self._check_parent(parent)
         if child.kind == "standalone":
@@ -1007,43 +870,7 @@ class CodexRuntimeAdapter:
                 if hashlib.sha256(os.path.normpath(cwd).encode("utf-8")).hexdigest() != proof.cwd_sha256:
                     return False
             return True
-        if (child.context.harness is not Harness.CODEX
-                or child.context.backend_id != self.context.backend_id
-                or child.context.backend_instance != self.context.backend_instance):
-            return False
-        loaded = list_loaded_threads(self.proxy)
-        if child.context.session_id not in loaded:
-            return False
-        rows: dict[str, Mapping[str, Any]] = {}
-        current_id = child.context.session_id
-        seen: set[str] = set()
-        for _ in range(32):
-            if current_id in seen:
-                return False
-            seen.add(current_id)
-            current = self._read_thread(current_id)
-            if current.get("id") != current_id:
-                return False
-            rows[current_id] = current
-            parent_id = current.get("parentThreadId")
-            if not isinstance(parent_id, str) or not self._is_native_child(current, parent_id):
-                return False
-            if parent_id == parent.context.session_id:
-                chain = self._verified_chain(child.context.session_id, rows, parent.context.session_id)
-                break
-            current_id = parent_id
-        else:
-            return False
-        if chain is None or tuple(child.ancestry) != chain:
-            return False
-        thread = rows[child.context.session_id]
-        status = thread.get("status")
-        return self._active_status(status)
-
-    def attach_argv(self, child: Session) -> list[str]:
-        if child.context.harness is not Harness.CODEX or child.context.backend_id != self.context.backend_id:
-            raise ValueError("child does not belong to the selected Codex backend")
-        return attach_argv(self.executable, self.socket_path, child.context.session_id)
+        return False
 
     def close(self) -> None:
         self.proxy.close()

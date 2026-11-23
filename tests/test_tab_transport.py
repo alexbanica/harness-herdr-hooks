@@ -1,64 +1,109 @@
-import unittest
+"""Session-only Herdr transport and one-shot pane effect regressions."""
 from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import Mock, patch
+import os
 
+from harness_herdr_hooks.attach import AttachmentUnavailable, attach_standalone_session
 from harness_herdr_hooks.herdr import HerdrClient, HerdrError
-class TabTransportFixtureTests(unittest.TestCase):
-    def setUp(self):
-        self.client = HerdrClient('/tmp/herdr-test.sock')
-        self.cwd = Path('/tmp/child-work')
-        self.requests = []
-
-    def response(self, result):
-        def request(method, params):
-            self.requests.append((method, params))
-            return result
-        self.client.request = request
-
-    def test_create_accepts_exact_unfocused_ack(self):
-        self.response({'type':'tab_created', 'tab':{'tab_id':'t2','workspace_id':'w','focused':False,'label':'Subagents: main'},
-                       'root_pane':{'pane_id':'p2','workspace_id':'w','tab_id':'t2','focused':False,'cwd':str(self.cwd)}})
-        self.assertEqual(self.client.create_subagent_tab('w', self.cwd, 'Subagents: main'), ('t2','p2'))
-        self.assertEqual(self.requests[0][1]['focus'], False)
-
-    def test_create_rejects_wrong_workspace_or_cwd_and_label(self):
-        for field, bad in [('workspace_id','wrong'),('cwd','/tmp/wrong'),('label','wrong')]:
-            tab={'tab_id':'t2','workspace_id':'w','focused':False,'label':'Subagents: main'}
-            pane={'pane_id':'p2','workspace_id':'w','tab_id':'t2','focused':False,'cwd':str(self.cwd)}
-            if field=='workspace_id': tab[field]=bad
-            elif field=='cwd': pane[field]=bad
-            else: tab[field]=bad
-            self.response({'type':'tab_created','tab':tab,'root_pane':pane})
-            with self.subTest(field=field), self.assertRaises(HerdrError):
-                self.client.create_subagent_tab('w',self.cwd,'Subagents: main')
-
-    def test_split_rejects_wrong_tab_focus_cwd_and_target_reuse(self):
-        for field,bad in [('tab_id','wrong'),('focused',True),('cwd','/tmp/wrong'),('pane_id','target')]:
-            pane={'pane_id':'newpane','workspace_id':'w','tab_id':'t2','focused':False,'cwd':str(self.cwd)}
-            if field=='pane_id': pane[field]=bad
-            else: pane[field]=bad
-            self.response({'type':'pane_info','pane':pane})
-            with self.subTest(field=field), self.assertRaises(HerdrError):
-                self.client.split_subagent_tab('target','w','t2',self.cwd)
-
-    def test_create_rejects_acknowledged_different_label(self):
-        self.response({'type':'tab_created', 'tab':{'tab_id':'t2','workspace_id':'w','focused':False,'label':'other'},
-                       'root_pane':{'pane_id':'p2','workspace_id':'w','tab_id':'t2','focused':False,'cwd':str(self.cwd)}})
-        with self.assertRaises(HerdrError):
-            self.client.create_subagent_tab('w', self.cwd, 'requested')
-
-    def test_rename_requires_exact_identity_label_and_unfocused_state(self):
-        for field,bad in [('tab_id','wrong'),('workspace_id','wrong'),('label','wrong'),('focused','yes')]:
-            tab={'tab_id':'t2','workspace_id':'w','label':'new label','focused':False}
-            tab[field]=bad
-            self.response({'type':'tab_info','tab':tab})
-            with self.subTest(field=field), self.assertRaises(HerdrError):
-                self.client.rename_subagent_tab('t2','w','new label')
-
-    def test_rename_accepts_focus_state_without_mutating_focus(self):
-        self.response({'type':'tab_info','tab':{'tab_id':'t2','workspace_id':'w','label':'new label','focused':True}})
-        self.client.rename_subagent_tab('t2','w','new label')
-        self.assertEqual(self.requests, [('tab.rename', {'tab_id':'t2','label':'new label'})])
+from harness_herdr_hooks.state import StateStore
 
 
-if __name__ == '__main__':
-    unittest.main()
+def pane(pane_id, tab="tab", session="parent"):
+    return {"pane_id": pane_id, "workspace_id": "work", "tab_id": tab,
+            "focused": False, "agent_session": {
+                "source": "native", "agent": "codex", "kind": "id", "value": session}}
+
+
+class StandaloneTransportTests(unittest.TestCase):
+    def test_unique_destination_uses_lexical_anchor_and_rejects_ambiguity(self):
+        h = HerdrClient("/unused")
+        h.peer_identity = (os.getuid(), 1)
+        snapshot = {"panes": [pane("z"), pane("a"), pane("other", session="different")]}
+        with patch.object(h, "snapshot", return_value=snapshot), patch.object(h, "server_identity", return_value="server"):
+            self.assertEqual(h.session_destination("parent")["anchor_pane_id"], "a")
+            self.assertIsNone(h.session_destination("missing"))
+            self.assertTrue(h.pane_has_session("a", "parent", workspace_id="work", tab_id="tab"))
+            snapshot["panes"].append(pane("conflict", tab="another"))
+            self.assertIsNone(h.session_destination("parent"))
+
+    def test_managed_start_requires_canonical_typed_acknowledgement(self):
+        h = HerdrClient("/unused")
+        args = ["resume", "--remote", "unix:///profile/socket", "child"]
+        with patch.object(h, "request", return_value={
+                "type": "agent_started", "agent": {"pane_id": "child-pane"}, "argv": ["codex", *args]}) as request:
+            self.assertEqual(h.start_agent("child-pane", "binding", args), "child-pane")
+            method, params = request.call_args.args
+            self.assertEqual(method, "agent.start")
+            self.assertEqual(params["args"], args)
+            self.assertEqual(params["timeout_ms"], 4000)
+            self.assertEqual(params["kind"], "codex")
+            request.return_value = {"type": "agent_started", "pane_id": "child-pane"}
+            with self.assertRaises(HerdrError):
+                h.start_agent("child-pane", "binding", args)
+
+    def test_positive_split_claim_start_and_exact_session_ack(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            h = Mock(spec=["server_identity", "session_destination", "split_standalone",
+                           "start_agent", "pane_has_session", "snapshot"])
+            h.server_identity.return_value = "server"
+            h.session_destination.return_value = {
+                "server_id": "server", "workspace_id": "work", "tab_id": "tab", "anchor_pane_id": "anchor"}
+            h.split_standalone.return_value = pane("new")
+            h.snapshot.return_value = {"panes": [{**pane("new"), "agent_session": None}]}
+            store = StateStore(root, "parent")
+
+            def start(pane_id, binding, args):
+                self.assertEqual(store.standalone_effect("event")["pane_id"], "new")
+                self.assertEqual(store.standalone_effect("event", "start")["status"], "intent")
+                self.assertEqual((pane_id, binding, args[-1]), ("new", "binding", "child"))
+                return pane_id
+
+            h.start_agent.side_effect = start
+            h.pane_has_session.side_effect = [False, True]
+            with patch("harness_herdr_hooks.attach.time.sleep"):
+                self.assertEqual(attach_standalone_session(
+                    h, root, event_key="event", binding_id="binding", parent_session_id="parent",
+                    state_namespace="parent", child_session_id="child", backend_socket=root/"socket",
+                    cwd=root, profile_home=root), "new")
+            self.assertEqual(store.standalone_effect("event", "start")["status"], "attached")
+            self.assertEqual(h.pane_has_session.call_args.args, ("new", "child"))
+            self.assertEqual(h.split_standalone.call_args.kwargs["env"]["CODEX_HOME"], str(root))
+
+    def test_uncertain_effects_are_not_repeated_after_restart(self):
+        for failure in ("split-reply", "before-claim", "after-claim", "start-reply"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                h = Mock(spec=["server_identity", "session_destination", "split_standalone",
+                               "start_agent", "pane_has_session", "snapshot"])
+                h.server_identity.return_value = "server"
+                h.session_destination.return_value = {"server_id": "server", "workspace_id": "work",
+                    "tab_id": "tab", "anchor_pane_id": "anchor"}
+                h.split_standalone.return_value = pane("child-pane")
+                h.start_agent.return_value = "child-pane"
+                h.snapshot.return_value = {"panes": [{**pane("child-pane"), "agent_session": None}]}
+                kwargs = dict(event_key="event", binding_id="binding", parent_session_id="parent",
+                              state_namespace="parent", child_session_id="child",
+                              backend_socket=root/"socket", cwd=root, profile_home=root)
+                if failure == "split-reply":
+                    h.split_standalone.side_effect = HerdrError("lost split response")
+                if failure == "start-reply":
+                    h.start_agent.side_effect = HerdrError("lost start response")
+                if failure == "before-claim":
+                    with patch.object(StateStore, "record_standalone_pane_claim", side_effect=RuntimeError("crash")):
+                        with self.assertRaises(RuntimeError):
+                            attach_standalone_session(h, root, **kwargs)
+                elif failure == "after-claim":
+                    claim = Mock(side_effect=RuntimeError("crash before start intent"))
+                    with self.assertRaises(RuntimeError):
+                        attach_standalone_session(h, root, on_pane_claim=claim, **kwargs)
+                    self.assertEqual(StateStore(root, "parent").standalone_effect("event")["pane_id"], "child-pane")
+                else:
+                    with self.assertRaises(HerdrError):
+                        attach_standalone_session(h, root, **kwargs)
+                with self.assertRaises(AttachmentUnavailable):
+                    attach_standalone_session(h, root, **kwargs)
+                self.assertEqual(h.split_standalone.call_count, 1)
+                self.assertEqual(h.start_agent.call_count, int(failure == "start-reply"))

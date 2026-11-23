@@ -26,20 +26,20 @@ class CodexInstallTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_install_registers_all_hooks_and_profile_adapter_then_uninstalls(self):
+    def test_install_registers_session_start_only_and_profile_adapter_then_uninstalls(self):
         hooks = self.root / "hooks.json"
         hooks.write_text(json.dumps({"hooks": {"UserEvent": [{"hooks": [{"type": "command", "command": "keep"}]}]}}))
         with patch.dict(os.environ, {"PATH": str(self.bin)}):
             result = install("codex", source_root=self.source, config_dir=str(self.root))
         data = json.loads(hooks.read_text())
-        self.assertEqual(set(data["hooks"]) - {"UserEvent"}, {"SessionStart", "SubagentStart", "SubagentStop"})
+        self.assertEqual(set(data["hooks"]) - {"UserEvent"}, {"SessionStart"})
         self.assertEqual(data["hooks"]["UserEvent"][0]["hooks"][0]["command"], "keep")
         adapter = self.root / "harness-herdr-hooks" / "codex-adapter"
         meta = json.loads((adapter / "adapter.json").read_text())
         self.assertEqual(meta["native_executable"], str(self.native.resolve()))
         self.assertEqual(os.stat(adapter / "codex").st_mode & 0o777, 0o700)
         self.assertEqual(json.loads((self.root / ".harness-herdr-hooks.json").read_text())["entries"]["codex"]["handlers"].keys(),
-                         {"SessionStart", "SubagentStart", "SubagentStop"})
+                         {"SessionStart"})
         self.assertEqual(status("codex", config_dir=str(self.root))["trust"], "unknown")
         uninstall("codex", config_dir=str(self.root))
         self.assertFalse((adapter / "codex").exists())
@@ -223,29 +223,37 @@ class CodexInstallTests(unittest.TestCase):
         with self.assertRaises(InstallError): _recover_transaction(self.root)
         self.assertTrue(config.is_symlink()); self.assertEqual(target.read_bytes(),b"after image")
 
-    def test_reinstall_and_legacy_two_hook_upgrade_are_idempotent(self):
+    def test_reinstall_and_legacy_three_hook_upgrade_are_idempotent(self):
         hooks = self.root / "hooks.json"
         command = str(self.source / "bin/harness-herdr-hooks") + " codex-hook"
         old = {"type": "command", "command": command, "timeout": 5, "async": True}
-        hooks.write_text(json.dumps({"hooks": {event: [{"hooks": [old]}] for event in ("SessionStart", "SubagentStart")}}))
+        independent={"type":"command","command":"user-owned"}
+        hooks.write_text(json.dumps({"hooks": {
+            "SessionStart": [{"hooks": [old]}],
+            "SubagentStart": [{"hooks": [old, independent]}],
+            "SubagentStop": [{"hooks": [old]}],
+        }}))
         manifest = self.root / ".harness-herdr-hooks.json"
-        # A previous managed 2-hook install is represented by its ownership record.
+        # A previous managed 3-hook install is represented by its ownership record.
         from harness_herdr_hooks.install import _read_manifest
         data = _read_manifest(manifest)
-        data["entries"]["codex"] = {"handlers": {event: old for event in ("SessionStart", "SubagentStart")}}
+        data["entries"]["codex"] = {"handlers": {event: old for event in ("SessionStart", "SubagentStart", "SubagentStop")}}
         manifest.write_text(json.dumps(data)); manifest.chmod(0o600)
         with patch.dict(os.environ, {"PATH": str(self.bin)}):
             install("codex", source_root=self.source, config_dir=str(self.root))
             install("codex", source_root=self.source, config_dir=str(self.root))
         installed = json.loads(hooks.read_text())["hooks"]
-        for event in ("SessionStart", "SubagentStart", "SubagentStop"):
-            self.assertEqual(sum(1 for g in installed[event] for h in g["hooks"] if h.get("command") == command), 1)
+        self.assertEqual(sum(1 for g in installed["SessionStart"] for h in g["hooks"] if h.get("command") == command), 1)
+        self.assertEqual(sum(1 for group in installed.get("SubagentStart", []) for item in group["hooks"]
+                             if item.get("command") == command), 0)
+        self.assertNotIn("SubagentStop", installed)
+        self.assertEqual(installed["SubagentStart"][0]["hooks"], [independent])
 
     def test_changed_owned_handler_and_unmanaged_conflict_fail_closed(self):
         install("codex", source_root=self.source, config_dir=str(self.root))
         hooks = self.root / "hooks.json"
         value = json.loads(hooks.read_text())
-        value["hooks"]["SubagentStop"][0]["hooks"][0]["command"] = "user edit"
+        value["hooks"]["SessionStart"][0]["hooks"][0]["command"] = "user edit"
         hooks.write_text(json.dumps(value))
         hooks.chmod(0o640)
         config = self.root / "config.toml"
@@ -269,7 +277,7 @@ class CodexInstallTests(unittest.TestCase):
         shim.write_bytes(b"foreign adapter")
         shim.chmod(0o640)
         hooks = self.root / "hooks.json"
-        hooks.write_bytes(b'{"hooks": {"SubagentStop": [{"hooks": [{"type": "command", "command": "conflict"}]}]}}\n')
+        hooks.write_bytes(b'{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "conflict"}]}]}}\n')
         hooks.chmod(0o640)
         before = {p: (p.read_bytes(), p.stat().st_mode & 0o777) for p in (shim, hooks)}
         directory_modes = {p: p.stat().st_mode & 0o777 for p in (parent, adapter)}
@@ -314,13 +322,25 @@ class CodexInstallTests(unittest.TestCase):
         self.assertEqual(hooks.stat().st_mode & 0o777, 0o640)
         self.assertFalse(config.exists())
 
-    def test_open_code_profile_remains_independent(self):
+    def test_opencode_install_is_retired(self):
         install("codex", source_root=self.source, config_dir=str(self.root))
         other = Path(self.tmp.name) / "other"
         other.mkdir(mode=0o700)
-        result = install("opencode", source_root=self.source, config_dir=str(other))
-        self.assertEqual(result["harness"], "opencode")
-        self.assertTrue((other / "plugins/harness-herdr-hooks.js").is_symlink())
+        with self.assertRaisesRegex(InstallError, "OpenCode installation is retired"):
+            install("opencode", source_root=self.source, config_dir=str(other))
+        self.assertFalse((other / "plugins/harness-herdr-hooks.js").exists())
+
+    def test_legacy_opencode_link_status_and_uninstall_remain_ownership_checked(self):
+        root=Path(self.tmp.name)/"legacy-opencode"; (root/"plugins").mkdir(parents=True)
+        source=self.source/"integrations/opencode/plugin.js"
+        dest=root/"plugins/harness-herdr-hooks.js"; dest.symlink_to(source)
+        manifest=root/".harness-herdr-hooks.json"
+        manifest.write_text(json.dumps({"schema":1,"entries":{"opencode":{"source":str(source),"destination":str(dest)}}}))
+        manifest.chmod(0o600)
+        self.assertEqual(status("opencode",config_dir=str(root))["status"],"installed")
+        self.assertEqual(uninstall("opencode",config_dir=str(root))["action"],"unlinked")
+        self.assertFalse(dest.is_symlink())
+        self.assertFalse(manifest.exists())
 
     def test_next_install_recovers_interrupted_adapter_publication(self):
         with patch.dict(os.environ, {"PATH": str(self.bin)}):
