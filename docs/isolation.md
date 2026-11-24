@@ -11,6 +11,28 @@ foreground PID or process tree.
 
 ## Codex and Herdr boundaries
 
+The optional client-bound route adds a per-helper lease under the private
+`client-bindings` state namespace. Admission requires the exact pinned local
+Codex TUI, a managed local interactive launch, a private authenticated local
+Herdr socket, and a terminal identity matching one protocol-22 pane tty.
+Codex session checks separately use the selected profile's pinned local Codex
+endpoint. Pane ID, tty, workspace or tab values inherited from a
+shared app-server or shell do not prove the foreground client's display.
+Missing tty data or more than one matching display fails closed.
+
+An active lease binds the displayed conversation to the verified Herdr
+server, workspace, tab and pane. View changes require acknowledged revocation;
+the helper serializes lease and pane effects under generation locks. A creation
+receipt is limited to the originating TUI's admitted user turn and exact typed
+child result. After a resume, the new conversation is eligible only after its
+new active lease is acknowledged. Receipts are single-use and bounded.
+Ambiguous clients, stale
+endpoints, view changes, native delegation, direct/native launch, or shim
+bypass do not authorize placement. The legacy Herdr Codex session reporter
+conflicts with this source of session references and must be absent before
+managed mode can be enabled. These checks do not claim support for remote or
+unpatched clients.
+
 Codex uses bounded local rollout metadata and the app-server interfaces needed
 to verify the selected profile and exact session. An explicit endpoint is
 accepted only when it is already associated with a verified standalone

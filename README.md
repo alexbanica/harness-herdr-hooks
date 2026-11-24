@@ -7,10 +7,10 @@ Codex shell commands. The integration does not discover or attach native
 subagents and does not create, name, or retire Herdr tabs. OpenCode integration
 has been retired.
 
-**Status: DRAFT / experimental.** Source checks and isolated migration/operator
-checks passed, but live standalone capture and attachment were not demonstrated
-in a correctly bound parent. See [validation](docs/validation.md) for current
-evidence and remaining gaps.
+**Status: DRAFT / experimental.** The opt-in client binding and source checks
+are implemented, but two-client live placement and patched Codex build/test
+qualification remain incomplete. See [validation](docs/validation.md) for the
+current evidence and limits.
 
 ## Quick start
 
@@ -20,6 +20,12 @@ cd harness-herdr-hooks
 bin/harness-herdr-hooks install codex
 bin/harness-herdr-hooks status codex
 ```
+
+Client-bound placement requires a separately built Codex TUI with the pinned
+Herdr display-binding patch. Enable it explicitly with
+`install codex --client-binding-codex /absolute/path/to/codex`; the ordinary
+install command above does not enable it. See [Codex setup](docs/install-codex.md)
+for the pinned source, patch and build instructions.
 
 Install registers the managed Codex `SessionStart` hook and the profile-owned
 command adapter. Reload the selected profile through Codex's normal controls
@@ -67,6 +73,7 @@ they already loaded. See
 
 Native subagent/tab behavior described in older validation records is
 historical and superseded. Current source assurance does not prove live
-standalone capture, same-tab display, no-added-turn attachment, shell recovery,
-or runtime loading of the current revision. The project remains DRAFT; see
+cross-space client binding, same-tab display, no-added-turn attachment, shell
+recovery, or runtime loading of the current revision. Ambiguous or missing
+client proof grants no pane authority. The project remains DRAFT; see
 [validation](docs/validation.md) and [troubleshooting](docs/troubleshooting.md).

@@ -1,6 +1,7 @@
 """Ownership-tracked, serialized per-user harness registrations."""
 from __future__ import annotations
 import fcntl, hashlib, json, os, shlex, stat, tempfile
+import subprocess
 import re
 from contextlib import contextmanager
 from pathlib import Path
@@ -172,7 +173,61 @@ def _groups(data:dict[str,Any],event:str)->list[Any]:
 
 def _owned_group_matches(groups:list[Any],owned:dict[str,Any])->list[int]: return [i for i,g in enumerate(groups) if g==owned]
 
-def _codex_install(root:Path,source_root:Path,manifest:dict[str,Any],manifest_pre:bytes|None)->dict[str,str]:
+_CLIENT_BINDING_VERSION = "0.172.0"
+_CLIENT_BINDING_MARKER = "herdr-client-binding-v1"
+
+def _sha256_file(path:Path)->str:
+    digest=hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda:stream.read(1024*1024),b""): digest.update(chunk)
+    return digest.hexdigest()
+
+def _verify_client_binding_executable(value:str|Path)->dict[str,str]:
+    from .codex_config import _is_managed_adapter
+    candidate=Path(value).expanduser()
+    if not candidate.is_absolute(): raise InstallError("client-binding Codex path must be absolute")
+    try:
+        if candidate.is_symlink(): raise InstallError("client-binding Codex executable must not be a symlink")
+        st=candidate.lstat()
+        if (not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or st.st_mode & 0o022
+                or not os.access(candidate,os.X_OK)):
+            raise InstallError("client-binding Codex executable must be a user-owned executable regular file")
+        canonical=candidate.resolve(strict=True)
+        if _is_managed_adapter(canonical): raise InstallError("client-binding Codex executable cannot be a managed adapter")
+        digest=_sha256_file(canonical)
+        result=subprocess.run([str(canonical),"--version"],capture_output=True,text=True,timeout=5,check=False)
+        tokens = result.stdout.strip().split()
+        if (result.returncode != 0 or _CLIENT_BINDING_VERSION not in tokens
+                or _CLIENT_BINDING_MARKER not in tokens):
+            raise InstallError("Codex executable does not report the pinned client-binding version and capability marker")
+        return {"native_executable":str(canonical),"sha256":digest,"version":_CLIENT_BINDING_VERSION,
+                "capability_marker":_CLIENT_BINDING_MARKER}
+    except InstallError: raise
+    except (OSError,subprocess.SubprocessError) as exc:
+        raise InstallError(f"cannot verify client-binding Codex executable: {exc}") from exc
+
+def _has_legacy_herdr_session_reporter(data:dict[str,Any])->bool:
+    hooks=data.get("hooks",{})
+    if not isinstance(hooks,dict): return False
+    for groups in hooks.values():
+        if not isinstance(groups,list): continue
+        for group in groups:
+            entries=group.get("hooks",[]) if isinstance(group,dict) else []
+            if not isinstance(entries,list): continue
+            for hook in entries:
+                command=hook.get("command","") if isinstance(hook,dict) else ""
+                if not isinstance(command,str): continue
+                folded=command.lower()
+                if "herdr-agent-state.sh" in folded:
+                    return True
+                if ("herdr" in folded and "codex" in folded and
+                    ("session" in folded or "report" in folded) and
+                    not ("harness-herdr-hooks" in folded and "codex-hook" in folded)):
+                    return True
+    return False
+
+def _codex_install(root:Path,source_root:Path,manifest:dict[str,Any],manifest_pre:bytes|None,
+                   client_binding_codex:str|Path|None=None)->dict[str,str]:
     from .codex_config import (_check_file, _parse, _path_value, _edit, _find_native, _is_managed_adapter,
         install_path, commit_path_journal, recover_path_journal,
                                _check_root)
@@ -180,6 +235,11 @@ def _codex_install(root:Path,source_root:Path,manifest:dict[str,Any],manifest_pr
     if not source.is_file(): raise InstallError(f"entrypoint is missing: {source}")
     path=root/"hooks.json"; hooks_identity=_safe_owned_file(path); hooks_pre=path.read_bytes() if hooks_identity is not None else None
     data,mode,existed=_read_hooks(path); entry=manifest["entries"].get("codex")
+    client_binding=None
+    if client_binding_codex is not None:
+        client_binding=_verify_client_binding_executable(client_binding_codex)
+        if _has_legacy_herdr_session_reporter(data):
+            raise InstallError("legacy Herdr Codex session reporter conflicts with client binding; remove it before enabling managed mode")
     if (path.read_bytes() if path.exists() else None)!=hooks_pre:
         raise InstallError("Codex hooks.json changed during preflight")
     adapter_dir=root/"harness-herdr-hooks"/"codex-adapter"
@@ -283,6 +343,9 @@ def _codex_install(root:Path,source_root:Path,manifest:dict[str,Any],manifest_pr
     native=prior_native or _find_native(tail,os.environ.get("PATH"),exclude_dirs=(adapter_dir,))
     meta={"schema":1,"source_root":str(source_root.resolve()),
           "native_executable":native,"config_root":str(root)}
+    if client_binding:
+        client_binding={**client_binding,"reporting_helper":str(source.resolve())}
+        meta["client_binding"]=client_binding
     # Snapshot adapter state after the validated directory creation.
     shim_mode=stat.S_IMODE(shim.stat().st_mode) if shim.exists() else 0o700
     meta_mode=stat.S_IMODE(metadata.stat().st_mode) if metadata.exists() else 0o600
@@ -302,6 +365,9 @@ def _codex_install(root:Path,source_root:Path,manifest:dict[str,Any],manifest_pr
         try:
             path_ownership=install_path(root,adapter_dir,env_path=os.environ.get("PATH"),
                                         ownership=old_path,retain_journal=True)
+            # Keep the profile's native search path explicit so managed child
+            # launches do not inherit a shell-mutated PATH.
+            path_ownership["native_path"]=tail
         except Exception as exc:
             raise InstallError(f"managed Codex PATH setup failed: {exc}") from exc
         shim_tmp=shim.with_name(".codex-stage"); meta_tmp=metadata.with_name(".adapter-stage")
@@ -323,6 +389,7 @@ def _codex_install(root:Path,source_root:Path,manifest:dict[str,Any],manifest_pr
             "handlers":handlers,"adapter_dir":str(adapter_dir),"adapter_sha256":hashlib.sha256(shim.read_bytes()).hexdigest(),
             "metadata_sha256":hashlib.sha256(metadata.read_bytes()).hexdigest(),"path":path_ownership,
             "trust":"unknown","backend_qualification":"unknown","observer":"unknown","attachment":"unknown"}
+        if client_binding: manifest["entries"]["codex"]["client_binding"]=client_binding
         manifest_after=(json.dumps(manifest,indent=2,sort_keys=True)+"\n").encode()
         transaction[str(manifest_path)]["after_sha256"]=hashlib.sha256(manifest_after).hexdigest()
         _write_transaction(root,transaction)
@@ -360,7 +427,8 @@ def _handler_locations(groups:list[Any],handler:dict[str,Any])->list[tuple[int,i
     return [(gi,hi) for gi,g in enumerate(groups) if isinstance(g,dict) and isinstance(g.get("hooks"),list)
             for hi,h in enumerate(g["hooks"]) if h==handler]
 
-def install(harness:str,*,source_root:Path,config_dir:str|None=None)->dict[str,str]:
+def install(harness:str,*,source_root:Path,config_dir:str|None=None,
+            client_binding_codex:str|Path|None=None)->dict[str,str]:
     source_root=source_root.resolve(); root=_root(config_dir,harness)
     with _locked(root):
         if harness=="codex":
@@ -375,7 +443,7 @@ def install(harness:str,*,source_root:Path,config_dir:str|None=None)->dict[str,s
         if harness=="codex":
             source=source_root/"bin/harness-herdr-hooks"
             if not source.is_file(): raise InstallError(f"entrypoint is missing: {source}")
-            return _codex_install(root,source_root,manifest,manifest_pre)
+            return _codex_install(root,source_root,manifest,manifest_pre,client_binding_codex)
         raise InstallError("OpenCode installation is retired; use the ownership-checked uninstall for an existing link")
 
 def status(harness:str,*,config_dir:str|None=None)->dict[str,str]:
@@ -395,6 +463,16 @@ def status(harness:str,*,config_dir:str|None=None)->dict[str,str]:
                 adapter_good=(hashlib.sha256(shim.read_bytes()).hexdigest()==entry.get("adapter_sha256")
                               and hashlib.sha256(meta.read_bytes()).hexdigest()==entry.get("metadata_sha256"))
             except OSError: adapter_good=False
+            binding_state="not-configured"
+            binding=entry.get("client_binding")
+            if binding is not None:
+                try:
+                    executable=Path(binding["native_executable"])
+                    executable_good=(not executable.is_symlink() and executable.is_file()
+                        and executable.stat().st_uid==os.getuid() and os.access(executable,os.X_OK)
+                        and _sha256_file(executable)==binding["sha256"])
+                    binding_state="verified" if executable_good else "changed-or-missing"
+                except (OSError,KeyError,TypeError): binding_state="changed-or-missing"
             path_state="unknown"
             try:
                 from .codex_config import _parse, _path_value
@@ -405,6 +483,7 @@ def status(harness:str,*,config_dir:str|None=None)->dict[str,str]:
         if harness=="codex": result.update(adapter="configured" if adapter_good else "changed-or-missing",path=path_state,
                                              trust=entry.get("trust","unknown"),backend_qualification=entry.get("backend_qualification","unknown"),
                                              observer=entry.get("observer","unknown"),attachment=entry.get("attachment","unknown"))
+        if harness=="codex" and entry.get("client_binding") is not None: result["client_binding"]=binding_state
         return result
 
 def uninstall(harness:str,*,config_dir:str|None=None)->dict[str,str]:

@@ -309,7 +309,8 @@ class StateStore:
 
     def reserve_standalone_effect(self, event_key: str, stage: str, binding_id: str,
                                  child_id: str, destination: dict[str, Any], *,
-                                 pane_id: str | None = None) -> bool:
+                                 pane_id: str | None = None,
+                                 client_view: dict[str, Any] | None = None) -> bool:
         """Durably reserve a one-shot split/start before any external side effect.
 
         Returns true only for the process that first records the intent. Replays,
@@ -325,6 +326,8 @@ class StateStore:
         if not all(isinstance(destination[k], str) and destination[k]
                    for k in destination):
             raise ValueError("invalid standalone effect destination values")
+        if client_view is not None:
+            _validate_client_view(client_view)
         with self.locked() as data:
             effects = data.setdefault("standalone_effects", {})
             _validate_standalone_effects(effects)
@@ -337,6 +340,7 @@ class StateStore:
                 split = effects.get(split_key)
                 if (not isinstance(split, dict) or split.get("binding_id") != binding_id
                         or split.get("child_id") != child_id or split.get("destination") != destination
+                        or split.get("client_view") != client_view
                         or not split.get("pane_id") or pane_id != split.get("pane_id")):
                     raise UnsafeState("standalone start requires the exact persisted split claim")
             elif pane_id is not None:
@@ -345,6 +349,8 @@ class StateStore:
                             "binding_id": binding_id, "child_id": child_id,
                             "destination": dict(destination), "pane_id": pane_id,
                             "status": "intent"}
+            if client_view is not None:
+                effects[key]["client_view"] = dict(client_view)
             return True
 
     def record_standalone_pane_claim(self, event_key: str, binding_id: str,
@@ -685,19 +691,37 @@ def standalone_association_digest(authority: dict, candidate: dict) -> str:
                                      sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def _validate_client_view(value: object) -> None:
+    import uuid
+
+    if not isinstance(value, dict) or set(value) != {"generation", "sequence"}:
+        raise UnsafeState("invalid client view effect pin")
+    generation, sequence = value["generation"], value["sequence"]
+    if (not isinstance(generation, str) or type(sequence) is not int
+            or not 0 < sequence < 2**64):
+        raise UnsafeState("invalid client view effect identity")
+    try:
+        if str(uuid.UUID(generation)) != generation:
+            raise ValueError
+    except ValueError as exc:
+        raise UnsafeState("invalid client view generation") from exc
+
+
 def _validate_standalone_effects(value: object) -> None:
     if not isinstance(value, dict):
         raise UnsafeState("invalid standalone effect ledger")
     for key, effect in value.items():
         if (not isinstance(key, str) or not re.fullmatch(r"[0-9a-f]{64}", key)
                 or not isinstance(effect, dict)
-                or set(effect) != {"event_key", "stage", "binding_id", "child_id",
-                                   "destination", "pane_id", "status"}
+                or set(effect) - {"client_view"} != {"event_key", "stage", "binding_id", "child_id",
+                                                     "destination", "pane_id", "status"}
                 or effect.get("stage") not in {"split", "start"}
                 or effect.get("status") not in {"intent", "claimed", "started", "attached"}
                 or any(not isinstance(effect.get(field), str) or not effect[field]
                        or len(effect[field]) > 512 for field in ("event_key", "binding_id", "child_id"))):
             raise UnsafeState("invalid standalone effect record")
+        if "client_view" in effect:
+            _validate_client_view(effect["client_view"])
         expected_key = hashlib.sha256(json.dumps(
             [effect["event_key"], effect["stage"]], separators=(",", ":")).encode()).hexdigest()
         if key != expected_key or (effect["stage"] == "start" and effect["pane_id"] is None):

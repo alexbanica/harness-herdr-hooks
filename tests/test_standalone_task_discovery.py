@@ -8,7 +8,7 @@ from harness_herdr_hooks.adapters.codex import CodexRuntimeAdapter
 from harness_herdr_hooks.model import Context, Harness, ParentBinding, Lifecycle
 from harness_herdr_hooks.state import StateStore
 from harness_herdr_hooks.model import CreationProof, Session
-from harness_herdr_hooks.coordinator import Coordinator
+from harness_herdr_hooks.coordinator import Coordinator, discovery_namespace
 from types import SimpleNamespace
 import hashlib
 
@@ -37,6 +37,37 @@ def event(parent='parent', child='standalone', turn='turn', item='item'):
 
 
 class StandaloneDiscoveryTests(unittest.TestCase):
+    def test_simultaneous_displays_keep_independent_rollout_cursors(self):
+        for first_pane in ("left", "right"):
+            with self.subTest(first_pane=first_pane), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                profile = root / "profile"
+                rollout = profile / "sessions" / "parent.jsonl"
+                rollout.parent.mkdir(parents=True)
+                rollout.write_text(json.dumps({"type": "session_meta", "payload": {"id": "parent"}}) + "\n")
+                context = Context(Harness.CODEX, str(profile), profile, profile, profile,
+                                  "/socket", "parent", "1:2:3")
+                proxy = Proxy([{"id": "parent", "path": str(rollout)}])
+                displays = {}
+                for pane_id in ("left", "right"):
+                    parent = ParentBinding(context, "server", "work", pane_id + "-tab", pane_id,
+                                           session_path=rollout, backend_proof={"client_generation": pane_id})
+                    adapter = object.__new__(CodexRuntimeAdapter)
+                    adapter.context, adapter.task_store_root, adapter.proxy = context, root / "state", proxy
+                    adapter.task_store_namespace = discovery_namespace(parent)
+                    displays[pane_id] = (parent, adapter)
+                    self.assertEqual(list(adapter.sessions(parent)), [])
+                with rollout.open("a") as stream:
+                    stream.write(json.dumps(event()) + "\n")
+                proxy.rows["standalone"] = {"id": "standalone", "cwd": "/work",
+                                             "status": {"type": "active", "activeFlags": []}}
+                for pane_id in (first_pane, "right" if first_pane == "left" else "left"):
+                    parent, adapter = displays[pane_id]
+                    discovered = list(adapter.sessions(parent))
+                    self.assertEqual([child.context.session_id for child in discovered], ["standalone"])
+                    store = StateStore(adapter.task_store_root, adapter.task_store_namespace)
+                    self.assertEqual(store.task_discovery()["authority"]["destination"]["pane_id"], pane_id)
+
     def test_reader_adapter_poll_bounds_overflow_and_resumes_after_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); profile = root / 'profile'; sessions = profile / 'sessions'

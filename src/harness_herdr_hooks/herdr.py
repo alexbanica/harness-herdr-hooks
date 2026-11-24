@@ -7,6 +7,11 @@ from pathlib import Path
 from typing import Any
 class HerdrError(RuntimeError): pass
 
+
+class AgentPaneBusy(HerdrError):
+    """Herdr rejected managed start before launching anything."""
+
+
 def _canonical_executable(value:str)->str|None:
     found=value if os.path.isabs(value) else shutil.which(value)
     return os.path.realpath(found) if found else None
@@ -179,7 +184,12 @@ class HerdrClient:
             self._socket_fingerprint=before
         except (OSError,TimeoutError,json.JSONDecodeError) as e: raise HerdrError('Herdr request failed') from e
         if not isinstance(reply,dict) or reply.get('id')!=rid: raise HerdrError('Herdr response ID mismatch')
-        if 'error' in reply: raise HerdrError('Herdr rejected request')
+        if 'error' in reply:
+            error = reply['error']
+            if (method == 'agent.start' and 'result' not in reply and isinstance(error, dict)
+                    and error.get('code') == 'agent_pane_busy' and isinstance(error.get('message'), str)):
+                raise AgentPaneBusy('Herdr reports that the pane shell is not ready')
+            raise HerdrError('Herdr rejected request')
         result=reply.get('result')
         if not isinstance(result,dict): raise HerdrError('malformed Herdr response')
         return result
@@ -264,6 +274,18 @@ class HerdrClient:
             return self._session_ref_matches(pane.get('agent_session'),session_id,session_path,harness)
         except (HerdrError,OSError,TypeError,ValueError,RuntimeError): return False
 
+    def report_client_session(self, pane_id: str, session_id: str, transition: str,
+                              endpoint: Path) -> None:
+        self.request("pane.report_agent_session", {
+            "pane_id": pane_id,
+            "source": "harness-herdr-hooks-client",
+            "agent": "codex",
+            "seq": time.time_ns(),
+            "agent_session_id": session_id,
+            "session_start_source": transition,
+            "resume_argv": ["codex", "resume", "--remote", "unix://" + str(endpoint), session_id],
+        })
+
     def start_agent(self,pane_id:str,binding_id:str,args:list[str])->str:
         """Start an exact Codex session through Herdr's typed managed-agent API.
 
@@ -279,7 +301,8 @@ class HerdrClient:
         uri=args[2]
         if not uri.startswith('unix:///') or not args[3] or not Path(uri[len('unix://'):]).is_absolute():
             raise HerdrError('managed Codex start requires an absolute verified Unix socket URI and thread ID')
-        name='hc-'+hashlib.sha256(json.dumps([pane_id,binding_id],separators=(',',':')).encode()).hexdigest()[:32]
+        # Herdr caps managed agent names at 32 characters, including the prefix.
+        name='hc-'+hashlib.sha256(json.dumps([pane_id,binding_id],separators=(',',':')).encode()).hexdigest()[:29]
         result=self.request('agent.start',{'kind':'codex','pane_id':pane_id,'name':name,
             'args':list(args),'timeout_ms':4000})
         agent=result.get('agent')
@@ -292,7 +315,10 @@ class HerdrClient:
     def split_standalone(self, workspace_id: str, anchor_pane_id: str, cwd: Path,
                          *, env: dict[str, str]) -> dict[str, Any]:
         if (not workspace_id or not anchor_pane_id or not cwd.is_absolute()
-                or set(env)!={'CODEX_HOME','HARNESS_HERDR_DISPLAY','HARNESS_HERDR_STATE_ROOT'}
+                or set(env) - {"CODEX_HOME", "HARNESS_HERDR_DISPLAY", "HARNESS_HERDR_STATE_ROOT", "PATH"}
+                or not {"CODEX_HOME", "HARNESS_HERDR_DISPLAY", "HARNESS_HERDR_STATE_ROOT"} <= set(env)
+                or ("PATH" in env and (not Path(env["PATH"].split(os.pathsep)[0]).is_absolute()
+                                      or "\x00" in env["PATH"]))
                 or env['HARNESS_HERDR_DISPLAY']!='1'
                 or not all(Path(env[key]).is_absolute()
                            for key in ('CODEX_HOME','HARNESS_HERDR_STATE_ROOT'))):

@@ -23,6 +23,40 @@ instructions.
 
 ## Standalone Codex creation and placement
 
+### Opt-in client binding
+
+The optional client-bound route is enabled per profile with
+`install codex --client-binding-codex /absolute/path/to/codex`. It accepts only
+the pinned patched TUI, launched by the managed adapter in a supported local
+interactive pane. A private helper compares its inherited terminal descriptor
+with a unique protocol-22 Herdr pane tty through the authenticated Herdr
+socket. Codex session checks use the selected profile's separately pinned
+local Codex endpoint. The helper records an acknowledged active-client lease.
+Inherited
+server coordinates, focus, cwd, latest session ID, and optional environment
+markers do not establish the display.
+
+The patched TUI reports `active` only after adopting the view and confirms
+`clear` before changing views. After resume, placement waits for the new
+`active` lease acknowledgement. It reports `created` only when the native
+thread and turn IDs match the acknowledged view and a user turn admitted by
+that TUI, and after successful creation returns the exact typed child UUID.
+Receipts are bounded, single-use and expire after 60 seconds. The observer
+requires the exact parent, turn and child receipt before reserving a split.
+If the view, endpoint, tty, receipt, destination or server state is ambiguous
+or stale, there is no pane effect. Same-tab attachment remains exact child
+verification in one new or verified existing unfocused pane; it never falls
+back to another tab or inserts a prompt or turn.
+
+This authority applies to the managed local pinned-client route only. Direct
+native launches, background startup, native subagent events, and clients that
+bypass the profile shim cannot provide placement authority. A profile that
+still has Herdr's legacy Codex session reporter is rejected until that
+ownership-checked conflict is removed. See [installation](install-codex.md)
+for patch provenance and setup.
+
+### Existing discovery contract
+
 The event source is a newly appended typed local rollout record for a
 successful `codex_tui.create_thread` completion. It must correlate the exact
 bound parent, turn, item, and one returned child ID. The event nominates a

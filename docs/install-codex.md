@@ -17,6 +17,50 @@ bin/harness-herdr-hooks install codex
 bin/harness-herdr-hooks status codex
 ```
 
+### Opt in to client-bound pane placement
+
+The client-bound route is opt-in per profile and requires the patched pinned
+Codex executable. Build it from OpenAI Codex tag `rust-v0.172.0`, commit
+`3d86e43b075adeba2193ec5c22ac92f55afd82e6`, source tree
+`82eb586eff8b4d378eafc4fec640605ef7d6dbf1`, with Rust `1.99.1`. The delivered
+patch is `integrations/codex/client-pane-binding.patch`, SHA-256
+`f5a1a6b145d2acdc082db878858dc1c3aef172c47629be4dd8acefb07896b046`.
+Use the pinned toolchain and verify a disposable checkout before applying the
+patch:
+
+```sh
+git clone https://github.com/openai/codex.git /tmp/codex-client-binding
+git -C /tmp/codex-client-binding checkout 3d86e43b075adeba2193ec5c22ac92f55afd82e6
+test "$(git -C /tmp/codex-client-binding rev-parse 'HEAD^{tree}')" = 82eb586eff8b4d378eafc4fec640605ef7d6dbf1
+cd /tmp/codex-client-binding/codex-rs
+rustc --version
+git apply --check /path/to/harness-herdr-hooks/integrations/codex/client-pane-binding.patch
+git apply /path/to/harness-herdr-hooks/integrations/codex/client-pane-binding.patch
+cargo build --locked -p codex-cli
+cargo test --locked -p codex-tui herdr_display_binding
+```
+
+Then enable the route for the selected profile, using the absolute path to the
+built executable:
+
+```sh
+bin/harness-herdr-hooks install codex --client-binding-codex /absolute/path/to/codex
+bin/harness-herdr-hooks status codex
+```
+
+The installer checks the pinned version and capability marker, executable
+ownership, canonical path and digest, and records the executable in its
+profile manifest. The route starts only through the managed local interactive
+adapter. Admission requires a private authenticated local Herdr socket.
+Codex session checks separately use the selected profile's pinned local Codex
+endpoint. These endpoints serve different purposes. Remote or ambiguous
+endpoints are not admitted. The existing legacy Herdr Codex session
+reporter must be absent from that profile; installation stops on that conflict.
+Unconfigured profiles and excluded direct/native launch routes retain their
+existing behavior. A claimed standalone child must be launched through the
+verified shim and publish the exact child lease matching its durable pane
+claim; bypassing the shim does not qualify.
+
 For another profile, use the same explicit config directory for each command:
 
 ```sh
@@ -41,6 +85,17 @@ registration. If Codex requests trust for changed hooks, use its native trust
 flow. Do not bypass trust or restart a shared daemon automatically.
 
 ## Runtime behavior and limits
+
+With the opt-in enabled, pane authority comes from the exact interactive TUI
+client's verified terminal and active conversation lease. The helper compares
+the duplicated PTY identity to a unique protocol-22 Herdr pane tty through the
+authenticated Herdr socket. Codex session checks use the selected profile's
+pinned local Codex endpoint. Missing tty data, a mismatch, stale coordinates,
+multiple possible displays, or a changed/disconnected view grants no pane
+effect. After resume, a conversation qualifies only after its new active lease
+has been acknowledged. A successful creation receipt is accepted only for the
+exact parent, own admitted user turn and exact returned child. The effect still targets one
+unfocused pane in the same workspace and tab and resumes that exact child.
 
 For standalone tasks, the local Codex app/TUI rollout record must report a
 successful `codex_tui.create_thread` result associated with the verified

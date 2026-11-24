@@ -1,0 +1,1124 @@
+diff --git a/codex-rs/cli/src/main.rs b/codex-rs/cli/src/main.rs
+index 0e01eab976c245d00608e2dbd71eb239e28dfe4a..30856ff9846557e1301febcb040c4616d14492b2 100644
+--- a/codex-rs/cli/src/main.rs
++++ b/codex-rs/cli/src/main.rs
+@@ -115,10 +115,15 @@ use codex_terminal_detection::TerminalName;
+ /// Codex CLI
+ ///
+ /// If no subcommand is specified, options will be forwarded to the interactive CLI.
++#[cfg(unix)]
++const CLI_CAPABILITY_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " herdr-client-binding-v1");
++#[cfg(not(unix))]
++const CLI_CAPABILITY_VERSION: &str = env!("CARGO_PKG_VERSION");
++
+ #[derive(Debug, Parser)]
+ #[clap(
+     author,
+-    version,
++    version = CLI_CAPABILITY_VERSION,
+     // If a sub‑command is given, ignore requirements of the default args.
+     subcommand_negates_reqs = true,
+     // The executable is sometimes invoked via a platform‑specific name like
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+index 766afaa4fc09f4dbe854d5a36651053ef49ba1a2..4a25561ce7ddcf3d9873ab3cd8db2e8dcfa6108b 100644
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -276,6 +276,7 @@ mod right_click_paste;
+ mod status_line_settings;
+ mod statusline_picker;
+ pub(crate) use right_click_paste::PasteEnvironment;
++pub(crate) mod herdr_display_binding;
+ mod pane_motion;
+ mod safety_buffering;
+ mod safety_recourse;
+@@ -1576,6 +1577,7 @@ impl App {
+
+ impl Drop for App {
+     fn drop(&mut self) {
++        herdr_display_binding::shutdown();
+         if let Err(err) = self.chat_widget.clear_managed_terminal_title() {
+             tracing::debug!(error = %err, "failed to clear terminal title on app drop");
+         }
+diff --git a/codex-rs/tui/src/app/agents_overview.rs b/codex-rs/tui/src/app/agents_overview.rs
+index 5cbf8cf4571f4ff3405881e65ed39f4d55e98ce2..a74399db5b4abe055e1e1be911e130075c874330 100644
+--- a/codex-rs/tui/src/app/agents_overview.rs
++++ b/codex-rs/tui/src/app/agents_overview.rs
+@@ -127,6 +127,10 @@ impl Drop for AgentsOverviewState {
+
+ impl App {
+     pub(super) fn open_agents_overview(&mut self, app_server: &AppServerSession) {
++        if let Err(error) = super::herdr_display_binding::clear() {
++            self.chat_widget.add_error_message(error.to_string());
++            return;
++        }
+         let threads = self
+             .agents_overview
+             .threads
+diff --git a/codex-rs/tui/src/app/backend_selection.rs b/codex-rs/tui/src/app/backend_selection.rs
+index 61135ace9df1d5b7e7a9a135592079901b20475f..53c545c0ac137e39f6b4c3b8e1ccdfafa67cfd9c 100644
+--- a/codex-rs/tui/src/app/backend_selection.rs
++++ b/codex-rs/tui/src/app/backend_selection.rs
+@@ -348,6 +348,10 @@ impl App {
+         if responsive_cloud_switch {
+             draft = Some(self.chat_widget.composer_draft_snapshot());
+         }
++        if switching_backend && let Err(error) = super::herdr_display_binding::clear() {
++            self.chat_widget.add_error_message(error.to_string());
++            return Ok(());
++        }
+         // A same-backend Cloud start already replaced the attachment. Clear on its first draw.
+         if switching_backend && let Err(error) = tui.clear_for_thread_switch() {
+             if responsive_cloud_switch {
+@@ -645,6 +649,10 @@ impl App {
+                 Ok(prepared) => prepared,
+                 Err(control) => return Ok(control),
+             };
++            if let Err(error) = super::herdr_display_binding::clear() {
++                self.add_session_picker_error(error.to_string());
++                return Ok(AppRunControl::Continue);
++            }
+             let handoff = self.chat_widget.pause_input_for_resume_handoff();
+             let _handoff = self.prepare_resume_handoff(tui, handoff).await?;
+             self.switch_backend_context(
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+index 1f85a4ed0c4c66025a4246aed2698d61fa4c7002..59ba55bccae6c3ff10cbbe644e2049a111360195 100644
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -814,12 +814,7 @@ impl App {
+                             };
+                             self.retain_thread_subscriptions();
+                             match self
+-                                .replace_chat_widget_with_app_server_thread(
+-                                    tui,
+-                                    forked,
+-                                    ThreadAttachPresentation::SessionLineage,
+-                                    /*initial_user_message*/ None,
+-                                )
++                                .adopt_forked_client_view(tui, forked)
+                                 .await
+                             {
+                                 Ok(()) => {
+@@ -4549,6 +4544,11 @@ impl App {
+             return Ok(AppRunControl::Continue);
+         }
+
++        if let Err(error) = super::herdr_display_binding::clear() {
++            self.chat_widget.add_error_message(error.to_string());
++            return Ok(AppRunControl::Continue);
++        }
++
+         let show_progress = !self.side_threads.is_empty() && {
+             let subtree = self.known_thread_subtree(thread_id);
+             self.side_threads
+@@ -4636,6 +4636,11 @@ impl App {
+             return Ok(AppRunControl::Continue);
+         }
+
++        if let Err(error) = super::herdr_display_binding::clear() {
++            self.chat_widget.add_error_message(error.to_string());
++            return Ok(AppRunControl::Continue);
++        }
++
+         if !self
+             .shutdown_side_threads(app_server, Some(thread_id))
+             .await
+diff --git a/codex-rs/tui/src/app/herdr_display_binding.rs b/codex-rs/tui/src/app/herdr_display_binding.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..06e48fe7fa965447877040e637560fb2f4bf472d
+--- /dev/null
++++ b/codex-rs/tui/src/app/herdr_display_binding.rs
+@@ -0,0 +1,469 @@
++//! Opt-in reporting of the primary conversation currently displayed by this TUI.
++//!
++//! The helper is supplied by the managed Herdr profile. With no helper configured this module is
++//! inert, preserving the ordinary Codex launch path.
++use color_eyre::eyre::{Result, bail, eyre};
++use serde_json::{Value, json};
++use std::io::{Read, Write};
++#[cfg(unix)]
++use std::os::fd::AsRawFd;
++use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
++use std::sync::{Mutex, OnceLock};
++use std::time::{Duration, Instant};
++
++const HELPER_ENV: &str = "HARNESS_HERDR_CLIENT_REPORTER";
++const MAX_LINE: usize = 4096;
++const NONCE_ENV: &str = "HARNESS_HERDR_CLIENT_NONCE";
++
++#[derive(Clone)]
++struct RevocationTicket {
++    helper: std::path::PathBuf,
++    nonce: String,
++    recovered: bool,
++}
++
++struct Reporter {
++    child: Child,
++    ticket: RevocationTicket,
++    input: ChildStdin,
++    output: ChildStdout,
++    sequence: u64,
++    active_thread: Option<String>,
++    active_sequence: Option<u64>,
++    own_turn: Option<(String, String)>,
++}
++
++enum State {
++    Pending { recovered: bool },
++    Disabled,
++    Connected(Reporter),
++    Blocked(RevocationTicket),
++}
++
++static REPORTER: OnceLock<Mutex<State>> = OnceLock::new();
++
++fn state() -> &'static Mutex<State> {
++    REPORTER.get_or_init(|| Mutex::new(State::Pending { recovered: false }))
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub(crate) struct CreationContext {
++    pub(crate) parent: String,
++    pub(crate) turn: String,
++    pub(crate) client_message_id: String,
++    view_sequence: u64,
++}
++
++/// Revoke the prior view before a transition. Failure is surfaced to the caller so a managed
++/// transition cannot silently retain stale placement authority.
++pub(super) fn clear() -> Result<()> {
++    let result = with_reporter(false, |reporter| {
++        if reporter.active_sequence.is_some() {
++            reporter.request("clear", Value::Null, None, None)?;
++            reporter.active_thread = None;
++            reporter.active_sequence = None;
++            reporter.own_turn = None;
++        }
++        Ok(())
++    });
++    if result.is_err() {
++        verify_revocation()
++    } else {
++        result
++    }
++}
++
++fn verify_revocation() -> Result<()> {
++    let mut state = state()
++        .lock()
++        .map_err(|_| eyre!("reporter lock poisoned"))?;
++    let State::Blocked(ticket) = &*state else {
++        bail!("Herdr client display revocation could not be confirmed");
++    };
++    let mut probe = spawn_helper(ticket, "verify-revoked")?;
++    let deadline = Instant::now() + Duration::from_secs(6);
++    while Instant::now() < deadline {
++        if let Some(status) = probe.try_wait()? {
++            if status.success() {
++                *state = State::Pending { recovered: true };
++                return Ok(());
++            }
++            bail!("Herdr client display revocation could not be confirmed");
++        }
++        std::thread::sleep(Duration::from_millis(20));
++    }
++    let _ = probe.kill();
++    let _ = probe.wait();
++    bail!("Herdr client display revocation verification timed out");
++}
++
++/// Publish a successfully adopted primary view with the transition recorded by the caller.
++pub(super) fn active(thread_id: &str, source: &str) -> Result<()> {
++    if !matches!(source, "startup" | "resume" | "fork") {
++        bail!("unsupported Herdr display binding source");
++    }
++    let id = uuid::Uuid::parse_str(thread_id)?;
++    with_reporter(true, |reporter| {
++        let id = id.to_string();
++        reporter.request("active", json!(id), Some(source), None)?;
++        reporter.active_thread = Some(id);
++        reporter.active_sequence = Some(reporter.sequence);
++        reporter.own_turn = None;
++        Ok(())
++    })
++}
++
++/// Remember only the server-confirmed start response for the exact acknowledged primary view.
++pub(crate) fn user_turn_started(thread_id: &str, turn_id: &str, client_message_id: &str) {
++    let _ = with_reporter(false, |reporter| {
++        if reporter.active_thread.as_deref() == Some(thread_id)
++            && reporter.active_sequence.is_some()
++            && !turn_id.is_empty()
++            && turn_id.len() <= 128
++        {
++            reporter.own_turn = Some((turn_id.to_string(), client_message_id.to_string()));
++        }
++        Ok(())
++    });
++}
++
++pub(crate) fn creation_context(parent: &str, turn: &str) -> Option<CreationContext> {
++    let state = state().lock().ok()?;
++    let State::Connected(reporter) = &*state else {
++        return None;
++    };
++    reporter.creation_context(parent, turn)
++}
++
++pub(crate) fn created(context: &CreationContext, child: &str) {
++    let _ = with_reporter(false, |reporter| {
++        let child = uuid::Uuid::parse_str(child)?.to_string();
++        if reporter
++            .creation_context(&context.parent, &context.turn)
++            .as_ref()
++            != Some(context)
++        {
++            return Ok(());
++        }
++        reporter.request(
++            "created",
++            json!(context.parent),
++            None,
++            Some(json!({"child_id": child, "turn_id": context.turn, "view_sequence": context.view_sequence})),
++        )
++    });
++}
++
++pub(super) fn shutdown() {
++    if std::env::var_os(HELPER_ENV).is_none() {
++        return;
++    }
++    let _ = with_reporter(false, |reporter| {
++        reporter.request("clear", Value::Null, None, None)
++    });
++    if let Ok(mut state) = state().lock() {
++        *state = State::Disabled;
++    }
++}
++
++fn with_reporter(start: bool, request: impl FnOnce(&mut Reporter) -> Result<()>) -> Result<()> {
++    let Some(helper) = std::env::var_os(HELPER_ENV) else {
++        return Ok(());
++    };
++    let mut state = state()
++        .lock()
++        .map_err(|_| eyre!("reporter lock poisoned"))?;
++    if let State::Pending { recovered } = *state
++        && start
++    {
++        let ticket = RevocationTicket {
++            helper: std::path::PathBuf::from(helper),
++            nonce: uuid::Uuid::new_v4().to_string(),
++            recovered,
++        };
++        match spawn_reporter(ticket) {
++            Ok(reporter) => *state = State::Connected(reporter),
++            Err(error) => {
++                *state = State::Disabled;
++                return Err(error);
++            }
++        }
++    }
++    match &mut *state {
++        State::Connected(reporter) => {
++            let was_active = reporter.active_sequence.is_some();
++            let result = request(reporter);
++            if result.is_err() {
++                *state = if was_active {
++                    State::Blocked(reporter.ticket.clone())
++                } else {
++                    State::Disabled
++                };
++            }
++            result
++        }
++        State::Blocked(_) => bail!("Herdr client display revocation could not be confirmed"),
++        State::Pending { .. } | State::Disabled => Ok(()),
++    }
++}
++
++#[cfg(unix)]
++fn spawn_helper(ticket: &RevocationTicket, mode: &str) -> Result<Child> {
++    use std::os::fd::FromRawFd;
++    use std::os::unix::process::CommandExt;
++
++    if !ticket.helper.is_absolute() || !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
++        bail!("Herdr reporter requires an absolute helper and the client terminal");
++    }
++    // Hold a duplicate of the terminal already used by the TUI before Command redirects fd 0.
++    let tty = unsafe { libc::fcntl(std::io::stdin().as_raw_fd(), libc::F_DUPFD_CLOEXEC, 4) };
++    if tty < 0 {
++        return Err(std::io::Error::last_os_error().into());
++    }
++    let terminal = unsafe { std::os::fd::OwnedFd::from_raw_fd(tty) };
++    let mut command = Command::new(&ticket.helper);
++    command
++        .arg("client-report")
++        .env(NONCE_ENV, &ticket.nonce)
++        .stderr(Stdio::null());
++    if ticket.recovered {
++        command
++            .env_remove("HARNESS_HERDR_CHILD_CLAIM")
++            .env_remove("HARNESS_HERDR_DISPLAY");
++    }
++    if mode == "verify-revoked" {
++        command.arg(mode).stdin(Stdio::null()).stdout(Stdio::null());
++    } else {
++        command.stdin(Stdio::piped()).stdout(Stdio::piped());
++    }
++    unsafe {
++        command.pre_exec(move || {
++            if libc::dup2(terminal.as_raw_fd(), 3) < 0 {
++                return Err(std::io::Error::last_os_error());
++            }
++            Ok(())
++        });
++    }
++    Ok(command.spawn()?)
++}
++
++#[cfg(not(unix))]
++fn spawn_helper(_ticket: &RevocationTicket, _mode: &str) -> Result<Child> {
++    bail!("Herdr client reporter requires a Unix terminal")
++}
++
++fn spawn_reporter(ticket: RevocationTicket) -> Result<Reporter> {
++    let mut child = spawn_helper(&ticket, "report")?;
++    let input = child
++        .stdin
++        .take()
++        .ok_or_else(|| eyre!("reporter stdin unavailable"))?;
++    let output = child
++        .stdout
++        .take()
++        .ok_or_else(|| eyre!("reporter stdout unavailable"))?;
++    Ok(Reporter {
++        child,
++        ticket,
++        input,
++        output,
++        sequence: 0,
++        active_thread: None,
++        active_sequence: None,
++        own_turn: None,
++    })
++}
++
++impl Drop for Reporter {
++    fn drop(&mut self) {
++        let _ = self.child.kill();
++        let _ = self.child.wait();
++    }
++}
++
++#[cfg(unix)]
++fn wait_for_output(output: &ChildStdout, deadline: Instant) -> Result<()> {
++    let mut descriptor = libc::pollfd {
++        fd: output.as_raw_fd(),
++        events: libc::POLLIN,
++        revents: 0,
++    };
++    let timeout = deadline
++        .saturating_duration_since(Instant::now())
++        .as_millis() as i32;
++    if timeout <= 0
++        || unsafe { libc::poll(&mut descriptor, 1, timeout) } <= 0
++        || descriptor.revents & libc::POLLIN == 0
++    {
++        bail!("Herdr reporter acknowledgement timed out or disconnected");
++    }
++    Ok(())
++}
++
++#[cfg(not(unix))]
++fn wait_for_output(_output: &ChildStdout, _deadline: Instant) -> Result<()> {
++    bail!("Herdr client reporter requires a Unix terminal")
++}
++
++#[derive(serde::Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Acknowledgement {
++    version: u8,
++    sequence: u64,
++    status: String,
++}
++
++fn check_acknowledgement(bytes: &[u8], sequence: u64) -> Result<()> {
++    let reply: Acknowledgement = serde_json::from_slice(bytes)?;
++    if reply.version != 1 || reply.sequence != sequence || reply.status != "ok" {
++        bail!("Herdr reporter rejected or mismatched a display report");
++    }
++    Ok(())
++}
++
++fn bound_creation(
++    active: Option<&str>,
++    own_turn: Option<(&str, &str)>,
++    sequence: Option<u64>,
++    requested_parent: &str,
++    requested_turn: &str,
++) -> Option<CreationContext> {
++    let (owned_id, client_message_id) = own_turn?;
++    if active != Some(requested_parent) || owned_id != requested_turn {
++        return None;
++    }
++    Some(CreationContext {
++        parent: requested_parent.to_owned(),
++        turn: requested_turn.to_owned(),
++        client_message_id: client_message_id.to_owned(),
++        view_sequence: sequence?,
++    })
++}
++
++impl Reporter {
++    fn creation_context(&self, parent: &str, turn: &str) -> Option<CreationContext> {
++        bound_creation(
++            self.active_thread.as_deref(),
++            self.own_turn
++                .as_ref()
++                .map(|(turn, message)| (turn.as_str(), message.as_str())),
++            self.active_sequence,
++            parent,
++            turn,
++        )
++    }
++
++    fn request(
++        &mut self,
++        event: &str,
++        thread_id: Value,
++        source: Option<&str>,
++        fields: Option<Value>,
++    ) -> Result<()> {
++        self.sequence = self
++            .sequence
++            .checked_add(1)
++            .ok_or_else(|| eyre!("report sequence exhausted"))?;
++        let mut message =
++            json!({"version":1,"sequence":self.sequence,"event":event,"thread_id":thread_id});
++        if let Some(source) = source {
++            message["source"] = json!(source);
++        }
++        if let Some(fields) = fields {
++            if let Some(object) = fields.as_object() {
++                for (key, value) in object {
++                    message[key] = value.clone();
++                }
++            }
++        }
++        let mut bytes = serde_json::to_vec(&message)?;
++        if bytes.len() + 1 > MAX_LINE {
++            bail!("Herdr report exceeds line limit");
++        }
++        bytes.push(b'\n');
++        self.input.write_all(&bytes)?;
++        self.input.flush()?;
++        let deadline = Instant::now() + Duration::from_secs(6);
++        let mut reply = Vec::new();
++        while reply.len() < MAX_LINE {
++            wait_for_output(&self.output, deadline)?;
++            let mut byte = [0_u8];
++            if self.output.read(&mut byte)? == 0 {
++                bail!("Herdr reporter closed");
++            }
++            if byte[0] == b'\n' {
++                break;
++            }
++            reply.push(byte[0]);
++        }
++        if reply.len() == MAX_LINE {
++            bail!("Herdr reporter exceeded line limit");
++        }
++        check_acknowledgement(&reply, self.sequence)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn rejects_invalid_thread_ids() {
++        assert!(active("not-a-uuid", "startup").is_err());
++    }
++
++    #[test]
++    fn acknowledgements_require_exact_sequence_shape_and_success() {
++        assert!(check_acknowledgement(br#"{"version":1,"sequence":4,"status":"ok"}"#, 4).is_ok());
++        for invalid in [
++            br#"{"version":1,"sequence":3,"status":"ok"}"#.as_slice(),
++            br#"{"version":1,"sequence":4,"status":"rejected"}"#,
++            br#"{"version":1,"sequence":4,"status":"ok","extra":1}"#,
++            br#"{"version":1,"sequence":2,"sequence":4,"status":"ok"}"#,
++        ] {
++            assert!(check_acknowledgement(invalid, 4).is_err());
++        }
++    }
++
++    #[test]
++    fn creation_requires_own_turn_and_current_view_generation() {
++        let first = bound_creation(
++            Some("parent"),
++            Some(("own", "message")),
++            Some(1),
++            "parent",
++            "own",
++        )
++        .unwrap();
++        assert!(bound_creation(Some("parent"), None, Some(1), "parent", "own").is_none());
++        assert!(
++            bound_creation(
++                Some("parent"),
++                Some(("other", "message")),
++                Some(1),
++                "parent",
++                "own"
++            )
++            .is_none()
++        );
++        assert!(
++            bound_creation(
++                Some("parent"),
++                Some(("own", "message")),
++                None,
++                "parent",
++                "own"
++            )
++            .is_none()
++        );
++        assert_ne!(
++            Some(first),
++            bound_creation(
++                Some("parent"),
++                Some(("own", "message")),
++                Some(2),
++                "parent",
++                "own"
++            )
++        );
++    }
++}
+diff --git a/codex-rs/tui/src/app/session_lifecycle.rs b/codex-rs/tui/src/app/session_lifecycle.rs
+index f3c97095804cb76400e8f5672816eeb208440321..5749022bafe59aa0a9275deda31ad270885662c7 100644
+--- a/codex-rs/tui/src/app/session_lifecycle.rs
++++ b/codex-rs/tui/src/app/session_lifecycle.rs
+@@ -61,6 +61,57 @@ pub(super) struct LoadedSubagentBackfill {
+ }
+
+ impl App {
++    pub(super) fn report_herdr_display(&self, thread_id: ThreadId, source: &str) {
++        if !self.herdr_client_endpoint_matches() {
++            return;
++        }
++        if self.primary_thread_id == Some(thread_id)
++            && self.current_displayed_thread_id() == Some(thread_id)
++            && let Err(error) = super::herdr_display_binding::active(&thread_id.to_string(), source)
++        {
++            tracing::warn!(%error, "Herdr client display binding was not acknowledged");
++        }
++    }
++
++    #[cfg(unix)]
++    fn herdr_client_endpoint_matches(&self) -> bool {
++        use std::os::unix::fs::{FileTypeExt, MetadataExt};
++
++        let (Some(expected), Some(instance)) = (
++            std::env::var_os("HARNESS_HERDR_CLIENT_ENDPOINT"),
++            std::env::var_os("HARNESS_HERDR_CLIENT_ENDPOINT_INSTANCE"),
++        ) else {
++            return false;
++        };
++        let endpoint = match &self.app_server_target {
++            AppServerTarget::LocalDaemon { endpoint, .. }
++            | AppServerTarget::Remote { endpoint } => endpoint,
++            _ => return false,
++        };
++        let crate::RemoteAppServerEndpoint::UnixSocket { socket_path } = endpoint else {
++            return false;
++        };
++        let Ok(target) = std::fs::canonicalize(socket_path.as_path()) else {
++            return false;
++        };
++        if target != Path::new(&expected) {
++            return false;
++        }
++        let Ok(metadata) = target.metadata() else {
++            return false;
++        };
++        metadata.file_type().is_socket()
++            && instance.to_str()
++                == Some(
++                    format!("{}:{}:{}", metadata.dev(), metadata.ino(), metadata.uid()).as_str(),
++                )
++    }
++
++    #[cfg(not(unix))]
++    fn herdr_client_endpoint_matches(&self) -> bool {
++        false
++    }
++
+     pub(super) async fn open_agent_picker(&mut self, app_server: &mut AppServerSession) {
+         let backfill = if self.primary_thread_id.is_none() {
+             self.backfill_loaded_subagent_threads(app_server).await
+@@ -820,6 +871,7 @@ impl App {
+         thread_id: ThreadId,
+         selection: Selection,
+     ) -> Result<()> {
++        super::herdr_display_binding::clear()?;
+         app_server.task_search.cancel();
+         let Selection {
+             mode,
+@@ -940,6 +992,9 @@ impl App {
+         }
+         self.render_thread_snapshot(tui, app_server, thread_id, snapshot, !is_replay_only)
+             .await?;
++        if !is_replay_only && !self.chat_widget.is_read_only_view() {
++            self.report_herdr_display(thread_id, "resume");
++        }
+         if !is_replay_only
+             && let Some(message) = self
+                 .side_threads
+@@ -1288,8 +1343,12 @@ impl App {
+                         started.session.approval_policy,
+                     )?;
+                 }
++                let bind_client_view = !started.blocks_direct_input;
+                 self.enqueue_primary_thread_session(started.session, started.turns)
+                     .await?;
++                if bind_client_view {
++                    self.report_herdr_display(thread_id, "startup");
++                }
+                 self.apply_backend_banner_fallback(app_server).await;
+                 if let Some(model) = self.harness_overrides.model.as_deref()
+                     && model == self.chat_widget.current_model()
+@@ -1597,6 +1656,10 @@ impl App {
+             self.chat_widget.add_error_message(error.to_string());
+             return;
+         }
++        if let Err(error) = super::herdr_display_binding::clear() {
++            self.chat_widget.add_error_message(error.to_string());
++            return;
++        }
+         // A completed turn can release queued input while draining the outgoing thread.
+         let handoff = self.chat_widget.pause_input_for_resume_handoff();
+         let source_thread = self.current_displayed_thread_id();
+@@ -1652,6 +1715,7 @@ impl App {
+                 initial_user_message,
+                 account,
+                 source_thread,
++                "startup",
+             )
+             .await;
+         drop(handoff);
+@@ -1689,6 +1753,24 @@ impl App {
+             initial_user_message,
+             /*account*/ None,
+             /*source_thread*/ None,
++            "resume",
++        )
++        .await
++    }
++
++    pub(super) async fn adopt_forked_client_view(
++        &mut self,
++        tui: &mut tui::Tui,
++        started: AppServerStartedThread,
++    ) -> Result<()> {
++        self.replace_chat_widget_with_account(
++            tui,
++            started,
++            ThreadAttachPresentation::SessionLineage,
++            None,
++            None,
++            None,
++            "fork",
+         )
+         .await
+     }
+@@ -1725,7 +1807,12 @@ impl App {
+         initial_user_message: Option<crate::chatwidget::UserMessage>,
+         account: Option<SessionAccount>,
+         source_thread: Option<ThreadId>,
++        binding_source: &str,
+     ) -> Result<()> {
++        // Confirm revocation before mutating the visible conversation or adopting its successor.
++        let binding_thread_id = started.session.thread_id;
++        let bind_client_view = !started.blocks_direct_input && !started.session.read_only_history;
++        super::herdr_display_binding::clear()?;
+         // Initial messages are for freshly attached primary threads only. Thread switches and
+         // resume/fork flows pass `None` so they cannot replay old history and then auto-submit a new
+         // user turn by accident.
+@@ -1808,6 +1895,9 @@ impl App {
+             presentation,
+         )
+         .await?;
++        if bind_client_view {
++            self.report_herdr_display(binding_thread_id, binding_source);
++        }
+         if new_visit {
+             self.statusline_metrics.begin_visit();
+         }
+@@ -2006,6 +2096,10 @@ impl App {
+             );
+             return Ok(AppRunControl::Continue);
+         }
++        if let Err(error) = super::herdr_display_binding::clear() {
++            self.add_session_picker_error(error.to_string());
++            return Ok(AppRunControl::Continue);
++        }
+         let handoff = self.chat_widget.pause_input_for_resume_handoff();
+         let _handoff = self.prepare_resume_handoff(tui, handoff).await?;
+         self.activate_prepared_session_after_clear(
+diff --git a/codex-rs/tui/src/app/startup.rs b/codex-rs/tui/src/app/startup.rs
+index d1fb8e0ac127de5740b80182aca6e3b847d8d52f..766e5288528356d1a11006dc2d7e42e408bda323 100644
+--- a/codex-rs/tui/src/app/startup.rs
++++ b/codex-rs/tui/src/app/startup.rs
+@@ -618,6 +618,11 @@ impl App {
+         let mut read_only_thread = false;
+         let mut provider_error = None;
+         let mut history_notice = None;
++        let binding_source = match &session_selection {
++            SessionSelection::Resume(_) => "resume",
++            SessionSelection::Fork(_) => "fork",
++            _ => "startup",
++        };
+         let (mut chat_widget, initial_started_thread) = match session_selection {
+             SessionSelection::StartFresh
+             | SessionSelection::Exit
+@@ -1206,6 +1211,8 @@ See the Codex keymap documentation for supported actions and examples."
+         let initial_session_started_at = Instant::now();
+         if let Some(started) = initial_started_thread {
+             let thread_id = started.session.thread_id;
++            let bind_client_view =
++                !read_only_thread && !started.blocks_direct_input && provider_error.is_none();
+             app.chat_widget
+                 .set_task_mentions_enabled(started.task_tools_available);
+             if started.blocks_direct_input {
+@@ -1229,6 +1236,9 @@ See the Codex keymap documentation for supported actions and examples."
+                     return shutdown_on_startup_error(app_server, &mut other_backends, err).await;
+                 }
+             }
++            if bind_client_view {
++                app.report_herdr_display(thread_id, binding_source);
++            }
+             app.remember_attached_host_project(&app_server);
+             if let Some(error) = provider_error {
+                 app.chat_widget
+diff --git a/codex-rs/tui/src/app/user_turn_submission.rs b/codex-rs/tui/src/app/user_turn_submission.rs
+index 26e575d74a3d581bff03f777b8c4848b9aef1543..c626de4e3fd27db449817008388c43d7c9f89feb 100644
+--- a/codex-rs/tui/src/app/user_turn_submission.rs
++++ b/codex-rs/tui/src/app/user_turn_submission.rs
+@@ -59,6 +59,14 @@ pub(super) async fn try_submit_user_turn(
+         CloudSubmissionIntent::UseKnownTurn
+     };
+     let original_active = app.active_turn_id_for_thread(thread_id).await;
++    // Direct Enter produces StartOrSteer. Queue draining normalizes the
++    // source to Prompt before dispatch, which produces StartIfIdle.
++    let bind_direct_submission = original_active.is_none()
++        && is_user_prompt
++        && *cloud_submission == CloudSubmissionIntent::StartOrSteer
++        && app
++            .chat_widget
++            .has_pending_user_message(client_user_message_id);
+     let mut active = original_active.clone();
+     let preflight = |model: &str| {
+         let enabled = app.chat_widget.daybreak_enabled
+@@ -108,6 +116,19 @@ pub(super) async fn try_submit_user_turn(
+
+     match result {
+         Ok((admission, selection)) => {
++            if bind_direct_submission
++                && !items.is_empty()
++                && app.primary_thread_id == Some(thread_id)
++                && app.active_thread_id == Some(thread_id)
++                && app.chat_widget.thread_id() == Some(thread_id)
++                && let UserMessageAdmission::StartResponse(turn_id) = &admission
++            {
++                super::herdr_display_binding::user_turn_started(
++                    &thread_id.to_string(),
++                    turn_id,
++                    client_user_message_id,
++                );
++            }
+             if *turn_trigger == "user"
+                 && !items.is_empty()
+                 && matches!(admission, UserMessageAdmission::StartResponse(_))
+diff --git a/codex-rs/tui/src/chatwidget/input_submission.rs b/codex-rs/tui/src/chatwidget/input_submission.rs
+index 0a34081f74f5ffa352a3c6011d36a1587d18acb8..13f8ed2f338cecea23abe2fe69a20da5ed0e1da0 100644
+--- a/codex-rs/tui/src/chatwidget/input_submission.rs
++++ b/codex-rs/tui/src/chatwidget/input_submission.rs
+@@ -5,6 +5,11 @@ use codex_app_server_protocol::ImageReference;
+ use codex_utils_path_uri::LegacyAppPathString;
+
+ impl ChatWidget {
++    pub(crate) fn has_pending_user_message(&self, client_id: &str) -> bool {
++        self.input_queue.user_turn_pending_start
++            && self.input_queue.pending_user_message_client_id.as_deref() == Some(client_id)
++    }
++
+     pub(crate) fn set_task_mentions_enabled(&mut self, enabled: bool) {
+         self.bottom_pane.set_task_mentions_enabled(enabled);
+     }
+diff --git a/codex-rs/tui/src/dynamic_tools.rs b/codex-rs/tui/src/dynamic_tools.rs
+index 8b112de7239272d238499c5ff79a6f9cc04292ce..57ea8e09a5aa73fee09556f21b1e02d6de4df221 100644
+--- a/codex-rs/tui/src/dynamic_tools.rs
++++ b/codex-rs/tui/src/dynamic_tools.rs
+@@ -297,7 +297,7 @@ pub(crate) async fn execute(
+     status_updates: broadcast::Receiver<ThreadStatusChangedNotification>,
+     app_event_tx: Option<&AppEventSender>,
+ ) -> DynamicToolCallResponse {
+-    match execute_inner(
++    execute_with_creation(
+         request_handle,
+         params,
+         thread_start_params,
+@@ -306,10 +306,46 @@ pub(crate) async fn execute(
+         app_event_tx,
+     )
+     .await
+-    .and_then(success_response)
+-    {
++    .response
++}
++
++/// Result of a dynamic tool call, with the typed child identity retained for the local TUI
++/// transport. Existing callers can keep using [`execute`] and receive the same response.
++pub(crate) struct DynamicToolExecution {
++    pub(crate) response: DynamicToolCallResponse,
++    pub(crate) created_thread_id: Option<ThreadId>,
++}
++
++pub(crate) async fn execute_with_creation(
++    request_handle: AppServerRequestHandle,
++    params: DynamicToolCallParams,
++    thread_start_params: ThreadStartParams,
++    features: Features,
++    status_updates: broadcast::Receiver<ThreadStatusChangedNotification>,
++    app_event_tx: Option<&AppEventSender>,
++) -> DynamicToolExecution {
++    let mut created_thread_id = None;
++    let result = execute_inner(
++        request_handle,
++        params,
++        thread_start_params,
++        features,
++        status_updates,
++        app_event_tx,
++        &mut created_thread_id,
++    )
++    .await
++    .and_then(success_response);
++    let response = match result {
+         Ok(response) => response,
+-        Err(error) => failure_response(error),
++        Err(error) => {
++            created_thread_id = None;
++            failure_response(error)
++        }
++    };
++    DynamicToolExecution {
++        response,
++        created_thread_id,
+     }
+ }
+
+@@ -328,6 +364,7 @@ async fn execute_inner(
+     features: Features,
+     mut status_updates: broadcast::Receiver<ThreadStatusChangedNotification>,
+     app_event_tx: Option<&AppEventSender>,
++    created_thread_id: &mut Option<ThreadId>,
+ ) -> Result<Value, String> {
+     let mcp_config = thread_start_params.config.as_ref().and_then(|overrides| {
+         let key = format!("mcp_servers.{NAMESPACE}");
+@@ -588,6 +625,8 @@ async fn execute_inner(
+                 .await
+                 .map_err(|error| error.to_string())?;
+             let thread_id = started.thread.id.clone();
++            *created_thread_id =
++                Some(ThreadId::from_string(&thread_id).map_err(|error| error.to_string())?);
+             let daybreak_enabled = started.thread.daybreak_enabled.unwrap_or(false);
+             register_background_thread(app_event_tx, started.thread, task_tools_available).await?;
+             let cyber_access_program = background_turn_program(
+diff --git a/codex-rs/tui/src/dynamic_tools_mcp.rs b/codex-rs/tui/src/dynamic_tools_mcp.rs
+index 47b5cb126c46ed93b0e4e095a17eeb28841861cc..1f2fe53dc7408e170fbb4631543d5331ba336d7f 100644
+--- a/codex-rs/tui/src/dynamic_tools_mcp.rs
++++ b/codex-rs/tui/src/dynamic_tools_mcp.rs
+@@ -12,10 +12,19 @@ use axum::middleware;
+ use axum::middleware::Next;
+ use axum::response::Response;
+ use codex_app_server_client::AppServerRequestHandle;
++use codex_app_server_protocol::ClientRequest;
+ use codex_app_server_protocol::DynamicToolCallOutputContentItem;
+ use codex_app_server_protocol::DynamicToolCallParams;
+ use codex_app_server_protocol::DynamicToolNamespaceTool;
+ use codex_app_server_protocol::DynamicToolSpec;
++use codex_app_server_protocol::RequestId;
++use codex_app_server_protocol::SortDirection;
++#[cfg(test)]
++use codex_app_server_protocol::ThreadItem;
++use codex_app_server_protocol::ThreadItemEntry;
++use codex_app_server_protocol::ThreadItemPayload;
++use codex_app_server_protocol::ThreadItemsListParams;
++use codex_app_server_protocol::ThreadItemsListResponse;
+ use codex_app_server_protocol::ThreadStartParams;
+ use codex_app_server_protocol::ThreadStatusChangedNotification;
+ use codex_features::Features;
+@@ -48,6 +57,66 @@ use tokio::sync::broadcast;
+ use tokio::task::JoinHandle;
+ use uuid::Uuid;
+
++async fn corroborates_start_origin(
++    handle: &AppServerRequestHandle,
++    context: &crate::app::herdr_display_binding::CreationContext,
++) -> bool {
++    let query = handle.request_typed::<ThreadItemsListResponse>(ClientRequest::ThreadItemsList {
++        request_id: RequestId::String(format!("herdr-origin-{}", Uuid::new_v4())),
++        params: ThreadItemsListParams {
++            thread_id: context.parent.clone(),
++            turn_id: Some(context.turn.clone()),
++            cursor: None,
++            limit: Some(8),
++            sort_direction: Some(SortDirection::Asc),
++            defer_output: None,
++        },
++    });
++    let Ok(Ok(items)) = tokio::time::timeout(std::time::Duration::from_millis(500), query).await
++    else {
++        return false;
++    };
++    // The server's StartResponse shape is also used for steer. Only the first
++    // user item on the returned turn distinguishes the exact initiating input.
++    initiating_message_matches(&items.data, &context.turn, &context.client_message_id)
++}
++
++fn initiating_message_matches(entries: &[ThreadItemEntry], turn: &str, client_id: &str) -> bool {
++    entries.iter().find_map(|entry| match &entry.item.payload {
++        ThreadItemPayload::UserMessage {
++            client_id: item_id, ..
++        } => Some(entry.turn_id == turn && item_id.as_deref() == Some(client_id)),
++        _ => None,
++    }) == Some(true)
++}
++
++#[cfg(test)]
++#[test]
++fn herdr_display_binding_does_not_attribute_a_steer_to_its_sender() {
++    fn message(turn: &str, client_id: &str) -> ThreadItemEntry {
++        ThreadItemEntry {
++            turn_id: turn.to_string(),
++            item: ThreadItem::untimed(ThreadItemPayload::UserMessage {
++                id: client_id.to_string(),
++                client_id: Some(client_id.to_string()),
++                content: Vec::new(),
++            }),
++            output_deferred: false,
++            started_at_ms: None,
++            completed_at_ms: None,
++        }
++    }
++    let entries = [message("turn", "initial"), message("turn", "steer")];
++    assert!(initiating_message_matches(&entries, "turn", "initial"));
++    assert!(!initiating_message_matches(&entries, "turn", "steer"));
++    assert!(!initiating_message_matches(
++        &entries,
++        "different",
++        "initial"
++    ));
++    assert!(!initiating_message_matches(&[], "turn", "initial"));
++}
++
+ #[derive(Clone)]
+ pub(crate) enum ThreadToolTransport {
+     Dynamic,
+@@ -279,6 +348,19 @@ impl ServerHandler for DynamicToolMcpHandler {
+             .or_else(|| turn_metadata.as_ref()?.get("thread_id")?.as_str())
+             .filter(|thread_id| !thread_id.is_empty())
+             .ok_or_else(|| McpError::invalid_params("missing task metadata", None))?;
++        // Keep exact caller metadata separate from the fallback IDs below. Synthetic identifiers
++        // preserve ordinary tool operation but can never establish display provenance.
++        let report_parent = metadata
++            .get("threadId")
++            .and_then(Value::as_str)
++            .or_else(|| turn_metadata.as_ref()?.get("thread_id")?.as_str())
++            .map(str::to_string);
++        let report_turn = metadata
++            .get("turnId")
++            .and_then(Value::as_str)
++            .or_else(|| turn_metadata.as_ref()?.get("turn_id")?.as_str())
++            .map(str::to_string);
++        let tool_name = request.name.to_string();
+         let turn_id = metadata
+             .get("turnId")
+             .and_then(Value::as_str)
+@@ -296,6 +378,12 @@ impl ServerHandler for DynamicToolMcpHandler {
+             tool: request.name.into_owned(),
+             arguments: Value::Object(request.arguments.unwrap_or_default()),
+         };
++        let report_creation = (tool_name == "create_thread")
++            .then(|| report_parent.zip(report_turn))
++            .flatten()
++            .and_then(|(parent, turn)| {
++                super::app::herdr_display_binding::creation_context(&parent, &turn)
++            });
+         let mut thread_start_params = self.thread_start_params.clone();
+         thread_start_params.config.get_or_insert_default().insert(
+             format!("mcp_servers.{}", dynamic_tools::NAMESPACE),
+@@ -310,23 +398,32 @@ impl ServerHandler for DynamicToolMcpHandler {
+             .ok_or_else(|| {
+                 McpError::internal_error("TUI is reconnecting; tool was not sent", None)
+             })?;
+-        let response = if matches!(
++        let report_creation = match report_creation {
++            Some(context) if corroborates_start_origin(&request_handle, &context).await => {
++                Some(context)
++            }
++            _ => None,
++        };
++        let (response, created_child) = if matches!(
+             params.tool.as_str(),
+             "create_worktree" | "get_worktree_creation_status" | "list_worktrees"
+         ) {
+             let service = self.worktrees.as_ref().ok_or_else(|| {
+                 McpError::invalid_params("Worktree tools are unavailable on this connection", None)
+             })?;
+-            service
+-                .execute(
+-                    request_handle,
+-                    params.thread_id,
+-                    &params.tool,
+-                    params.arguments,
+-                )
+-                .await
++            (
++                service
++                    .execute(
++                        request_handle,
++                        params.thread_id,
++                        &params.tool,
++                        params.arguments,
++                    )
++                    .await,
++                None,
++            )
+         } else {
+-            dynamic_tools::execute(
++            let execution = dynamic_tools::execute_with_creation(
+                 request_handle,
+                 params,
+                 thread_start_params,
+@@ -334,8 +431,15 @@ impl ServerHandler for DynamicToolMcpHandler {
+                 self.status_updates.subscribe(),
+                 Some(&app_event_tx),
+             )
+-            .await
++            .await;
++            (execution.response, execution.created_thread_id)
+         };
++        if response.success
++            && let Some(context) = report_creation
++            && let Some(child) = created_child
++        {
++            super::app::herdr_display_binding::created(&context, &child.to_string());
++        }
+         let content = response
+             .content_items
+             .into_iter()

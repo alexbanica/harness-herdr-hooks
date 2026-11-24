@@ -14,6 +14,8 @@ import stat
 import sys
 import tempfile
 import time
+import re
+from urllib.parse import urlsplit
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
@@ -25,6 +27,9 @@ class LaunchError(RuntimeError):
 
 _TOOL_COMMANDS = {"exec", "resume", "fork", "apply", "review", "login", "logout",
                   "mcp", "completion", "debug", "features", "update", "cloud", "app-server"}
+_OPTION_VALUES = {"-c", "--config", "-p", "--profile", "-m", "--model", "-C", "--cd",
+                  "-s", "--sandbox", "-a", "--ask-for-approval", "--remote",
+                  "--remote-auth-token-env", "--local-provider", "--image", "--add-dir"}
 _PAYLOAD_TTL = 120
 
 
@@ -66,9 +71,7 @@ def classify_command(argv: Sequence[str], *, display: bool = False,
         return "native"
     # Parse only leading native options and their declared values. Once the
     # prompt boundary or first positional word is reached, never inspect it.
-    takes_value = {"-c", "--config", "-p", "--profile", "-m", "--model", "-C", "--cd",
-                   "-s", "--sandbox", "-a", "--ask-for-approval", "--remote",
-                   "--remote-auth-token-env", "--local-provider", "--image", "--add-dir"}
+    takes_value = _OPTION_VALUES
     i = 0
     while i < len(args):
         token = args[i]
@@ -160,7 +163,8 @@ class LaunchStore:
         return bool(value) and all(c in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in value)
 
     def create(self, argv: Sequence[str], *, native_executable: Path,
-               cwd: Path, profile: str) -> str:
+               cwd: Path, profile: str, client_binding: Mapping[str, str] | None = None,
+               client_endpoint: tuple[str, str] | None = None) -> str:
         if len(argv) > 256 or not native_executable.is_absolute() or not cwd.is_absolute() or not profile:
             raise ValueError("launch argv, native executable, cwd, and profile are invalid")
         if any(not isinstance(x, str) or "\0" in x or len(x.encode("utf-8", "surrogateescape")) > 65536 for x in argv):
@@ -169,6 +173,10 @@ class LaunchStore:
         request_id = secrets.token_urlsafe(18).replace("=", "")
         payload = {"schema": 1, "argv": list(argv), "native_executable": str(native_executable),
                    "cwd": str(cwd), "profile": profile}
+        if client_binding is not None:
+            payload["client_binding"] = dict(client_binding)
+        if client_endpoint is not None:
+            payload["client_endpoint"] = list(client_endpoint)
         encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8", "surrogateescape")
         if len(encoded) > 1024 * 1024:
             raise ValueError("launch payload exceeds 1 MiB")
@@ -255,6 +263,8 @@ class LaunchRouter(Protocol):
 def route_interactive(argv: Sequence[str], *, native_executable: Path,
                       config_root: Path, cwd: Path, state_root: Path,
                       environ: Mapping[str, str], router: LaunchRouter,
+                      client_binding: Mapping[str, str] | None = None,
+                      client_endpoint: tuple[str, str] | None = None,
                       timeout: float = 5.0,
                       expiry_scheduler: Callable[..., Any] | None = None) -> str:
     """Route once after parent proof; uncertain launch outcomes are never retried."""
@@ -265,7 +275,8 @@ def route_interactive(argv: Sequence[str], *, native_executable: Path,
         raise LaunchError("requesting Codex parent pane/backend could not be verified")
     store = LaunchStore(state_root / "harness-herdr-hooks" / "launches")
     request_id = store.create(argv, native_executable=native_executable,
-                              cwd=cwd, profile=str(config_root))
+                              cwd=cwd, profile=str(config_root), client_binding=client_binding,
+                              client_endpoint=client_endpoint)
     payload_path = store.root / "payloads" / f"{request_id}.json"
     try:
         _schedule_expiry(store.root, request_id, expiry_scheduler)
@@ -316,6 +327,9 @@ def run_claimed_launch(request_id: str, *, store: LaunchStore,
         native = Path(claimed["native_executable"])
         if not native.is_absolute() or not native.is_file() or not os.access(native, os.X_OK):
             raise LaunchError("native Codex executable is unavailable")
+        binding = claimed.get("client_binding")
+        if binding is not None and _verified_patched_executable(binding) != native:
+            raise LaunchError("claimed client executable no longer matches its pin")
     except Exception:
         store.terminate(request_id, "failed")
         raise
@@ -334,6 +348,18 @@ def run_claimed_launch(request_id: str, *, store: LaunchStore,
     child_env.pop("CODEX_THREAD_ID", None)
     child_env.pop("HARNESS_HERDR_DISPLAY", None)
     child_env.update({k: v for k, v in child_markers.items() if k.startswith("HERDR_")})
+    for key in ("HARNESS_HERDR_CLIENT_REPORTER", "HARNESS_HERDR_CLIENT_ENDPOINT",
+                "HARNESS_HERDR_CLIENT_ENDPOINT_INSTANCE", "HARNESS_HERDR_CHILD_CLAIM"):
+        child_env.pop(key, None)
+    binding = claimed.get("client_binding")
+    endpoint = _verified_interactive_endpoint(claimed["argv"], profile, binding) if isinstance(binding, Mapping) else None
+    if (endpoint and list(endpoint) == claimed.get("client_endpoint")
+            and child_markers.get("HERDR_ENV") == "1"
+            and all(child_markers.get(key) for key in ("HERDR_SOCKET_PATH", "HERDR_PANE_ID",
+                                                      "HERDR_TAB_ID", "HERDR_WORKSPACE_ID"))):
+        child_env["HARNESS_HERDR_CLIENT_REPORTER"] = binding["reporting_helper"]
+        child_env["HARNESS_HERDR_CLIENT_ENDPOINT"], child_env["HARNESS_HERDR_CLIENT_ENDPOINT_INSTANCE"] = endpoint
+        child_env["PATH"] = _verified_display_path(profile, binding)
     spawn = popen or subprocess.Popen
     try:
         proc = spawn([str(native), *claimed["argv"]], cwd=str(cwd), env=child_env,
@@ -349,12 +375,129 @@ def _metadata(shim_path: Path) -> dict[str, Any]:
     path = shim_path.with_name("adapter.json")
     data = LaunchStore._read_private(path)
     required = {"schema", "source_root", "native_executable", "config_root"}
-    if set(data) != required or data.get("schema") != 1:
+    if not required.issubset(data) or set(data)-required-{"client_binding"} or data.get("schema") != 1:
         raise LaunchError("Codex adapter metadata is missing or unsupported")
     for key in ("source_root", "native_executable", "config_root"):
         if not isinstance(data[key], str) or not Path(data[key]).is_absolute():
             raise LaunchError("Codex adapter metadata path is invalid")
+    binding=data.get("client_binding")
+    if binding is not None:
+        expected={"native_executable","sha256","version","capability_marker","reporting_helper"}
+        if not isinstance(binding,dict) or set(binding)!=expected:
+            raise LaunchError("Codex client-binding metadata is malformed")
+        if (not Path(binding["native_executable"]).is_absolute() or
+            binding["version"]!="0.172.0" or binding["capability_marker"]!="herdr-client-binding-v1" or
+            not Path(binding["reporting_helper"]).is_absolute()):
+            raise LaunchError("Codex client-binding metadata does not match the pinned route")
     return data
+
+
+def _display_args(argv: Sequence[str]) -> tuple[str,str] | None:
+    args=list(argv)
+    remote=child=None
+    if len(args)==4 and args[0]=="resume" and args[1]=="--remote": remote,child=args[2],args[3]
+    elif len(args)==3 and args[0]=="resume" and args[1].startswith("--remote="): remote,child=args[1].split("=",1)[1],args[2]
+    if (isinstance(remote,str) and re.fullmatch(r"unix:///[^\s]+",remote)
+        and isinstance(child,str) and re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}",child)):
+        return child.lower(),remote
+    return None
+
+
+def _pinned_endpoint(profile: str, endpoint: str | None):
+    from .codex_backend import select_endpoint
+    selected=select_endpoint(Path(profile))
+    if endpoint:
+        if endpoint.startswith("unix://"):
+            parts=urlsplit(endpoint)
+            if parts.scheme!="unix" or parts.netloc not in ("","localhost") or not parts.path.startswith("/") or parts.query or parts.fragment:
+                return None
+        elif not Path(endpoint).is_absolute():
+            return None
+        explicit=select_endpoint(Path(profile),endpoint)
+    else: explicit=selected
+    if (explicit.target,explicit.instance)!=(selected.target,selected.instance): return None
+    return selected
+
+
+def _leading_remote(argv: Sequence[str]) -> tuple[str | None,bool]:
+    args=list(argv); i=0; remote=None
+    while i<len(args):
+        token=args[i]
+        if token=="--": break
+        if token.startswith("--remote="):
+            if remote is not None: return None,False
+            remote=token.split("=",1)[1]
+        elif token=="--remote":
+            if remote is not None or i+1>=len(args): return None,False
+            remote=args[i+1]; i+=1
+        elif token in _OPTION_VALUES:
+            i+=1
+        elif token.startswith("-"):
+            pass
+        else:
+            break
+        i+=1
+    return remote,True
+
+
+def _verified_interactive_endpoint(argv: Sequence[str], profile: str,
+                                   binding: Mapping[str, Any] | None = None) -> tuple[str, str] | None:
+    remote,valid=_leading_remote(argv)
+    if not valid: return None
+    try:
+        if binding is not None: _verified_display_path(profile,binding)
+        selected=_pinned_endpoint(profile,remote)
+        return (str(selected.target), selected.instance) if selected else None
+    except Exception: return None
+
+
+def _verified_display_claim(argv: Sequence[str], profile: str,
+                            binding: Mapping[str, Any]) -> tuple[str, tuple[str, str]] | None:
+    parsed=_display_args(argv)
+    if parsed is None: return None
+    child_id,endpoint=parsed
+    _verified_display_path(profile,binding)
+    parts=urlsplit(endpoint)
+    if parts.scheme!="unix" or parts.netloc or not parts.path.startswith("/") or parts.query or parts.fragment:
+        return None
+    try:
+        selected=_pinned_endpoint(profile,endpoint)
+    except Exception:
+        return None
+    return (child_id, (str(selected.target), selected.instance)) if selected else None
+
+
+def _verified_patched_executable(binding: Mapping[str, Any]) -> Path:
+    try:
+        native = Path(binding["native_executable"])
+        if not native.is_absolute() or native.resolve(strict=True) != native:
+            raise LaunchError("pinned client executable is not canonical")
+        with native.open("rb") as stream:
+            info = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_mode & 0o022 or not os.access(native, os.X_OK)
+                    or hashlib.file_digest(stream, "sha256").hexdigest() != binding["sha256"]):
+                raise LaunchError("pinned client executable changed after installation")
+        return native
+    except (OSError, KeyError, TypeError) as exc:
+        raise LaunchError("pinned client executable is unavailable") from exc
+
+
+def _verified_display_path(profile: str, binding: Mapping[str, Any]) -> str:
+    """Build the child PATH from the profile's ownership manifest."""
+    profile_root=Path(profile)
+    manifest=LaunchStore._read_private(profile_root/".harness-herdr-hooks.json")
+    entry=manifest.get("entries",{}).get("codex")
+    if not isinstance(entry,dict) or entry.get("client_binding")!=dict(binding):
+        raise LaunchError("managed display client binding no longer matches its profile manifest")
+    adapter=Path(entry.get("adapter_dir",""))
+    if not adapter.is_absolute() or adapter.resolve()!=profile_root.resolve()/"harness-herdr-hooks"/"codex-adapter":
+        raise LaunchError("managed display adapter directory does not match its profile")
+    path_record=entry.get("path")
+    native_path=path_record.get("native_path") if isinstance(path_record,dict) else None
+    if not isinstance(native_path,str) or "\n" in native_path or "\r" in native_path:
+        raise LaunchError("managed display native PATH is unavailable")
+    return str(adapter)+(os.pathsep+native_path if native_path else "")
 
 
 def main(argv: Sequence[str] | None = None, *, shim_path: Path | None = None,
@@ -364,6 +507,9 @@ def main(argv: Sequence[str] | None = None, *, shim_path: Path | None = None,
     """Managed shim entry point with verified Herdr routing by default."""
     args = list(sys.argv[1:] if argv is None else argv)
     env = os.environ if environ is None else environ
+    for key in ("HARNESS_HERDR_CLIENT_REPORTER","HARNESS_HERDR_CLIENT_ENDPOINT","HARNESS_HERDR_CLIENT_ENDPOINT_INSTANCE",
+                "HARNESS_HERDR_CHILD_CLAIM"):
+        os.environ.pop(key,None)
     path = (shim_path or Path(sys.argv[0])).resolve(strict=True)
     meta = _metadata(path)
     source = Path(meta["source_root"]).resolve(strict=True)
@@ -371,24 +517,55 @@ def main(argv: Sequence[str] | None = None, *, shim_path: Path | None = None,
     config_root = Path(meta["config_root"]).resolve(strict=True)
     if not native.is_file() or not os.access(native, os.X_OK):
         raise LaunchError("recorded native Codex executable is unavailable")
+    binding=meta.get("client_binding")
     mode = classify_command(args, display=env.get("HARNESS_HERDR_DISPLAY") == "1",
                             herdr=env.get("HERDR_ENV") == "1",
                             absolute_exec=False)
+    ordinary_endpoint=None; display_claim=None
+    if binding and mode=="interactive" and env.get("HERDR_ENV")=="1" and env.get("HARNESS_HERDR_DISPLAY")!="1":
+        ordinary_endpoint=_verified_interactive_endpoint(args,str(config_root),binding)
+    elif binding and mode!="interactive" and env.get("HARNESS_HERDR_DISPLAY")=="1":
+        try: display_claim=_verified_display_claim(args,str(config_root),binding)
+        except (LaunchError,OSError,ValueError): display_claim=None
+    eligible=bool(ordinary_endpoint or display_claim)
+    client_native=native
+    if eligible and binding:
+        client_native = _verified_patched_executable(binding)
+    if mode=="interactive" and binding and not eligible:
+        sys.path.insert(0,str(source/"src"))
+        execv(str(native),[str(native),*args])
+        return 0
     if mode == "interactive":
-        if router_factory is None and env.get("HERDR_ENV") == "1" and env.get("HARNESS_HERDR_DISPLAY") != "1":
+        if (router_factory is None and (not binding or eligible) and env.get("HERDR_ENV") == "1"
+                and env.get("HARNESS_HERDR_DISPLAY") != "1"):
             from .cli import _launch_router_factory
             router_factory = _launch_router_factory
-        if router_factory is None and env.get("HERDR_ENV") == "1" and env.get("HARNESS_HERDR_DISPLAY") != "1":
+        if router_factory is None and (not binding or eligible) and env.get("HERDR_ENV") == "1" and env.get("HARNESS_HERDR_DISPLAY") != "1":
             raise LaunchError("verified Herdr launch routing is unavailable")
         if router_factory is None:
-            execv(str(native), [str(native), *args])
+            target=client_native if eligible else native
+            if eligible and binding:
+                os.environ["HARNESS_HERDR_CLIENT_REPORTER"]=binding["reporting_helper"]
+                os.environ["HARNESS_HERDR_CLIENT_ENDPOINT"], os.environ["HARNESS_HERDR_CLIENT_ENDPOINT_INSTANCE"] = ordinary_endpoint
+            execv(str(target), [str(target), *args])
             return 0
         router = router_factory(meta)
-        result = route_interactive(args, native_executable=native, config_root=config_root,
+        result = route_interactive(args, native_executable=client_native if eligible else native, config_root=config_root,
                                    cwd=Path.cwd(), state_root=_state_root(env),
-                                   environ=env, router=router)
+                                   environ=env, router=router, client_binding=binding,
+                                   client_endpoint=ordinary_endpoint)
         if result != "native":
             return 0
+        if binding and eligible:
+            os.environ["HARNESS_HERDR_CLIENT_REPORTER"]=binding["reporting_helper"]
+            os.environ["HARNESS_HERDR_CLIENT_ENDPOINT"], os.environ["HARNESS_HERDR_CLIENT_ENDPOINT_INSTANCE"] = ordinary_endpoint
+            native=client_native
+    elif binding and display_claim:
+        child_id,endpoint=display_claim
+        native=client_native
+        os.environ["HARNESS_HERDR_CHILD_CLAIM"]=child_id
+        os.environ["HARNESS_HERDR_CLIENT_REPORTER"]=binding["reporting_helper"]
+        os.environ["HARNESS_HERDR_CLIENT_ENDPOINT"], os.environ["HARNESS_HERDR_CLIENT_ENDPOINT_INSTANCE"] = endpoint
     sys.path.insert(0, str(source / "src"))
     execv(str(native), [str(native), *args])
     return 0

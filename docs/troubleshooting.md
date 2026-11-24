@@ -27,6 +27,35 @@ behavior, or client exit to a usable shell.
   missing mapping or matches spanning tabs are skipped. Standalone placement
   does not require a foreground PID or process tree. Do not substitute a
   similarly named session, another profile, or a different pane.
+- **Client-bound install refuses the executable:** confirm the absolute path
+  names the pinned patched `rust-v0.172.0` executable, its recorded digest is
+  current, and the capability marker is present. Build only from the pinned
+  tag and patch documented in [Codex setup](install-codex.md). The standard
+  Cargo build and focused test are currently blocked by locked dependency
+  resolution; see [validation](validation.md). Do not treat a version string
+  alone as client-binding qualification.
+- **Client binding reports no display or rejects startup:** verify the
+  managed adapter launched the local interactive client and that its private
+  Herdr endpoint is the selected profile's pinned endpoint. Admission requires
+  the helper's terminal to match one protocol-22 pane tty. Missing tty data,
+  stale inherited coordinates, multiple matching panes, a direct/native
+  launch, a background client, or shim bypass gives no pane authority. Check
+  that the profile's legacy Herdr Codex session reporter is absent; managed
+  installation rejects that conflict.
+- **You need a fresh-process pane control:** inspect `herdr workspace list`
+  and `herdr pane list`, then name the selected working pane explicitly in
+  `herdr pane split --pane PANE_ID --direction right --cwd PATH --no-focus`.
+  Capture the pane ID from that acknowledgement and pass it explicitly to
+  `herdr agent start NAME --kind codex --pane NEW_PANE_ID`. Independently check
+  that the new pane is in the selected existing tab. This verifies explicit
+  pane targeting and process start only; a fresh no-argument Codex process
+  does not prove attachment to an already created child.
+- **Creation is not attached after a view change:** only an acknowledged
+  active lease and a matching one-use receipt for the initiating client's
+  admitted user turn and exact returned child can authorize placement. Resume,
+  native delegation, an ambiguous client, or a stale receipt does not qualify.
+  Inspect the existing tab and durable effect status before retrying; an
+  unresolved pane effect is not replayed.
 - **A standalone task is skipped or deferred:** `status` separates
   recognition, verification, attachment, and current observer health. Bounded
   reasons can identify missing/mismatched parent rollout, unsupported record,

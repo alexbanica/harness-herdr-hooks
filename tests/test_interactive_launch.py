@@ -3,7 +3,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from harness_herdr_hooks.launch import LaunchError, LaunchStore, classify_command, route_interactive
 
@@ -148,6 +148,54 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(cwd, Path.cwd())
         self.assertFalse((other / "harness-herdr-hooks" / "launches").exists())
 
+    def test_managed_excluded_command_uses_original_native_and_clears_reporter_claim(self):
+        from harness_herdr_hooks.launch import main
+        shim=self.root/"codex"; shim.write_text("shim")
+        original=self.root/"codex-original"; original.write_text("#!/bin/sh\nexit 0\n"); original.chmod(0o700)
+        pinned=self.root/"codex-patched"; pinned.write_text("#!/bin/sh\nexit 0\n"); pinned.chmod(0o700)
+        source=Path(__file__).resolve().parents[1]
+        metadata=shim.with_name("adapter.json")
+        metadata.write_text(json.dumps({"schema":1,"source_root":str(source),
+            "native_executable":str(original),"config_root":str(self.root),
+            "client_binding":{"native_executable":str(pinned),"sha256":__import__("hashlib").sha256(pinned.read_bytes()).hexdigest(),
+                "version":"0.172.0","capability_marker":"herdr-client-binding-v1",
+                "reporting_helper":"/opt/herdr/bin/harness-herdr-hooks"}}))
+        metadata.chmod(0o600)
+        pinned.unlink()  # excluded routes must not require the managed client to remain installed
+        execv=Mock()
+        with patch.dict(os.environ,{"HARNESS_HERDR_CLIENT_REPORTER":"inherited","HARNESS_HERDR_CHILD_CLAIM":"inherited"}):
+            main(["--version"],shim_path=shim,environ={},execv=execv)
+            self.assertNotIn("HARNESS_HERDR_CLIENT_REPORTER",os.environ)
+            self.assertNotIn("HARNESS_HERDR_CHILD_CLAIM",os.environ)
+        self.assertEqual(execv.call_args.args[0],str(original))
+
+    def test_client_route_accepts_both_remote_forms_only_for_selected_socket_pin(self):
+        from harness_herdr_hooks.codex_backend import SocketPin
+        from harness_herdr_hooks.launch import _verified_interactive_endpoint, _verified_display_claim
+        def pin(path, inode):
+            uid=os.getuid()
+            return SocketPin(Path("/tmp/alias"),Path(path),(1,4,uid,0o777,0o120000),
+                (1,inode,uid,0o600,0o140000),(1,5,uid,0o700,0o040000))
+        selected=pin("/tmp/selected.sock",10); other=pin("/tmp/other.sock",11)
+        def choose(profile,explicit=None):
+            if explicit is None: return selected
+            return other if str(explicit).endswith("other.sock") else selected
+        with patch("harness_herdr_hooks.codex_backend.select_endpoint",side_effect=choose):
+            for args in (["--remote","unix:///tmp/selected.sock","hello"],
+                         ["--remote=unix:///tmp/selected.sock","hello"]):
+                self.assertEqual(_verified_interactive_endpoint(args,"/profile"),(str(selected.target), selected.instance))
+            self.assertIsNone(_verified_interactive_endpoint(["--remote","unix:///tmp/other.sock","hello"],"/profile"))
+            with patch("harness_herdr_hooks.codex_backend.select_endpoint",
+                       side_effect=[selected, pin("/tmp/selected.sock", 99)]):
+                self.assertIsNone(_verified_interactive_endpoint(
+                    ["--remote=unix:///tmp/selected.sock", "hello"], "/profile"))
+            with patch("harness_herdr_hooks.launch._verified_display_path",return_value="/verified/adapter"):
+                self.assertEqual(_verified_display_claim(["resume","--remote=unix:///tmp/selected.sock",
+                    "123e4567-e89b-42d3-a456-426614174000"],"/profile",{})[1],
+                    (str(selected.target), selected.instance))
+                self.assertIsNone(_verified_display_claim(["resume","--remote","unix:///tmp/other.sock",
+                    "123e4567-e89b-42d3-a456-426614174000"],"/profile",{}))
+
 
     def test_claimed_launch_uses_argv_without_shell_and_cleans_payload_after_spawn(self):
         executable = Path(os.sys.executable).resolve()
@@ -200,6 +248,42 @@ class LaunchTests(unittest.TestCase):
                 self.assertNotIn("CODEX_THREAD_ID", child_env)
                 self.assertNotIn("HARNESS_HERDR_DISPLAY", child_env)
                 self.assertEqual(spawn.call_count, 1)
+
+    def test_claimed_ordinary_resume_keeps_client_endpoint_without_child_claim(self):
+        from harness_herdr_hooks.launch import run_claimed_launch
+        executable = self.root / "patched-codex"
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o700)
+        child="123e4567-e89b-42d3-a456-426614174000"
+        binding={"native_executable":str(executable),"sha256":__import__("hashlib").sha256(executable.read_bytes()).hexdigest(),"version":"0.172.0",
+                 "capability_marker":"herdr-client-binding-v1","reporting_helper":"/opt/herdr/bin/harness-herdr-hooks"}
+        profile=self.root/"profile"; profile.mkdir(mode=0o700)
+        manifest={"entries":{"codex":{"client_binding":binding,
+            "adapter_dir":str(profile/"harness-herdr-hooks/codex-adapter"),
+            "path":{"native_path":"/usr/local/bin:/usr/bin"}}}}
+        manifest_path=profile/".harness-herdr-hooks.json"
+        manifest_path.write_text(json.dumps(manifest)); manifest_path.chmod(0o600)
+        endpoint="unix:///tmp/herdr-test.sock"
+        spawn=Mock(return_value=Mock(wait=Mock(return_value=0)))
+        from harness_herdr_hooks.codex_backend import SocketPin
+        uid=os.getuid()
+        pin=SocketPin(Path("/tmp/alias"),Path("/tmp/herdr-test.sock"),(1,2,uid,0o777,0o120000),
+                      (1,3,uid,0o600,0o140000),(1,4,uid,0o700,0o040000))
+        request=self.store.create(["resume","--remote",endpoint,child],native_executable=executable,cwd=self.root,
+                                  profile=str(profile), client_binding=binding,
+                                  client_endpoint=(str(pin.target), pin.instance))
+        with patch("harness_herdr_hooks.codex_backend.select_endpoint",return_value=pin):
+            run_claimed_launch(request,store=self.store,
+                verify_destination=lambda *a:{"HERDR_ENV":"1","HERDR_SOCKET_PATH":"/run/herdr.sock",
+                    "HERDR_PANE_ID":"p2","HERDR_TAB_ID":"t2","HERDR_WORKSPACE_ID":"w2"},
+                environ={"PATH":"/usr/bin:/bin"},popen=spawn)
+        child_env=spawn.call_args.kwargs["env"]
+        self.assertNotIn("HARNESS_HERDR_CHILD_CLAIM", child_env)
+        self.assertNotIn("HARNESS_HERDR_DISPLAY", child_env)
+        self.assertEqual(child_env["HARNESS_HERDR_CLIENT_REPORTER"],binding["reporting_helper"])
+        self.assertEqual(child_env["HARNESS_HERDR_CLIENT_ENDPOINT"],str(pin.target))
+        self.assertEqual(child_env["HARNESS_HERDR_CLIENT_ENDPOINT_INSTANCE"], pin.instance)
+        self.assertEqual(child_env["PATH"],str(profile/"harness-herdr-hooks/codex-adapter")+os.pathsep+"/usr/local/bin:/usr/bin")
 
     def test_outside_and_display_bypass_router(self):
         router = Mock()

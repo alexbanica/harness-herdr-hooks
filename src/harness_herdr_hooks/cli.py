@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Sequence
 from . import install as installer
 from .adapters.codex import parse_hook, CodexRuntimeAdapter
-from .coordinator import run_observer
+from .coordinator import discovery_namespace, run_observer
 from .environment import child_environment
 from .herdr import HerdrClient, HerdrError, codex_backend_proof, codex_remote_socket
 from .model import Context, Harness, Lifecycle, ParentBinding, Session, parent_from_dict, parent_to_dict, session_to_dict
@@ -273,7 +273,8 @@ def _parser() -> argparse.ArgumentParser:
     parser=argparse.ArgumentParser(prog="harness-herdr-hooks"); sub=parser.add_subparsers(dest="command",required=True)
     for name in ("install","status","uninstall"):
         p=sub.add_parser(name); p.add_argument("harness",choices=("codex","opencode")); p.add_argument("--config-dir")
-    for name in ("codex-hook","opencode-event","observe","observe-standalone","attach","launch-run"):
+        if name == "install": p.add_argument("--client-binding-codex")
+    for name in ("codex-hook","opencode-event","observe","observe-standalone","attach","launch-run","client-report"):
         p=sub.add_parser(name,help=argparse.SUPPRESS); p.add_argument("binding_id",nargs="?")
     return parser
 
@@ -340,10 +341,169 @@ def _parent_from_event(command:str, payload:bytes, client:HerdrClient):
         return None, None, None, None
     return _standalone_session_parent(raw, client)
 
+def _managed_profile_entry(profile: Path) -> dict | None:
+    manifest = profile / ".harness-herdr-hooks.json"
+    try:
+        data = LaunchStore._read_private(manifest)
+    except FileNotFoundError:
+        return None
+    entry = data.get("entries", {}).get("codex", {})
+    if not isinstance(entry, dict):
+        raise ValueError("invalid Codex manifest entry")
+    if "client_binding" not in entry:
+        return None
+    if not isinstance(entry["client_binding"], dict):
+        raise ValueError("invalid managed client binding manifest")
+    return entry
+
+
+def _client_report(mode: str | None) -> int:
+    from .client_binding import ClientBindingStore, admit_from_herdr
+    from .codex_backend import select_endpoint
+    from .model import session_from_dict
+
+    os.closerange(4, os.sysconf("SC_OPEN_MAX"))
+    if mode not in (None, "verify-revoked"):
+        raise ValueError("invalid managed client reporter mode")
+    client_nonce = os.environ.get("HARNESS_HERDR_CLIENT_NONCE")
+    if not isinstance(client_nonce, str) or not re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", client_nonce):
+        raise ValueError("managed client connection identity is unavailable")
+    if os.environ.get("HERDR_ENV") != "1":
+        raise ValueError("managed client requires a local Herdr pane")
+    profile = Path(os.environ["CODEX_HOME"]).resolve(strict=True)
+    if str(profile) != os.environ["CODEX_HOME"]:
+        raise ValueError("managed client profile is not canonical")
+    entry = _managed_profile_entry(profile)
+    if entry is None or entry.get("source") != str(_entrypoint()):
+        raise ValueError("managed client registration is unavailable")
+    config = entry["client_binding"]
+    if config.get("reporting_helper") != str(_entrypoint()):
+        raise ValueError("managed client reporter no longer matches the manifest")
+    _native_codex_executable(profile)  # verifies the shim and metadata against the manifest
+    metadata = LaunchStore._read_private(Path(entry["adapter_dir"]) / "adapter.json")
+    if metadata.get("client_binding") != config:
+        raise ValueError("managed client metadata no longer matches the manifest")
+    from .launch import _verified_patched_executable
+    executable = str(_verified_patched_executable(config))
+    pin = select_endpoint(profile)
+    if (os.environ.get("HARNESS_HERDR_CLIENT_ENDPOINT") != str(pin.target)
+            or os.environ.get("HARNESS_HERDR_CLIENT_ENDPOINT_INSTANCE") != pin.instance):
+        raise ValueError("managed client endpoint does not match the pinned profile")
+    root = _state_root()
+    client = HerdrClient(os.environ["HERDR_SOCKET_PATH"], timeout=.3)
+    display = admit_from_herdr(3, client, workspace_id=os.environ["HERDR_WORKSPACE_ID"],
+                               tab_id=os.environ["HERDR_TAB_ID"], pane_id=os.environ["HERDR_PANE_ID"])
+    claim_id = os.environ.get("HARNESS_HERDR_CHILD_CLAIM")
+    claimed_display = os.environ.get("HARNESS_HERDR_DISPLAY") == "1"
+    if claimed_display and not claim_id:
+        raise ValueError("managed display launch has no child claim")
+    backend = {"endpoint": str(pin.target), "instance": pin.instance}
+    store = ClientBindingStore(root)
+    if mode == "verify-revoked":
+        def reconcile_start(record, unresolved):
+            parent_id, pane_id = unresolved.get("parent_id"), unresolved.get("pane_id")
+            if not parent_id or not pane_id:
+                return False
+            pin.revalidate()
+            context = Context(Harness.CODEX, str(profile), profile, profile, profile,
+                              str(pin.target), parent_id, pin.instance)
+            effects = StateStore(root, context.key()[:32])
+            event_key = unresolved["event_key"]
+            effect = effects.standalone_effect(event_key, "start")
+            start_view = {"generation": record["generation"], "sequence": unresolved["view_sequence"]}
+            destination = {"server_id": display.server_id, "workspace_id": display.workspace_id,
+                           "tab_id": display.tab_id, "anchor_pane_id": display.pane_id}
+            if (not effect or effect.get("client_view") != start_view
+                    or effect.get("pane_id") != pane_id or effect.get("destination") != destination):
+                return False
+            child_id = effect["child_id"]
+            matching = [active for _, active in store.live_records()
+                        if active.get("profile") == str(profile) and active.get("backend") == backend
+                        and active.get("active_thread_id") == child_id
+                        and (active.get("server_id"), active.get("workspace_id"),
+                             active.get("tab_id"), active.get("pane_id")) ==
+                        (display.server_id, display.workspace_id, display.tab_id, pane_id)]
+            if len(matching) != 1 or not client.pane_has_session(
+                    pane_id, child_id, workspace_id=display.workspace_id, tab_id=display.tab_id):
+                return False
+            return effects.mark_standalone_effect(event_key, "start", effect["binding_id"], pane_id, "attached")
+
+        store.assert_revoked_client(display, str(profile), backend, client_nonce,
+                                    reconcile_start=reconcile_start)
+        return 0
+    lease = store.open_lease(profile=str(profile), backend=backend,
+                             server_id=display.server_id, workspace_id=display.workspace_id,
+                             tab_id=display.tab_id, pane_id=display.pane_id,
+                             terminal_device=display.terminal_device, terminal_inode=display.terminal_inode,
+                             client_nonce=client_nonce)
+
+    first_active = True
+
+    def prepare_active(record, report):
+        nonlocal pending
+        session_id = report["thread_id"]
+        pin.revalidate()
+        context = Context(Harness.CODEX, str(profile), profile, profile, profile,
+                          str(pin.target), session_id, pin.instance)
+        if claimed_display and first_active:
+            if session_id != claim_id:
+                raise ValueError("display session does not match the exact child claim")
+            claim = load_existing_binding(root, "display-" + context.key())
+            origin = parent_from_dict(claim["parent"])
+            if (claim.get("kind") != "standalone" or claim.get("ownership") != "created"
+                    or claim.get("pane_id") != display.pane_id
+                    or claim.get("server_socket") != str(client.socket_path)
+                    or session_from_dict(claim["child"]).context != context
+                    or (origin.herdr_server_id, origin.workspace_id, origin.tab_id) !=
+                    (display.server_id, display.workspace_id, display.tab_id)):
+                raise ValueError("managed display claim is stale")
+        provider = CodexRuntimeAdapter(context, executable=executable, task_store_root=root)
+        try:
+            thread = provider._read_thread(session_id)
+        finally:
+            provider.close()
+        session_path, cwd = thread.get("path"), thread.get("cwd")
+        if (thread.get("id") != session_id or not isinstance(session_path, str)
+                or not Path(session_path).is_absolute() or not isinstance(cwd, str)
+                or not Path(cwd).is_absolute()):
+            raise ValueError("managed display thread metadata is unavailable")
+        snap = client.snapshot()
+        matches = [row for row in snap.get("panes", []) if isinstance(row, dict)
+                   and row.get("pane_id") == display.pane_id]
+        if (client.server_identity() != display.server_id or len(matches) != 1
+                or (matches[0].get("workspace_id"), matches[0].get("tab_id")) !=
+                (display.workspace_id, display.tab_id)):
+            raise ValueError("managed pane changed")
+        client.report_client_session(display.pane_id, session_id, report["source"], pin.target)
+        if not client.pane_has_session(display.pane_id, session_id, workspace_id=display.workspace_id,
+                                       tab_id=display.tab_id):
+            raise ValueError("Herdr did not publish the exact managed session")
+        proof = {"executable": executable, "client_key": lease.key,
+                 "client_generation": record["generation"], "client_view_sequence": report["sequence"]}
+        parent = ParentBinding(context, display.server_id, display.workspace_id, display.tab_id,
+                               display.pane_id, session_path=Path(session_path), backend_proof=proof)
+        pending = (parent, Path(cwd))
+
+    def start_active(_record, _report):
+        nonlocal first_active
+        if pending is not None:
+            _start_observer(pending[0], client, pending[1])
+        first_active = False
+
+    pending = None
+    with lease:
+        lease.serve(sys.stdin.buffer, sys.stdout.buffer, before_active=prepare_active,
+                    after_active=start_active)
+    return 0
+
+
 def _standalone_session_parent(raw:dict,client:HerdrClient):
     """Bind a new standalone SessionStart through authenticated session identity only."""
     from .codex_backend import select_endpoint
     profile=Path(os.environ.get("CODEX_HOME","~/.codex")).expanduser().resolve()
+    if _managed_profile_entry(profile) is not None:
+        return None, None, None, None
     pin=select_endpoint(profile)
     instance=pin.instance
     event=parse_hook(raw,profile=str(profile),config_root=profile,data_root=profile,state_root=profile,
@@ -442,7 +602,9 @@ def _provider(parent: ParentBinding) -> CodexRuntimeAdapter:
     executable = proof.get("executable")
     if not isinstance(executable, str) or not Path(executable).is_absolute():
         raise ValueError("recorded native Codex executable proof missing")
-    return CodexRuntimeAdapter(parent.context, executable=executable, task_store_root=_state_root())
+    provider = CodexRuntimeAdapter(parent.context, executable=executable, task_store_root=_state_root())
+    provider.task_store_namespace = discovery_namespace(parent)
+    return provider
 
 
 def _start_observer(parent: ParentBinding, client: HerdrClient, cwd: Path) -> None:
@@ -450,6 +612,9 @@ def _start_observer(parent: ParentBinding, client: HerdrClient, cwd: Path) -> No
     entrypoint = _entrypoint()
     session = Session(parent.context, None, None, cwd, Lifecycle.UNKNOWN, False, time.time())
     identity = [parent.context.key(), parent.herdr_server_id, parent.workspace_id, parent.tab_id]
+    if (parent.backend_proof or {}).get("client_generation"):
+        identity.extend([parent.pane_id, parent.backend_proof["client_generation"],
+                         parent.backend_proof["client_view_sequence"]])
     binding = "standalone-" + hashlib.sha256(json.dumps(identity).encode()).hexdigest()
     save_binding(root, binding, {
         "parent": parent_to_dict(parent), "child": session_to_dict(session),
@@ -482,7 +647,7 @@ def _observe(binding: str) -> None:
     if client.server_identity() != parent.herdr_server_id:
         return
     provider = _provider(parent)
-    store = StateStore(root, parent.context.key()[:32])
+    store = StateStore(root, discovery_namespace(parent))
     run_observer(parent, store, provider, client, _entrypoint(), root)
 
 
@@ -492,7 +657,11 @@ def main(argv:Sequence[str]|None=None)->int:
     if args.command=="launch-run" and (not args.binding_id or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}",args.binding_id)):
         print("harness-herdr-hooks: ValueError: invalid launch request ID",file=sys.stderr); return 2
     try:
-        if args.command=="install": result=installer.install(args.harness,source_root=Path(__file__).resolve().parents[2],config_dir=args.config_dir)
+        if args.command=="install":
+            options = {"client_binding_codex": args.client_binding_codex} if args.client_binding_codex else {}
+            result=installer.install(args.harness,source_root=Path(__file__).resolve().parents[2],config_dir=args.config_dir,**options)
+        elif args.command=="client-report":
+            return _client_report(args.binding_id)
         elif args.command=="status":
             result=installer.status(args.harness,config_dir=args.config_dir)
             if args.harness == "codex":

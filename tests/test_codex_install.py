@@ -26,6 +26,29 @@ class CodexInstallTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_client_binding_install_pins_capability_and_rejects_legacy_reporter(self):
+        pinned=self.bin/"codex-patched"
+        pinned.write_text("#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'codex-cli 0.172.0 herdr-client-binding-v1'; exit 0; fi\nexit 0\n")
+        pinned.chmod(0o700)
+        with patch.dict(os.environ,{"PATH":str(self.bin)}):
+            install("codex",source_root=self.source,config_dir=str(self.root),client_binding_codex=str(pinned))
+        meta=json.loads((self.root/"harness-herdr-hooks/codex-adapter/adapter.json").read_text())
+        manifest=json.loads((self.root/".harness-herdr-hooks.json").read_text())
+        binding=meta["client_binding"]
+        self.assertEqual(meta["native_executable"],str(self.native.resolve()))
+        self.assertEqual(binding["native_executable"],str(pinned.resolve()))
+        self.assertEqual(binding["capability_marker"],"herdr-client-binding-v1")
+        self.assertEqual(binding["sha256"],hashlib.sha256(pinned.read_bytes()).hexdigest())
+        self.assertEqual(manifest["entries"]["codex"]["client_binding"],binding)
+
+        other=Path(self.tmp.name)/"conflicting-profile"; other.mkdir(mode=0o700)
+        for command in ("herdr codex session reporter", "bash '/selected/profile/herdr-agent-state.sh'"):
+            with self.subTest(command=command):
+                (other/"hooks.json").write_text(json.dumps({"hooks":{"SessionStart":[{"hooks":[
+                    {"type":"command","command":command}]}]}}))
+                with patch.dict(os.environ,{"PATH":str(self.bin)}), self.assertRaisesRegex(InstallError,"legacy Herdr Codex"):
+                    install("codex",source_root=self.source,config_dir=str(other),client_binding_codex=str(pinned))
+
     def test_install_registers_session_start_only_and_profile_adapter_then_uninstalls(self):
         hooks = self.root / "hooks.json"
         hooks.write_text(json.dumps({"hooks": {"UserEvent": [{"hooks": [{"type": "command", "command": "keep"}]}]}}))

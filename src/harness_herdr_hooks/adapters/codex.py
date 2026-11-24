@@ -593,7 +593,8 @@ class CodexRuntimeAdapter:
             self._standalone_status("deferred", "deferred", "unknown", "parent_file_mismatch")
             return
         sessions_dir = self.context.data_root / "sessions"
-        store = StateStore(self.task_store_root, self.context.key()[:32])
+        namespace = getattr(self, "task_store_namespace", None) or self.context.key()[:32]
+        store = StateStore(self.task_store_root, namespace)
         try:
             binding = bind_parent_file(native_path, sessions_dir, parent.context.session_id)
         except FileNotFoundError:

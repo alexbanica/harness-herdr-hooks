@@ -1,8 +1,70 @@
 # Validation and support status
 
-**Current delivery status: DRAFT / experimental; current Definition of Done is not met.** The current scope retains standalone Codex session panes and the separate ordinary fresh interactive command route. Native subagent discovery/attachment, OpenCode event handling, and automated tab creation/naming/retirement were removed. Results below the historical-record heading refer to predecessor behavior and are not evidence for this current scope.
+**Current revision: client-bound Codex pane binding, DRAFT / experimental.**
+The opt-in protocol and Python integration have source coverage, but the
+patched Rust client has not passed its locked build/test commands and live
+two-client acceptance is incomplete. Evidence and limits for this revision
+are recorded first below. Predecessor records follow unchanged.
 
-## Standalone session panes only — current revision
+## Client-bound Codex pane binding
+
+This section applies to approved SPEC `SPEC-codex-client-pane-binding.md`
+(SHA-256 `6dce64b3ca3a910340c00791cce2ef678b10118e6934fffe4a997259cd264a6c`)
+and effective PLAN `PLAN-codex-client-pane-binding.md` (SHA-256
+`cca7b89e22ddb7018579e7275fbf417cb19bb2efeb30fe82fca9a78320022aca`). The
+opt-in command is `install codex --client-binding-codex /absolute/path/to/codex`.
+Patch provenance and build instructions are in [Codex setup](install-codex.md).
+
+| Area | Evidence obtained | Qualification limit |
+| --- | --- | --- |
+| Python source QA | Independent final QA passed 80 focused tests and 170 full Python tests. `git diff --check` passed. | Python fixtures do not qualify the patched Rust producer or real two-client pane placement. |
+| Patch application | The patch applied cleanly to a clean checkout of the pinned Codex tag and commit. | Successful application does not prove the patched client builds or runs. |
+| Rust package tests | The isolated reporter module's 3 Rust tests passed. `cargo build --locked -p codex-cli` and `cargo test --locked -p codex-tui herdr_display_binding` both exited 101 requesting a lockfile update. The same locked build failure was independently reproduced on the unpatched clean tag. | No successful locked CLI build or focused TUI integration test is evidenced. The failure is reproducible on baseline and does not establish a patch regression. |
+| Disposable Herdr probe | On a disposable Herdr 0.9.5 / protocol 22 server with real `/dev/pts/13`, `pane.process_info` omitted tty on two panes, including a foreground-work pane. `pane.split --env PATH=...` acknowledged a same-tab split without focus. `agent.start` invoked installed Codex instead of the controlled stub and timed out at the mock socket. The server was stopped after the probe. | The environment did not provide the required admission tty and did not exercise a controlled exact-child attachment. No authenticated two-client live acceptance or runtime claim is made. |
+| Live cross-space behavior | None. | No authenticated two-client shared-app-server qualification, resume transition, exact child receipt, no-added-turn result, or post-exit shell result was obtained. |
+
+The separately confirmed operator control selected workspace `w2`
+(`RpiInfrastructure`) with `herdr workspace list`, then its focused working
+Codex pane `w2:pR` in tab `w2:t1` with `herdr pane list`. Despite the caller
+shell inheriting unrelated `wE:p4`, the operator explicitly split from `w2:pR`
+and started a fresh Codex process in the acknowledged `w2:pZ` pane:
+
+```sh
+herdr pane split --pane w2:pR --direction right --cwd /tmp/rpi-vpn-merge.aOklGJ --no-focus
+herdr agent start swarm-vpn-implement --kind codex --pane w2:pZ --timeout 25000
+herdr pane get w2:pZ
+```
+
+The replies showed `w2:pZ` in the existing `w2:t1` and an idle Codex client,
+and a separate `herdr pane get w2:pZ`/snapshot independently confirmed its
+pane and tab. There was no exact Codex session reference. This proves only the
+explicit-pane operator control and start acknowledgement. A fresh no-argument
+launch cannot prove attachment to an existing child and is not a fallback for
+automated binding.
+
+The patch is for Codex `rust-v0.172.0`, commit
+`3d86e43b075adeba2193ec5c22ac92f55afd82e6`, tree
+`82eb586eff8b4d378eafc4fec640605ef7d6dbf1`, Rust `1.99.1`. Patch SHA-256 is
+`f5a1a6b145d2acdc082db878858dc1c3aef172c47629be4dd8acefb07896b046`. The
+canonical patch check and locked build/test commands are documented in
+[Codex setup](install-codex.md). The profile opt-in remains gated on the
+pinned executable. The legacy Herdr Codex session reporter must be absent.
+Direct/native routes, background startup, native subagent events, or shim
+bypass do not establish placement authority. Missing tty, ambiguous pane or
+client, stale endpoint, or unconfirmed view transition fail closed.
+
+Until the locked Rust build and focused TUI test pass and authenticated
+two-client live acceptance is completed, this revision remains DRAFT. The
+current probe is not evidence of successful attachment or client binding.
+
+## Standalone session panes only — predecessor evidence
+
+**Predecessor delivery status: DRAFT / experimental; that revision's Definition
+of Done was not met.** Its scope retained standalone Codex session panes and
+the separate ordinary fresh interactive command route. Native subagent
+discovery/attachment, OpenCode event handling, and automated tab
+creation/naming/retirement had been removed. The evidence below describes that
+predecessor and does not qualify the current client-binding revision.
 
 This record applies to approved SPEC `SPEC-standalone-session-panes-only.md`
 (SHA-256 `cd5f54056039a7736e5ececa290c8261f8b14cd80e37fedb45740ed0b75b4687`)

@@ -4,6 +4,7 @@ import json
 import hashlib
 import os
 import time
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from pathlib import Path
 from typing import Iterable, Protocol
@@ -26,6 +27,7 @@ class Runtime(Protocol):
 class Coordinator:
     def __init__(self, store: StateStore, runtime: Runtime):
         self.store, self.runtime = store, runtime
+        self.effects = getattr(runtime, "effects", store)
 
     def observe_initial(self, parent: ParentBinding) -> Outcome:
         if not self.runtime.verify_parent(parent):
@@ -65,6 +67,9 @@ class Coordinator:
             return Outcome(Decision.SKIP, "standalone creation proof does not prove this parent")
         key = hashlib.sha256(json.dumps([proof.parent_id, proof.turn_id, proof.item_id],
                                         separators=(",", ":")).encode()).hexdigest()
+        authorize = getattr(self.runtime, "creation_authorized", None)
+        if authorize is not None and not authorize(parent, child) and self.effects.standalone_effect(key) is None:
+            return Outcome(Decision.WAIT, "no exact live client creation receipt")
         return self._handle_standalone(parent, child, key)
 
     def _handle_standalone(self, parent: ParentBinding, child: Session, event_key: str) -> Outcome:
@@ -158,7 +163,7 @@ class Coordinator:
         claim_binding = binding
         effect = None
         try:
-            effect = self.store.standalone_effect(event_key)
+            effect = self.effects.standalone_effect(event_key)
             if not newly_claimed or effect is not None:
                 pane_state = self.runtime.owned_pane_state(parent, child, binding)
             else:
@@ -209,20 +214,152 @@ class Coordinator:
                 try: self.runtime.update_title(binding, child.title)
                 except Exception: pass
             return Outcome(Decision.ATTACHED, binding_id=binding, attempts=attempts)
-        if self.store.standalone_effect(event_key) is not None:
+        if self.effects.standalone_effect(event_key) is not None:
             return Outcome(Decision.WAIT, "standalone pane outcome is unresolved", binding, attempts)
         if not self.store.reconcile_standalone(key, event_key, claim_binding, "pending", attempts=attempts + 1):
             return Outcome(Decision.WAIT, "standalone association changed during attachment", binding, attempts)
         return Outcome(Decision.WAIT if attempts + 1 < MAX_RETRIES else Decision.FAILED,
                        "child not yet attachable", binding, attempts + 1)
 
+def discovery_namespace(parent: ParentBinding) -> str:
+    """Retain independent rollout cursors for simultaneous displays of one thread."""
+    if not (parent.backend_proof or {}).get("client_generation"):
+        return parent.context.key()[:32]
+    identity = [parent.context.key(), parent.herdr_server_id, parent.workspace_id,
+                parent.tab_id, parent.pane_id]
+    return hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()[:32]
+
+
+class ManagedPlacement:
+    """Bind every pane effect to one live client view and its exact receipt."""
+
+    def __init__(self, runtime, parent: ParentBinding, child: Session | None = None):
+        from .client_binding import ClientBindingStore
+
+        self.runtime, self.parent, self.child = runtime, parent, child
+        self.store = ClientBindingStore(runtime.state_root)
+        proof = parent.backend_proof or {}
+        self.key = proof["client_key"]
+        self.generation = proof["client_generation"]
+        self.view_sequence = proof["client_view_sequence"]
+        self.destination = {"server_id": parent.herdr_server_id, "workspace_id": parent.workspace_id,
+                            "tab_id": parent.tab_id, "anchor_pane_id": parent.pane_id}
+        self.receipt = None
+
+    def _matches(self, record: dict | None, session_id: str, pane_id: str) -> bool:
+        context = self.parent.context
+        return bool(record and record.get("active_thread_id") == session_id
+                    and record.get("profile") == context.profile
+                    and record.get("backend") == {"endpoint": context.backend_id,
+                                                  "instance": context.backend_instance}
+                    and (record.get("server_id"), record.get("workspace_id"),
+                         record.get("tab_id"), record.get("pane_id")) ==
+                    (self.parent.herdr_server_id, self.parent.workspace_id, self.parent.tab_id, pane_id))
+
+    def valid(self) -> bool:
+        from .codex_backend import select_endpoint
+
+        record = self.store.read_live(self.key, self.generation)
+        if (not self._matches(record, self.parent.context.session_id, self.parent.pane_id)
+                or record.get("active_sequence") != self.view_sequence):
+            return False
+        context = self.parent.context
+        pin = select_endpoint(context.config_root)
+        if (str(pin.target), pin.instance) != (context.backend_id, context.backend_instance):
+            return False
+        return (self.runtime.herdr.pane_has_session(
+            self.parent.pane_id, context.session_id, session_path=self.parent.session_path,
+            workspace_id=self.parent.workspace_id, tab_id=self.parent.tab_id)
+            and self.runtime.herdr.server_identity() == self.parent.herdr_server_id)
+
+    def child_is_live(self, pane_id: str) -> bool:
+        return any(self._matches(record, self.child.context.session_id, pane_id)
+                   for _, record in self.store.live_records())
+
+    def matching_receipts(self) -> list[dict]:
+        proof = self.child.creation_proof
+        exact = (proof.parent_id, proof.turn_id, proof.child_id)
+        matches = []
+        for _, record in self.store.live_records():
+            if (record.get("profile") != self.parent.context.profile
+                    or record.get("backend") != {"endpoint": self.parent.context.backend_id,
+                                                 "instance": self.parent.context.backend_instance}):
+                continue
+            for receipt in record["receipts"]:
+                if (receipt["expires_at"] > time.time()
+                        and (receipt["parent_id"], receipt["turn_id"], receipt["child_id"]) == exact):
+                    matches.append(record)
+        return matches
+
+    def has_receipt(self) -> bool:
+        matches = self.matching_receipts()
+        return (len(matches) == 1 and matches[0]["generation"] == self.generation
+                and matches[0]["active_sequence"] == self.view_sequence)
+
+    @property
+    def split_path(self) -> str:
+        from .cli import _managed_profile_entry
+
+        entry = _managed_profile_entry(self.parent.context.config_root)
+        adapter = Path(entry["adapter_dir"])
+        path = entry["path"]["installed_path"]
+        if not adapter.is_absolute() or path.split(os.pathsep)[0] != str(adapter):
+            raise ValueError("managed split PATH does not match the selected adapter")
+        for name, expected in (("codex", "adapter_sha256"), ("adapter.json", "metadata_sha256")):
+            with (adapter / name).open("rb") as stream:
+                if hashlib.file_digest(stream, "sha256").hexdigest() != entry[expected]:
+                    raise ValueError("managed split adapter changed")
+        return path
+
+    @property
+    def client_view(self) -> dict:
+        return {"generation": self.generation, "sequence": self.view_sequence}
+
+    @contextmanager
+    def guard(self, stage: str, *, event_key: str = "", pane_id: str | None = None):
+        selection = self.store.selecting_receipt() if stage == "split" else nullcontext()
+        with selection, self.store.guard(self.key, self.generation) as effect:
+            if effect.record.get("unresolved_effect") or not self.valid():
+                raise ValueError("managed view cannot admit this effect")
+            if stage == "split" and not self.has_receipt():
+                raise ValueError("managed creation receipt is absent or ambiguous")
+            yield ManagedEffect(self, effect, stage, event_key, pane_id)
+
+
+class ManagedEffect:
+    def __init__(self, placement: ManagedPlacement, effect, stage: str,
+                 event_key: str, pane_id: str | None):
+        self.placement, self.effect, self.stage = placement, effect, stage
+        self.identity = {"stage": stage, "event_key": event_key,
+                         "view_sequence": placement.view_sequence,
+                         "parent_id": placement.parent.context.session_id}
+        if pane_id is not None:
+            self.identity["pane_id"] = pane_id
+
+    def issue(self) -> None:
+        if not self.placement.valid():
+            raise ValueError("managed view changed before issuing effect")
+        if self.stage == "split":
+            proof = self.placement.child.creation_proof
+            self.placement.receipt = self.effect.consume_receipt(proof.parent_id, proof.turn_id, proof.child_id)
+            if self.placement.receipt is None:
+                raise ValueError("managed creation receipt changed")
+        if self.stage in {"split", "start"}:
+            self.effect.set_unresolved(self.identity)
+
+    def resolve(self) -> None:
+        if self.stage in {"split", "start"}:
+            self.effect.set_unresolved(None, expected=self.identity)
+
+
 class NativeRuntime:
     """Compose a native provider adapter with a verified Herdr presentation client."""
     def __init__(self, store: StateStore, provider: object, herdr: object,
                  entrypoint: Path, backend_pid: int | None = None,
-                 state_root: Path | None = None):
+                 state_root: Path | None = None, *, effects: StateStore | None = None):
         if not entrypoint.is_absolute(): raise ValueError("entrypoint must be absolute")
         self.store, self.provider, self.herdr = store, provider, herdr
+        self.effects = effects if effects is not None else store
         self.entrypoint, self.backend_pid = entrypoint, backend_pid
         self.state_root = state_root or store.root.parent.parent
 
@@ -230,6 +367,11 @@ class NativeRuntime:
     def verify_parent(self, parent: ParentBinding) -> bool:
         try:
             if parent.context != self.provider.context or not self._registration_valid(parent):
+                return False
+            if (parent.backend_proof or {}).get("client_generation"):
+                return ManagedPlacement(self, parent).valid()
+            from .cli import _managed_profile_entry
+            if _managed_profile_entry(parent.context.config_root) is not None:
                 return False
             # Session identity and the authenticated current snapshot establish
             # placement; standalone flow does not inspect process metadata.
@@ -298,6 +440,11 @@ class NativeRuntime:
     def can_attach_now(self, parent: ParentBinding, child: Session) -> bool:
         return self.verify_parent(parent) and bool(self.provider.can_attach_now(parent, child))
 
+    def creation_authorized(self, parent: ParentBinding, child: Session) -> bool:
+        if not (parent.backend_proof or {}).get("client_generation"):
+            return True
+        return ManagedPlacement(self, parent, child).has_receipt()
+
 
     def find_existing_pane(self, parent: ParentBinding, child: Session) -> str | None:
         if child.kind != "standalone":
@@ -310,6 +457,9 @@ class NativeRuntime:
                     or destination.get("tab_id") != parent.tab_id):
                 return None
             pane_id = destination.get("anchor_pane_id")
+            if (parent.backend_proof or {}).get("client_generation") and not ManagedPlacement(
+                    self, parent, child).child_is_live(pane_id):
+                return None
             return pane_id if self.herdr.pane_has_session(pane_id, child.context.session_id,
                 session_path=child.session_path, harness="codex",
                 workspace_id=parent.workspace_id, tab_id=parent.tab_id) else None
@@ -324,7 +474,7 @@ class NativeRuntime:
             event_key = hashlib.sha256(json.dumps(
                 [proof.parent_id, proof.turn_id, proof.item_id],
                 separators=(",", ":")).encode()).hexdigest()
-            effect = self.store.standalone_effect(event_key)
+            effect = self.effects.standalone_effect(event_key)
             if effect is None:
                 record = load_existing_binding(self.state_root, binding_id)
                 if (record.get("kind") != "standalone" or record.get("ownership") != "reused"
@@ -338,13 +488,23 @@ class NativeRuntime:
             if effect.get("binding_id") != binding_id or not effect.get("pane_id"):
                 return "unknown"
             pane_id = effect["pane_id"]
-            if self.herdr.pane_has_session(
+            managed = ManagedPlacement(self, parent, child) if (parent.backend_proof or {}).get("client_generation") else None
+            if managed is not None and not reused and effect.get("client_view") != managed.client_view:
+                return "unknown"
+            if (managed is None or managed.child_is_live(pane_id)) and self.herdr.pane_has_session(
                     pane_id, child.context.session_id, session_path=child.session_path,
                     workspace_id=parent.workspace_id, tab_id=parent.tab_id):
                 if reused:
                     return "live"
-                start = self.store.standalone_effect(event_key, "start")
-                if start and self.store.mark_standalone_effect(event_key, "start", binding_id, pane_id, "attached"):
+                start = self.effects.standalone_effect(event_key, "start")
+                if start and self.effects.mark_standalone_effect(event_key, "start", binding_id, pane_id, "attached"):
+                    if managed is not None and start.get("client_view") == managed.client_view:
+                        expected = {"stage": "start", "event_key": event_key,
+                                    "view_sequence": managed.view_sequence, "pane_id": pane_id,
+                                    "parent_id": parent.context.session_id}
+                        with managed.store.guard(managed.key, managed.generation) as guard:
+                            if managed.valid() and guard.record.get("unresolved_effect") == expected:
+                                guard.set_unresolved(None, expected=expected)
                     update_binding_outcome(self.state_root, binding_id, "attached")
                     return "live"
             snap = self.herdr.snapshot()
@@ -378,7 +538,15 @@ class NativeRuntime:
         record = load_existing_binding(self.state_root, binding_id)
         parent, child = parent_from_dict(record["parent"]), session_from_dict(record["child"])
         if self.owned_pane_state(parent, child, binding_id) != "live": return
-        self.herdr.rename(record["pane_id"], self.herdr.safe_label(title, child.context.harness.value, child.context.session_id))
+        label = self.herdr.safe_label(title, child.context.harness.value, child.context.session_id)
+        if (parent.backend_proof or {}).get("client_generation"):
+            managed = ManagedPlacement(self, parent, child)
+            with managed.guard("title") as effect:
+                effect.issue()
+                if managed.child_is_live(record["pane_id"]):
+                    self.herdr.rename(record["pane_id"], label)
+        else:
+            self.herdr.rename(record["pane_id"], label)
 
 
 
@@ -409,7 +577,9 @@ class NativeRuntime:
                 backend_socket=Path(child.context.backend_id), cwd=child.cwd,
                 profile_home=child.context.config_root, session_path=child.session_path,
                 revalidate_binding=lambda: self.can_attach_now(parent, child),
-                on_pane_claim=claim_display)
+                on_pane_claim=claim_display,
+                managed=ManagedPlacement(self, parent, child)
+                if (parent.backend_proof or {}).get("client_generation") else None)
             update_binding_outcome(self.state_root, binding_id, "attached")
             return bool(pane_id)
         except Exception:
@@ -422,8 +592,16 @@ def run_observer(parent: ParentBinding, store: StateStore, provider: object,
     """Run one context-scoped observer; transport errors are bounded and never terminalize children."""
     import fcntl
     import time
-    helper_fd = store._open_private_lock("helper.lock")
-    runtime = NativeRuntime(store, provider, herdr, entrypoint, backend_pid, state_root)
+    proof = parent.backend_proof or {}
+    helper_name = "helper.lock"
+    if proof.get("client_generation"):
+        view_key = hashlib.sha256(json.dumps(
+            [proof["client_generation"], proof["client_view_sequence"]]).encode()).hexdigest()
+        helper_name = f"helper-{view_key}.lock"
+    helper_fd = store._open_private_lock(helper_name)
+    effects = StateStore(state_root, parent.context.key()[:32])
+    runtime = NativeRuntime(store, provider, herdr, entrypoint, backend_pid, state_root,
+                            effects=effects)
     coordinator = Coordinator(store, runtime)
     failures = 0
     started = False
