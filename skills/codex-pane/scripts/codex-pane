@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+"""Open one fresh stock Codex session in a sibling Herdr pane."""
+import argparse
+import datetime
+import json
+import mmap
+import os
+import unicodedata
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+import uuid
+
+
+class Failure(Exception):
+    def __init__(self, message, pane=None, workspace=None, tab=None, outcome="unknown"):
+        super().__init__(message)
+        self.pane = pane
+        self.workspace = workspace
+        self.tab = tab
+        self.outcome = outcome
+
+
+def invoke(args, timeout=15):
+    try:
+        p = subprocess.run(["herdr", *args], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        raise Failure(f"Herdr command timed out; outcome unknown ({args[0]} {args[1] if len(args)>1 else ''})") from e
+    except OSError as e:
+        raise Failure(f"Could not run Herdr: {e}") from e
+    try:
+        obj = json.loads(p.stdout)
+    except (ValueError, TypeError):
+        obj = None
+    if p.returncode:
+        try:
+            error_obj = json.loads(p.stderr)
+        except (ValueError, TypeError):
+            error_obj = obj
+        if isinstance(error_obj, dict) and isinstance(error_obj.get("error"), dict):
+            error = error_obj["error"]
+            code, detail = error.get("code"), error.get("message")
+            if isinstance(code, str) and isinstance(detail, str):
+                # Only codes that guarantee validation failed before dispatch are
+                # treated as rejection. Runtime/state codes may follow an effect.
+                phase = args[:2]
+                rejected = (code in {"invalid_argument", "invalid_args", "validation_error"}
+                            or (phase == ["agent", "prompt"] and code == "agent_blocked"))
+                outcome = "rejected" if rejected else "outcome unknown"
+                raise Failure(f"Herdr command {outcome} ({code}): {detail}", outcome="rejected" if rejected else "unknown")
+        raise Failure(f"Herdr command failed with exit {p.returncode}; outcome unknown")
+    if not isinstance(obj, dict) or not isinstance(obj.get("result"), dict):
+        raise Failure("Herdr returned an invalid success acknowledgement; outcome unknown")
+    return obj["result"]
+
+
+def snapshot():
+    result = invoke(["api", "snapshot"])
+    if result.get("type") != "session_snapshot":
+        raise Failure("Herdr returned an unexpected snapshot response")
+    snap = result.get("snapshot")
+    if not isinstance(snap, dict) or snap.get("protocol") != 22 or not isinstance(snap.get("panes"), list):
+        raise Failure("Herdr protocol 22 snapshot is unavailable or malformed")
+    return snap
+
+
+def canonical_rollout_path(value, thread_id):
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", thread_id):
+        return False
+    try:
+        path = Path(value)
+        filename = path.name
+        if not path.is_absolute():
+            return False
+        match = re.fullmatch(rf"rollout-([0-9]{{4}})-([0-9]{{2}})-([0-9]{{2}})T([0-9]{{2}})-([0-9]{{2}})-([0-9]{{2}})-{re.escape(thread_id)}\.jsonl", filename)
+        if not match:
+            return False
+        datetime.date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        datetime.time(int(match.group(4)), int(match.group(5)), int(match.group(6)))
+        return True
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def matches(pane, thread_id):
+    if pane.get("agent") != "codex":
+        return False
+    ref = pane.get("agent_session")
+    if (not isinstance(ref, dict) or ref.get("agent") != "codex"
+            or ref.get("source") != "herdr:codex"):
+        return False
+    if ref.get("kind") == "id":
+        return ref.get("value") == thread_id
+    return ref.get("kind") == "path" and canonical_rollout_path(ref.get("value"), thread_id)
+
+
+def valid_pane(pane):
+    return (isinstance(pane, dict) and isinstance(pane.get("pane_id"), str) and bool(pane["pane_id"])
+            and isinstance(pane.get("workspace_id"), str) and bool(pane["workspace_id"])
+            and isinstance(pane.get("tab_id"), str) and bool(pane["tab_id"]))
+
+
+def choose_source(snap, explicit, thread_id):
+    panes = snap["panes"]
+    if explicit:
+        found = [p for p in panes if isinstance(p, dict) and p.get("pane_id") == explicit]
+        if len(found) != 1 or not valid_pane(found[0]):
+            raise Failure(f"Pane {explicit!r} is not a unique valid live Herdr pane; choose a live pane ID")
+        return found[0]
+    if not thread_id:
+        raise Failure("I cannot establish the current Codex pane. Choose an explicit live pane ID with --pane.")
+    found = [p for p in panes if isinstance(p, dict) and matches(p, thread_id)]
+    if len(found) != 1 or not valid_pane(found[0]):
+        raise Failure("I cannot uniquely identify the current Codex pane. Choose an explicit live pane ID with --pane.")
+    return found[0]
+
+
+def inspect_destination(pane_id, workspace_id, tab_id, expected_cwd=None, expected_name=None):
+    """Read-only bounded recovery/current-state check; never repeats an effect."""
+    try:
+        for _ in range(3):
+            snap = snapshot()
+            found = [p for p in snap["panes"] if isinstance(p, dict) and p.get("pane_id") == pane_id]
+            if len(found) != 1:
+                continue
+            p = found[0]
+            if p.get("workspace_id") != workspace_id or p.get("tab_id") != tab_id:
+                return "placement changed or unverified"
+            if expected_cwd is not None and p.get("cwd") not in (None, expected_cwd):
+                return "unexpected destination working directory"
+            if p.get("agent") == "codex":
+                try:
+                    response = invoke(["agent", "get", pane_id])
+                    agent = response.get("agent")
+                    if (response.get("type") == "agent_info" and isinstance(agent, dict) and agent.get("pane_id") == pane_id
+                            and agent.get("name") == expected_name and agent.get("workspace_id") == workspace_id
+                            and agent.get("tab_id") == tab_id
+                            and agent.get("agent") == "codex" and agent.get("interactive_ready") is True
+                            and agent.get("agent_status") in ("idle", "done")):
+                        return "Codex is ready"
+                except Failure:
+                    pass
+            return "pane exists; Codex readiness is unconfirmed"
+    except Failure:
+        pass
+    return "destination state is unknown"
+
+
+def wait_for_shell(pane_id, workspace_id, tab_id, expected_cwd):
+    """Poll read-only pane and process metadata until its shell owns the foreground."""
+    supported = {"sh", "bash", "zsh", "dash", "ksh", "fish"}
+    for _ in range(10):
+        snap = snapshot()
+        panes = [p for p in snap["panes"] if isinstance(p, dict) and p.get("pane_id") == pane_id]
+        if (len(panes) == 1 and panes[0].get("workspace_id") == workspace_id
+                and panes[0].get("tab_id") == tab_id and panes[0].get("cwd") == expected_cwd
+                and panes[0].get("agent") is None and panes[0].get("agent_session") is None):
+            try:
+                info_result = invoke(["pane", "process-info", "--pane", pane_id])
+            except Failure:
+                time.sleep(0.1)
+                continue
+            info = info_result.get("process_info") if info_result.get("type") == "pane_process_info" else None
+            if isinstance(info, dict) and info.get("pane_id") == pane_id:
+                shell_pid, foreground = info.get("shell_pid"), info.get("foreground_processes")
+                if isinstance(shell_pid, int) and isinstance(foreground, list) and len(foreground) == 1:
+                    proc = foreground[0]
+                    if isinstance(proc, dict) and proc.get("pid") == shell_pid:
+                        name = Path(str(proc.get("argv0") or proc.get("name") or "")).name.lower().lstrip("-")
+                        argv = proc.get("argv") or []
+                        argv_name = Path(str(argv[0])).name.lower().lstrip("-") if isinstance(argv, list) and argv else name
+                        if name in supported and argv_name in supported:
+                            return True
+        time.sleep(0.1)
+    return False
+
+
+def argv_size_ok(message, argv):
+    if message is None:
+        return True
+    try:
+        encoded = os.fsencode(message)
+        if b"\0" in encoded:
+            return False
+        # Account conservatively for the actual argument vector and inherited environment.
+        size = sum(len(os.fsencode(x)) + 1 for x in argv)
+        size += sum(len(os.fsencode(k)) + len(os.fsencode(v)) + 2 for k, v in os.environ.items())
+        limit = os.sysconf("SC_ARG_MAX")
+        return len(encoded) < 32 * mmap.PAGESIZE and size < limit - 8192
+    except (OSError, ValueError):
+        return False
+
+
+def max_message_bytes():
+    """Largest message that can be passed as one argv item, before reading stdin."""
+    try:
+        env_size = sum(len(os.fsencode(k)) + len(os.fsencode(v)) + 2 for k, v in os.environ.items())
+        argv_without_message = ["herdr", "agent", "prompt", "pane-id"]
+        argv_size = sum(len(os.fsencode(x)) + 1 for x in argv_without_message)
+        remaining = os.sysconf("SC_ARG_MAX") - 8192 - env_size - argv_size
+        return max(0, min(32 * mmap.PAGESIZE - 1, remaining - 2))
+    except (OSError, ValueError):
+        return 0
+
+
+def reported_location(pane_id):
+    """Read-only lookup of the exact returned pane's current placement."""
+    try:
+        found = [p for p in snapshot()["panes"] if isinstance(p, dict) and p.get("pane_id") == pane_id]
+        if len(found) == 1:
+            return found[0].get("workspace_id"), found[0].get("tab_id")
+    except Failure:
+        pass
+    return None, None
+
+
+def fail(message, pane=None, workspace=None, tab=None):
+    if pane and f"pane {pane}" not in message.lower():
+        message = f"Pane {pane}: {message}"
+    if workspace and f"workspace {workspace}" not in message.lower():
+        message += f"; workspace {workspace}"
+    if tab and f"tab {tab}" not in message.lower():
+        message += f", tab {tab}"
+    print(message, file=sys.stderr)
+    return 1
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Open a fresh Codex session in a sibling Herdr pane.")
+    ap.add_argument("--pane", help="explicit live source pane ID")
+    ap.add_argument("--cwd", help="destination directory (defaults to this process's cwd)")
+    ap.add_argument("--message-stdin", action="store_true", help="submit UTF-8 stdin as the first user message")
+    ns = ap.parse_args(argv)
+    if ns.pane is not None and not ns.pane:
+        return fail("An explicit --pane value must be a live pane ID; nothing was split.")
+    message = None
+    if ns.message_stdin:
+        max_bytes = max_message_bytes()
+        raw = sys.stdin.buffer.read(max_bytes + 1)
+        if len(raw) > max_bytes:
+            return fail("The first message exceeds the operating system argument limit; nothing was split.")
+        if not raw:
+            return fail("The first message is empty; nothing was split.")
+        try:
+            message = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return fail("The first message is not valid UTF-8; nothing was split.")
+        if not message.strip():
+            return fail("The first message is empty; nothing was split.")
+        if message != message.strip() or "\r" in message:
+            return fail("The first message has boundary whitespace or carriage returns that Codex cannot preserve; nothing was split.")
+        if any((unicodedata.category(char) == "Cc" and char not in "\n\t") for char in message):
+            return fail("The first message contains terminal control characters that cannot be passed safely; nothing was split.")
+        first_word = message.split(None, 1)[0]
+        if first_word.startswith("!") or (first_word.startswith("/") and "/" not in first_word[1:]):
+            return fail("The first message begins with a Codex control command that cannot be submitted as ordinary text; nothing was split.")
+    known_location = None
+    try:
+        cwd = Path(ns.cwd or os.getcwd()).expanduser().resolve(strict=True)
+        if not cwd.is_dir():
+            return fail(f"Working directory is not a directory: {cwd}")
+        if len(os.fsencode(str(cwd))) > 4096:
+            return fail("Working directory exceeds the supported OS path length; nothing was split.")
+        if not argv_size_ok(message, ["herdr", "agent", "prompt", "pane-id", message or ""]):
+            return fail("The first message exceeds the operating system argument limit; nothing was split.")
+        snap = snapshot()
+        source = choose_source(snap, ns.pane, os.environ.get("CODEX_THREAD_ID"))
+        src_id, workspace, tab = source["pane_id"], source["workspace_id"], source["tab_id"]
+        existing_ids = {p.get("pane_id") for p in snap["panes"] if isinstance(p, dict)}
+        split = invoke(["pane", "split", "--pane", src_id, "--direction", "right", "--cwd", str(cwd), "--no-focus"])
+        dest = split.get("pane")
+        pane_id = dest.get("pane_id") if isinstance(dest, dict) else None
+        if not isinstance(pane_id, str) or not pane_id or pane_id in existing_ids:
+            raise Failure("Split acknowledgement did not identify a distinct destination pane; outcome unknown")
+        known_location = (pane_id, workspace, tab)
+        if (split.get("type") != "pane_info" or dest.get("workspace_id") != workspace or dest.get("tab_id") != tab
+                or dest.get("focused") is not False or dest.get("cwd") != str(cwd)):
+            actual_workspace, actual_tab = reported_location(pane_id)
+            known_location = (pane_id, actual_workspace, actual_tab)
+            actual = (f"Herdr reported workspace {dest.get('workspace_id')!r}, tab {dest.get('tab_id')!r}; "
+                      f"current exact-pane placement is workspace {actual_workspace!r}, tab {actual_tab!r}")
+            raise Failure(f"Split acknowledgement failed; expected workspace {workspace!r}, tab {tab!r}; {actual}; no Codex session was started", pane_id)
+        # Confirm the exact returned pane is still the requested shell destination before startup.
+        after_split = snapshot()
+        current = [p for p in after_split["panes"] if isinstance(p, dict) and p.get("pane_id") == pane_id]
+        if (len(current) != 1 or current[0].get("workspace_id") != workspace or current[0].get("tab_id") != tab
+                or current[0].get("cwd") != str(cwd) or current[0].get("focused") is not False
+                or current[0].get("agent") is not None or current[0].get("agent_session") is not None
+                or after_split.get("focused_pane_id") != snap.get("focused_pane_id")):
+            raise Failure("Returned destination is no longer the verified empty shell in the requested location", pane_id)
+        if not wait_for_shell(pane_id, workspace, tab, str(cwd)):
+            raise Failure("Destination shell did not become foreground-ready after bounded read-only polling", pane_id)
+        # Herdr names are unique and bounded; the name is part of the acknowledgement contract.
+        name = "codex-" + uuid.uuid4().hex[:12]
+        try:
+            start = invoke(["agent", "start", name, "--kind", "codex", "--pane", pane_id, "--timeout", "30000"], timeout=35)
+        except Failure as e:
+            state = inspect_destination(pane_id, workspace, tab, str(cwd), name)
+            not_attempted = "; first message was not attempted" if message is not None else ""
+            raise Failure(f"Codex startup is {state}; {e}{not_attempted}", pane_id)
+        agent = start.get("agent")
+        if (start.get("type") != "agent_started" or not isinstance(agent, dict)
+                or start.get("argv") != ["codex"]
+                or agent.get("pane_id") != pane_id or agent.get("workspace_id") != workspace
+                or agent.get("tab_id") != tab or agent.get("name") != name
+                or agent.get("agent") != "codex" or agent.get("interactive_ready") is not True
+                or agent.get("agent_status") != "idle"):
+            state = inspect_destination(pane_id, workspace, tab, str(cwd), name)
+            not_attempted = "; first message was not attempted" if message is not None else ""
+            raise Failure(f"Startup acknowledgement was incomplete; current state: {state}{not_attempted}", pane_id)
+        try:
+            current_result = invoke(["agent", "get", pane_id])
+            current_agent = current_result.get("agent") if current_result.get("type") == "agent_info" else None
+        except Failure as e:
+            not_attempted = "; first message was not attempted" if message is not None else ""
+            raise Failure(f"Codex startup was acknowledged but current readiness is unverified: {e}{not_attempted}", pane_id)
+        if (not isinstance(current_agent, dict) or current_agent.get("pane_id") != pane_id
+                or current_agent.get("name") != name or current_agent.get("agent") != "codex"
+                or current_agent.get("workspace_id") != workspace or current_agent.get("tab_id") != tab
+                or current_agent.get("interactive_ready") is not True
+                or current_agent.get("agent_status") != "idle"):
+            raise Failure("Current destination occupant is not the acknowledged ready Codex session", pane_id)
+        if message is not None:
+            try:
+                # A1: Herdr takes the complete prompt as one positional argument immediately after DEST.
+                prompt = invoke(["agent", "prompt", pane_id, message], timeout=15)
+            except Failure as e:
+                if e.outcome == "rejected":
+                    raise Failure(f"Codex is ready; first-message submission was rejected before send: {e}", pane_id)
+                state = inspect_destination(pane_id, workspace, tab, str(cwd), name)
+                raise Failure(f"Codex is ready; first-message submission is unknown ({state}): {e}", pane_id)
+            prompt_agent = prompt.get("agent")
+            if (prompt.get("type") != "agent_prompted" or not isinstance(prompt_agent, dict)
+                    or prompt_agent.get("pane_id") != pane_id or prompt_agent.get("name") != name
+                    or prompt_agent.get("agent") != "codex" or prompt_agent.get("workspace_id") != workspace
+                    or prompt_agent.get("tab_id") != tab):
+                state = inspect_destination(pane_id, workspace, tab, str(cwd), name)
+                raise Failure(f"Prompt acknowledgement was incomplete; submission is unknown ({state})", pane_id)
+            message_state = "submitted"
+        else:
+            message_state = "omitted"
+        print(f"Codex session ready in workspace {workspace}, tab {tab}, pane {pane_id}; first message {message_state}.")
+        return 0
+    except Failure as e:
+        location = known_location
+        pane = e.pane or (location[0] if location else None)
+        workspace = e.workspace or (location[1] if location else None)
+        tab = e.tab or (location[2] if location else None)
+        return fail(str(e), pane, workspace, tab)
+    except OSError as e:
+        return fail(f"Could not prepare launcher request: {e}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

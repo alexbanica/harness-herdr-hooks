@@ -1,72 +1,65 @@
-# Harness Herdr Hooks
+# Codex pane launcher for Herdr
 
-Harness Herdr Hooks displays newly created, independently verified standalone
-Codex sessions in an unfocused pane in the verified parent session's existing
-Herdr tab. It also retains a separate route for supported fresh interactive
-Codex shell commands. The integration does not discover or attach native
-subagents and does not create, name, or retire Herdr tabs. OpenCode integration
-has been retired.
+Ask Codex to open another session in Herdr. The `codex-pane` skill splits the selected pane once and starts fresh stock Codex in an unfocused sibling in the same workspace and tab. Supply an instruction to send it as the child's first user message, or omit it to open an idle session.
 
-**Status: DRAFT / experimental.** Source checks and isolated migration/operator
-checks passed, but live standalone capture and attachment were not demonstrated
-in a correctly bound parent. See [validation](docs/validation.md) for current
-evidence and remaining gaps.
+## Prerequisites
 
-## Quick start
+Use Python 3, local Herdr 0.9.5 (protocol 22), and authenticated stock `codex` on the Herdr pane shell's `PATH`. The launcher runs only on an explicit request. It requires no event hooks.
+
+## Retire an older installation
+
+Keep the old checkout at its current path until you have uninstalled its registrations. If you need to switch revisions, retain a checkout of the previously installed revision so its `bin/harness-herdr-hooks` remains available. Run status and uninstall with the same profile used for installation. For the default Codex profile, run these commands from the old checkout.
 
 ```sh
-git clone https://github.com/alexbanica/harness-herdr-hooks.git
-cd harness-herdr-hooks
-bin/harness-herdr-hooks install codex
-bin/harness-herdr-hooks status codex
+profile="${CODEX_HOME:-$HOME/.codex}"
+bin/harness-herdr-hooks status codex --config-dir "$profile"
+bin/harness-herdr-hooks uninstall codex --config-dir "$profile"
 ```
 
-Install registers the managed Codex `SessionStart` hook and the profile-owned
-command adapter. Reload the selected profile through Codex's normal controls
-and follow any native trust prompt. Installation does not bypass trust or
-restart a running client. OpenCode installation is retired; see
-[OpenCode migration](docs/install-opencode.md).
+If that installation also owns an OpenCode plugin, run its retirement commands from the old checkout. Substitute the original profile path in either example if the installation used a custom directory.
 
-## Standalone session panes
+```sh
+profile="${OPENCODE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}"
+bin/harness-herdr-hooks status opencode --config-dir "$profile"
+bin/harness-herdr-hooks uninstall opencode --config-dir "$profile"
+```
 
-In a supported Codex app/TUI local rollout, a successful
-`codex_tui.create_thread` result from a verified parent can identify a new
-standalone session. The integration verifies that exact session on the
-selected Codex backend and maps the originating parent session to one existing
-Herdr tab. Standalone placement does not require a foreground PID or process
-tree. If the parent has no unique verified tab, the event is skipped.
+The old tool checks manifest ownership and preserves unrelated entries. If it reports a conflict, keep the checkout and inspect the changed entry. Existing panes and conversations can continue running.
 
-The exact session is displayed in one pane in that tab. A durable one-shot
-intent precedes each non-idempotent pane effect. If an acknowledgement is lost
-or the result cannot be proved, the integration retains the intent and reports
-a bounded uncertain outcome; it does not blindly repeat the split or managed
-start. Attachment adds no prompt or turn. The pane is retained through idle,
-completion, cancellation, and client exit, leaving a usable shell.
+## Link the skill
 
-## Fresh interactive Codex commands
+From the root of the launcher checkout, link the skill directory into the selected Codex profile. Keep that checkout available for the lifetime of the link.
 
-The profile-owned adapter separately routes supported fresh interactive
-`codex` shell commands from a verified Herdr parent. It preserves the selected
-profile, working directory, arguments, and requested prompt, starts the command
-once in a pane in the caller's existing tab, and leaves a usable shell after
-client exit. This route keeps its existing process and launch verification;
-the standalone session-only path does not depend on that PID gate. Unsupported
-or uncertain launch modes retain native routing.
+```sh
+profile="${CODEX_HOME:-$HOME/.codex}"
+mkdir -p "$profile/skills"
+target="$profile/skills/codex-pane"
+if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+    ln -s "$PWD/skills/codex-pane" "$target"
+fi
+```
 
-## State, migration, and qualification
+If the destination already exists, inspect it before using it. Open a fresh Codex session and check that `codex-pane` appears in the available skills.
 
-The integration stores bounded identity and recovery records under the
-selected private state root. Uninstall revokes its registrations but leaves
-sessions, panes, tabs, and retained state alone. Reinstalling Codex removes
-unchanged managed legacy subagent hooks. Run the OpenCode uninstall command
-to remove its owned plugin link. Both operations preserve unmanaged and
-independently changed entries. Existing processes may keep running the code
-they already loaded. See
-[Codex setup](docs/install-codex.md), [OpenCode migration](docs/install-opencode.md),
-[contracts](docs/contracts.md), and [isolation](docs/isolation.md).
+## Open a session
 
-Native subagent/tab behavior described in older validation records is
-historical and superseded. Current source assurance does not prove live
-standalone capture, same-tab display, no-added-turn attachment, shell recovery,
-or runtime loading of the current revision. The project remains DRAFT; see
-[validation](docs/validation.md) and [troubleshooting](docs/troubleshooting.md).
+For example, ask “Open a new Codex session here and send it `$implement specs/SPEC-example.md`.” The launcher matches the caller's thread to a unique live Codex session reference. If the reference is missing or ambiguous, the skill asks you to select a live Herdr pane before it creates anything.
+
+You can also invoke the launcher from your project directory. The command below sends the literal dollar sign and adds no final newline.
+
+```sh
+launcher="${CODEX_HOME:-$HOME/.codex}/skills/codex-pane/scripts/codex-pane"
+printf '%s' '$implement specs/SPEC-example.md' | "$launcher" --message-stdin
+```
+
+Omit `--message-stdin` for an idle session. The default working directory is the caller's current directory. To select both the source pane and a different destination directory, use `"$launcher" --pane PANE_ID --cwd DIRECTORY`.
+
+Literal UTF-8 input can contain internal spaces, tabs, line feeds, quotes and shell punctuation. The launcher rejects invalid UTF-8, empty or oversized messages, outer whitespace, carriage returns, other terminal controls, a leading `!`, and slash-command words such as `/status` before splitting. The skill includes a copyable multiline example. [Agent instructions](skills/codex-pane/SKILL.md)
+
+A successful result identifies the workspace, tab and pane and says whether the first message was submitted or omitted. On a partial result, inspect the reported pane. A timeout can occur after Herdr has acted, so repeating the request can duplicate a pane or message. Herdr checks the occupant and submits to the pane in separate operations. A replacement between them can leave delivery uncertain. The launcher reports an acknowledgement mismatch and does not resend.
+
+## Verification
+
+Run `python3 -m unittest discover -s tests -v` for the 16 public CLI tests. Authenticated checks with stock Codex 0.172.0 and Herdr 0.9.5 verified one exact multiline first message, an idle child with zero user turns, requested and default working directories, preserved focus and source history, and explicit selection after a stale inherited pane marker. A fresh child discovered the linked skill. A real subprocess timeout produced one split, one start, one submission attempt and read-only recovery.
+
+Scratch migration checks exercised Codex install, status and uninstall, plus OpenCode status and uninstall against an existing managed-plugin fixture. Unrelated Codex settings and hooks and an unrelated OpenCode plugin survived.
